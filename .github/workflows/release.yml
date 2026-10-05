@@ -39,11 +39,21 @@ jobs:
           go build -trimpath -ldflags "-s -w -X main.version=${GITHUB_REF_NAME}" \
             -o mnagent_${GOOS}_${GOARCH} .
           sha256sum mnagent_${GOOS}_${GOARCH} > mnagent_${GOOS}_${GOARCH}.sha256
-      - name: Upload to release
+      - name: Upload binary to release
         uses: softprops/action-gh-release@v2
         if: startsWith(github.ref, 'refs/tags/')
         with:
           files: |
-            mnagent_*
-            install.sh
+            mnagent_${{ matrix.goos }}_${{ matrix.goarch }}
+            mnagent_${{ matrix.goos }}_${{ matrix.goarch }}.sha256
+          overwrite_files: true
           generate_release_notes: true
+
+      # 只由一个任务上传 install.sh：多个矩阵任务同时上传同名资产会撞车，
+      # 曾导致某个任务失败、Release 里缺少安装脚本。
+      - name: Upload install script
+        uses: softprops/action-gh-release@v2
+        if: startsWith(github.ref, 'refs/tags/') && matrix.goos == 'linux' && matrix.goarch == 'amd64'
+        with:
+          files: install.sh
+          overwrite_files: true
