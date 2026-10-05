@@ -1,0 +1,47 @@
+name: release
+
+# 打 v* 标签时构建各平台二进制并附到 Release：
+# 安装脚本默认从 releases/latest/download/mnagent_<os>_<arch> 下载，
+# 因此发布一个标签后，主机上的一键安装即可直接下载预编译产物。
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        include:
+          - { goos: linux, goarch: amd64 }
+          - { goos: linux, goarch: arm64 }
+          - { goos: linux, goarch: arm }
+          - { goos: darwin, goarch: amd64 }
+          - { goos: darwin, goarch: arm64 }
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+      - name: Test
+        run: go test ./...
+      - name: Build
+        env:
+          GOOS: ${{ matrix.goos }}
+          GOARCH: ${{ matrix.goarch }}
+          CGO_ENABLED: '0'
+        run: |
+          go build -trimpath -ldflags "-s -w -X main.version=${GITHUB_REF_NAME}" \
+            -o mnagent_${GOOS}_${GOARCH} .
+          sha256sum mnagent_${GOOS}_${GOARCH} > mnagent_${GOOS}_${GOARCH}.sha256
+      - name: Upload to release
+        uses: softprops/action-gh-release@v2
+        if: startsWith(github.ref, 'refs/tags/')
+        with:
+          files: |
+            mnagent_*
+          generate_release_notes: true
