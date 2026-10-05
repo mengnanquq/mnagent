@@ -1,0 +1,8 @@
+# 编译产物
+/mnagent
+/mnagent-*
+*.exe
+
+# 本地令牌（切勿提交）
+/token
+*.token
