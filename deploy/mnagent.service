@@ -6,11 +6,10 @@ Wants=network-online.target
 
 [Service]
 Type=simple
-# 建议专用低权限用户；nexttrace 需要的 CAP_NET_RAW 通过 setcap 授予二进制，
+# 建议专用低权限用户；原始套接字权限由下面的 AmbientCapabilities 提供，
 # 不要为了追踪把整个服务跑成 root：
 #   sudo useradd --system --no-create-home --shell /usr/sbin/nologin mnagent
 #   sudo install -m 0755 mnagent /usr/local/bin/mnagent
-#   sudo setcap cap_net_raw,cap_net_admin+eip /usr/local/bin/nexttrace
 User=mnagent
 Group=mnagent
 
@@ -24,7 +23,15 @@ ExecStart=/usr/local/bin/mnagent \
 Restart=always
 RestartSec=5
 
+# nexttrace 需要 CAP_NET_RAW 才能做原始套接字追踪：由服务携带 ambient 能力并传给
+# 子进程（与 NoNewPrivileges 兼容；比给 nexttrace 二进制 setcap 更稳，二进制被替换后
+# 也不会失效）。因此本单元下无需再执行 setcap。
+AmbientCapabilities=CAP_NET_RAW CAP_NET_ADMIN
+CapabilityBoundingSet=CAP_NET_RAW CAP_NET_ADMIN
+
 # 基础加固：不提升权限、根文件系统只读、私有 /tmp。
+# 注意不要启用 MemoryDenyWriteExecute：它对 Go/第三方二进制并不总是安全，
+# 而本服务只需要执行 nexttrace。
 NoNewPrivileges=true
 ProtectSystem=strict
 ProtectHome=true
@@ -33,7 +40,6 @@ ProtectKernelTunables=true
 ProtectControlGroups=true
 RestrictSUIDSGID=true
 LockPersonality=true
-MemoryDenyWriteExecute=true
 
 [Install]
 WantedBy=multi-user.target

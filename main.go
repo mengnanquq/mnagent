@@ -69,7 +69,7 @@ func run(args []string) error {
 		cfg:    cfg,
 		logger: log,
 		client: newClient(cfg),
-		runner: newRunner(cfg.binary),
+		runner: newRunner(cfg.binary, log),
 	}
 	log.Info("mnagent 已启动",
 		"version", version, "bot", cfg.botURL, "host", cfg.host,

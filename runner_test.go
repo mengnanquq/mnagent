@@ -6,6 +6,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"sync/atomic"
@@ -26,7 +27,7 @@ func writeScript(t *testing.T, body string) string {
 // TestRunnerArgvRejectsBadInput 验证 agent 侧会独立校验任务参数。
 // 这是对外暴露的执行入口，即使机器人已经校验过也不能盲信网络输入。
 func TestRunnerArgvRejectsBadInput(t *testing.T) {
-	r := newRunner("nexttrace")
+	r := newRunner("nexttrace", nil)
 	cases := []struct {
 		name string
 		job  Job
@@ -51,7 +52,7 @@ func TestRunnerArgvRejectsBadInput(t *testing.T) {
 
 // TestRunnerArgvBuildsExpected 验证合法任务的 argv 形状。
 func TestRunnerArgvBuildsExpected(t *testing.T) {
-	r := newRunner("nexttrace")
+	r := newRunner("nexttrace", nil)
 	args, err := r.argv(Job{Target: "1.1.1.1", Hops: 20, Port: 443, Protocol: "ICMP"})
 	if err != nil {
 		t.Fatal(err)
@@ -74,7 +75,7 @@ func TestRunnerArgvBuildsExpected(t *testing.T) {
 // TestRunnerExecutesWithoutShell 验证参数原样传给 nexttrace（不经 shell 解释）。
 func TestRunnerExecutesWithoutShell(t *testing.T) {
 	script := writeScript(t, `printf '%s\n' "$@"`)
-	r := newRunner(script)
+	r := newRunner(script, nil)
 
 	job := Job{Target: "1.1.1.1", Hops: 5}
 	out, errText, code := r.run(context.Background(), job)
@@ -100,7 +101,7 @@ func TestRunnerFallsBackWhenJSONUnsupported(t *testing.T) {
 	exit 2
 fi
 echo "TRACE OK"`)
-	r := newRunner(script)
+	r := newRunner(script, nil)
 
 	out, errText, code := r.run(context.Background(), Job{Target: "1.1.1.1"})
 	if errText != "" || code != 0 {
@@ -129,7 +130,7 @@ func TestRunnerTimeout(t *testing.T) {
 	defer func() { jobMinTimeout = old }()
 
 	script := writeScript(t, "sleep 30")
-	r := newRunner(script)
+	r := newRunner(script, nil)
 	r.waitDelay = 50 * time.Millisecond // 脚本派生的孙进程会占着管道，靠 WaitDelay 兜底
 
 	start := time.Now()
@@ -144,7 +145,7 @@ func TestRunnerTimeout(t *testing.T) {
 
 // TestRunnerReportsExitCode 验证非零退出码会被记录。
 func TestRunnerReportsExitCode(t *testing.T) {
-	r := newRunner(writeScript(t, `echo "boom" >&2; exit 7`))
+	r := newRunner(writeScript(t, `echo "boom" >&2; exit 7`), nil)
 	_, errText, code := r.run(context.Background(), Job{Target: "1.1.1.1"})
 	if code != 7 || !strings.Contains(errText, "退出码 7") {
 		t.Fatalf("code=%d errText=%q", code, errText)
@@ -215,7 +216,7 @@ func TestAgentLoopEndToEnd(t *testing.T) {
 		maxBackoff:  50 * time.Millisecond,
 		pollTimeout: 2 * time.Second,
 	}
-	a := &agent{cfg: cfg, logger: testLogger{t}, client: newClient(cfg), runner: newRunner(cfg.binary)}
+	a := &agent{cfg: cfg, logger: testLogger{t}, client: newClient(cfg), runner: newRunner(cfg.binary, nil)}
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -256,5 +257,42 @@ func TestSleepRespectsContext(t *testing.T) {
 	}
 	if !errors.Is(ctx.Err(), context.Canceled) {
 		t.Fatalf("ctx.Err() = %v", ctx.Err())
+	}
+}
+
+// TestRunnerReportsStartFailure 验证“进程根本没起来”时会带出真实原因，
+// 而不是只报一个无从排查的“退出码 -1”。
+func TestRunnerReportsStartFailure(t *testing.T) {
+	r := newRunner(filepath.Join(t.TempDir(), "missing-nexttrace"), nil)
+	_, errText, code := r.run(context.Background(), Job{Target: "1.1.1.1"})
+	if code != -1 {
+		t.Fatalf("退出码 = %d，期望 -1", code)
+	}
+	if !strings.Contains(errText, "无法启动 nexttrace") || !strings.Contains(errText, "no such file") {
+		t.Fatalf("错误提示应包含真实原因: %q", errText)
+	}
+	if strings.Contains(errText, "退出码 -1）") {
+		t.Fatalf("不应只报退出码 -1: %q", errText)
+	}
+}
+
+// fakeProcessState 构造一个“被 SIGKILL 终止”的进程状态。
+func fakeProcessState(t *testing.T) *os.ProcessState {
+	t.Helper()
+	cmd := exec.Command("/bin/sh", "-c", "kill -9 $$")
+	if err := cmd.Run(); err == nil {
+		t.Fatal("期望进程被信号终止")
+	}
+	return cmd.ProcessState
+}
+
+// TestDescribeRunError 覆盖信号终止与普通失败两种情况的文案。
+func TestDescribeRunError(t *testing.T) {
+	sig := describeRunError(&exec.ExitError{ProcessState: fakeProcessState(t)}, -1)
+	if !strings.Contains(sig, "进程被信号终止") {
+		t.Fatalf("信号终止文案异常: %q", sig)
+	}
+	if got := describeRunError(&exec.ExitError{}, 7); got != "执行失败（退出码 7）" {
+		t.Fatalf("普通失败文案异常: %q", got)
 	}
 }

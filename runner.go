@@ -58,11 +58,12 @@ type runner struct {
 	// waitDelay 限制“进程已被杀掉、但仍有子进程占着输出管道”时的额外等待，
 	// 避免超时任务因为派生的孙进程而把 agent 卡死。
 	waitDelay time.Duration
+	logger    logger // 可选：记录实际执行的 argv，便于与主机上手跑结果对照。
 }
 
 // newRunner 构建执行器，默认请求 JSON 输出。
-func newRunner(binary string) *runner {
-	r := &runner{binary: binary, waitDelay: 5 * time.Second}
+func newRunner(binary string, log logger) *runner {
+	r := &runner{binary: binary, waitDelay: 5 * time.Second, logger: log}
 	r.jsonOutput.Store(true)
 	return r
 }
@@ -91,16 +92,43 @@ func (r *runner) run(ctx context.Context, job Job) (output string, errText strin
 	case errors.Is(runCtx.Err(), context.DeadlineExceeded):
 		return out, fmt.Sprintf("执行超时（%s）", job.Timeout()), code
 	case runErr != nil:
-		return out, fmt.Sprintf("执行失败（退出码 %d）", code), code
+		return out, describeRunError(runErr, code), code
 	default:
 		return out, "", 0
 	}
+}
+
+// describeRunError 把执行失败的原因描述清楚：
+//   - 进程被信号终止：ExitCode() 为 -1，必须把信号名带上；
+//   - 正常退出但非零：退出码本身就有意义；
+//   - 根本没起来（找不到文件、无执行权限、架构不匹配等）：错误文本是关键，
+//     过去只报“退出码 -1”会让这类问题无从排查。
+func describeRunError(err error, code int) string {
+	var exitErr *exec.ExitError
+	if errors.As(err, &exitErr) {
+		if code == -1 {
+			return fmt.Sprintf("执行失败：进程被信号终止（%s）", exitErr.Error())
+		}
+		return fmt.Sprintf("执行失败（退出码 %d）", code)
+	}
+	return "执行失败：无法启动 nexttrace（" + clampText(err.Error(), 300) + "）"
+}
+
+// clampText 截断过长的错误文本，避免刷屏。
+func clampText(s string, max int) string {
+	if len(s) <= max {
+		return s
+	}
+	return s[:max] + "…"
 }
 
 // exec 以 argv 方式调用 nexttrace（不经 shell），并捕获受限输出。
 func (r *runner) exec(ctx context.Context, args []string) (string, int, error) {
 	cmd := exec.CommandContext(ctx, r.binary, args...)
 	cmd.WaitDelay = r.waitDelay
+	if r.logger != nil {
+		r.logger.Debug("执行 nexttrace", "argv", strings.Join(append([]string{r.binary}, args...), " "))
+	}
 	out := &cappedBuffer{max: maxOutputBytes}
 	cmd.Stdout, cmd.Stderr = out, out
 

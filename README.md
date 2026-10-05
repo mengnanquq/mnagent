@@ -60,6 +60,7 @@ install -m 0755 mnagent /usr/local/bin/mnagent
 useradd --system --no-create-home --shell /usr/sbin/nologin mnagent
 install -d -m 0750 -o mnagent -g mnagent /etc/mnagent
 printf '%s\n' '<令牌>' > /etc/mnagent/token && chmod 0600 /etc/mnagent/token && chown mnagent /etc/mnagent/token
+# 手工前台运行时需要自己给 nexttrace 授权（用 systemd 时由单元的 AmbientCapabilities 提供）
 setcap cap_net_raw,cap_net_admin+eip "$(command -v nexttrace)"
 ```
 
@@ -120,7 +121,7 @@ POST /agent/results?host=<name>     {"id":"…","output":"…","exit_code":0,"er
 | 令牌 | 每台主机独立令牌，机器人侧用常量时间比较；令牌等同该主机的"任务接受权"，泄露后应立刻轮换 |
 | 命令执行 | agent 侧重新校验参数（目标字符集、跳数/端口区间、协议枚举），以 argv 方式直接 `exec`，**不经 shell**；`target` 不允许以 `-` 开头，因此无法注入额外参数 |
 | 程序路径 | 由本机 `-nexttrace` 决定，机器人无法指定要执行的程序 |
-| 权限 | 建议专用用户 + 对 nexttrace 二进制 `setcap cap_net_raw,cap_net_admin+eip`，不要以 root 运行 |
+| 权限 | 专用低权限用户运行；原始套接字能力由 systemd 单元的 `AmbientCapabilities=CAP_NET_RAW CAP_NET_ADMIN` 携带并传给 nexttrace（无需对二进制 setcap，二进制被替换后也不会失效），不要以 root 运行 |
 | TLS | 默认校验服务器证书；仅在本地联调时可对机器人使用 `http://` |
 
 ## 故障排查
@@ -131,4 +132,7 @@ POST /agent/results?host=<name>     {"id":"…","output":"…","exit_code":0,"er
 | 机器人显示 ⚪️ 离线 | agent 未运行、`-bot` 地址不可达（出站 443 被拦？）、或机器人的 `/agent/jobs` 未对外暴露 |
 | 任务报 `执行超时` | 主机到目标网络不通，或需要更长超时；也可在命令里减少跳数 |
 | 任务报 `执行失败（退出码 N）` | 手动在该主机执行同参数 `nexttrace` 复现；注意 `nexttrace -j` 需要 v1.7+，旧版本 agent 会自动去掉 `-j` 重试 |
-| 输出为空 | 检查 `nexttrace` 是否具备 `cap_net_raw`（`getcap $(command -v nexttrace)`） |
+| 任务报 `无法启动 nexttrace（…）` | 二进制本身有问题：确认路径存在、可执行、架构匹配（`file $(command -v nexttrace)`），必要时在主机上直接运行一次 |
+| 任务报 `进程被信号终止（…）` | 二进制启动后被信号杀死，按提示的信号名排查（内存不足、平台不兼容等） |
+| 任务报权限/原始套接字错误 | 用 systemd 运行时应由单元的 `AmbientCapabilities` 提供 `CAP_NET_RAW`；检查单元是否被旧版本覆盖（重跑安装脚本会重新生成） |
+| 输出为空且无报错 | 检查 `nexttrace` 能否直接运行：`sudo -u mnagent $(command -v nexttrace) -j 1.1.1.1 \| head -3` |

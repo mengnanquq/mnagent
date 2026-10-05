@@ -204,22 +204,21 @@ if command -v runuser >/dev/null 2>&1 && ! runuser -u "$RUN_USER" -- test -r "$T
 	warn "服务用户 $RUN_USER 读不到 $TOKEN_FILE：请确认 $TOKEN_DIR 的属主/权限为 root:$RUN_GROUP 0750"
 fi
 
-# nexttrace 需要原始套接字权限：给二进制授予能力，而不是把服务跑成 root。
+# nexttrace 做原始套接字追踪需要 CAP_NET_RAW。有 systemd 时由服务的
+# AmbientCapabilities 提供（与 NoNewPrivileges 兼容，且 nexttrace 升级/重装后依然有效，
+# 不像 setcap 那样会因子文件被替换而失效）；只有需要手工前台运行时才回退到 setcap。
 NEXTTRACE_PATH="$(command -v "$NEXTTRACE_BIN" 2>/dev/null || true)"
-if [ -n "$NEXTTRACE_PATH" ]; then
-	if command -v setcap >/dev/null 2>&1; then
-		setcap cap_net_raw,cap_net_admin+eip "$NEXTTRACE_PATH" || warn "setcap 失败，请手动执行：setcap cap_net_raw,cap_net_admin+eip $NEXTTRACE_PATH"
-	else
-		warn "未找到 setcap（libcap），请为 $NEXTTRACE_PATH 授予 cap_net_raw，否则追踪会失败"
-	fi
-else
-	warn "未找到 nexttrace（$NEXTTRACE_BIN）：请安装后再执行 setcap cap_net_raw,cap_net_admin+eip \$(command -v nexttrace)"
-fi
 
 if ! command -v systemctl >/dev/null 2>&1; then
-	warn "未检测到 systemd：请手动运行"
+	warn "未检测到 systemd：请手动运行（并为 nexttrace 授予原始套接字权限）"
+	if [ -n "$NEXTTRACE_PATH" ] && command -v setcap >/dev/null 2>&1; then
+		setcap cap_net_raw,cap_net_admin+eip "$NEXTTRACE_PATH" || warn "setcap 失败，请手动执行：setcap cap_net_raw,cap_net_admin+eip $NEXTTRACE_PATH"
+	fi
 	printf '    %s/mnagent -bot %s -host %s -token-file %s\n' "$PREFIX" "$BOT_URL" "$HOST_NAME" "$TOKEN_FILE" >&2
 	exit 0
+fi
+if [ -z "$NEXTTRACE_PATH" ]; then
+	warn "未找到 nexttrace（$NEXTTRACE_BIN）：请安装后再试，否则追踪会失败"
 fi
 
 log "写入 systemd 服务 /etc/systemd/system/$SERVICE_NAME.service"
@@ -236,6 +235,10 @@ Group=$RUN_USER
 ExecStart=$PREFIX/mnagent -bot $BOT_URL -host $HOST_NAME -token-file $TOKEN_FILE -nexttrace ${NEXTTRACE_PATH:-$NEXTTRACE_BIN}
 Restart=always
 RestartSec=5
+# 原始套接字权限由服务携带（ambient）并传给子进程 nexttrace；
+# 与 NoNewPrivileges 兼容，也不依赖对 nexttrace 二进制执行 setcap。
+AmbientCapabilities=CAP_NET_RAW CAP_NET_ADMIN
+CapabilityBoundingSet=CAP_NET_RAW CAP_NET_ADMIN
 NoNewPrivileges=true
 ProtectSystem=strict
 ProtectHome=true
@@ -244,7 +247,6 @@ ProtectKernelTunables=true
 ProtectControlGroups=true
 RestrictSUIDSGID=true
 LockPersonality=true
-MemoryDenyWriteExecute=true
 
 [Install]
 WantedBy=multi-user.target
