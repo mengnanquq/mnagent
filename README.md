@@ -1,6 +1,6 @@
 # mnagent
 
-运行在追踪主机上的轻量 agent，配合 [mengnanbot](../mengnanbot) 的 `/nexttrace` 使用。
+运行在追踪主机上的轻量 agent，配合 Telegram 机器人 [@mengnan_dedicated_bot](https://t.me/mengnan_dedicated_bot) 的 `/nexttrace` 使用。
 
 它主动向机器人**长轮询**领取任务、在本机执行 `nexttrace`、再回传结果。因此：
 
