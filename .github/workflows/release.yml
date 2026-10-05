@@ -1,8 +1,9 @@
 name: release
 
-# 打 v* 标签时构建各平台二进制并附到 Release：
+# 打 v* 标签时构建各平台二进制并附到 Release（同时附上 install.sh）：
 # 安装脚本默认从 releases/latest/download/mnagent_<os>_<arch> 下载，
-# 因此发布一个标签后，主机上的一键安装即可直接下载预编译产物。
+# 因此发布一个标签后，主机上的一键安装即可直接取用预编译产物；
+# 也可以用 releases/latest/download/install.sh 拿到与本版本配套的安装脚本。
 on:
   push:
     tags: ['v*']
@@ -44,4 +45,5 @@ jobs:
         with:
           files: |
             mnagent_*
+            install.sh
           generate_release_notes: true

@@ -11,20 +11,31 @@
 
 ## 安装
 
-推荐用机器人生成的**一键命令**（脚本由机器人托管，主机只要能访问机器人即可安装，不依赖 GitHub）：
+推荐用机器人生成的**一键命令**（管理员在 Telegram 里执行 `/nexthost add hk 香港节点`，机器人会直接回复下面这条命令）：
 
-1. 在 Telegram 里以管理员身份添加主机：
-   ```
-   /nexthost add hk 香港节点
-   ```
-2. 机器人会回复一条命令，直接在目标主机上以 root 执行：
-   ```bash
-   curl -fsSL https://<机器人地址>/agent/install.sh | sudo bash -s -- \
-       --bot https://<机器人地址>/agent --host hk --token <令牌>
-   ```
+```bash
+curl -fsSL https://raw.githubusercontent.com/mengnanquq/mnagent/main/install.sh | sudo bash -s -- \
+    --bot https://<机器人地址>/agent --host hk --token <令牌>
+```
 
-脚本会自动：下载预编译二进制（没有 Release 时回退到源码编译）、创建专用用户、写入令牌（0600）、
-为 nexttrace 授予 `cap_net_raw`、写入 systemd 单元并启动服务。重复执行即为升级。
+也可以固定到某个发布版本（脚本与二进制版本一致）：
+
+```bash
+curl -fsSL https://github.com/mengnanquq/mnagent/releases/latest/download/install.sh | sudo bash -s -- \
+    --bot https://<机器人地址>/agent --host hk --token <令牌>
+```
+
+脚本会自动：从本仓库的 Release 下载预编译二进制（`mnagent_<os>_<arch>`，没有 Release 或网络受限时回退到源码编译）、创建专用用户、写入令牌（0600）、为 nexttrace 授予 `cap_net_raw`、写入 systemd 单元并启动服务。重复执行即为升级。
+
+> 如果主机访问 GitHub 受限：把 `install.sh` 与对应架构的二进制放到内网镜像，用 `--binary https://内网镜像/mnagent_linux_amd64` 指定二进制即可；机器人侧也可用 `MNAGENT_INSTALL_URL` 把生成的脚本地址指向你的镜像。
+
+### 发布
+
+打标签即触发 Actions 构建 linux/darwin × amd64/arm64/arm 的二进制并附加到 Release（含 `install.sh` 与 sha256）：
+
+```bash
+git tag v0.1.0 && git push origin v0.1.0
+```
 
 ### 脚本参数
 
