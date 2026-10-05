@@ -134,7 +134,7 @@ download_release() {
 	else
 		url="https://github.com/$REPO/releases/download/$VERSION/mnagent_${OS}_${ARCH}"
 	fi
-	log "下载 mnagent（$VERSION，$OS/$ARCH）"
+	log "下载 mnagent（${VERSION}，$OS/${ARCH}）"
 	curl -fsSL --retry 3 -o "$PREFIX/.mnagent.new" "$url" || return 1
 	install -m 0755 "$PREFIX/.mnagent.new" "$PREFIX/mnagent"
 	rm -f "$PREFIX/.mnagent.new"
@@ -144,7 +144,7 @@ build_from_source() {
 	command -v go >/dev/null 2>&1 || die "未找到 go：请先安装 Go，或用 --binary 指定已编译好的 mnagent"
 	local tmp
 	tmp="$(mktemp -d)"
-	log "下载源码并编译（$VERSION）"
+	log "下载源码并编译（${VERSION}）"
 	if [ "$VERSION" = "latest" ]; then
 		curl -fsSL --retry 3 "https://github.com/$REPO/archive/refs/heads/main.tar.gz" | tar -xz -C "$tmp"
 	else
@@ -184,7 +184,7 @@ elif [ "$TOKEN_DIR" = "/etc/mnagent" ]; then
 	chown root:"$RUN_GROUP" "$TOKEN_DIR" 2>/dev/null || true
 	chmod 0750 "$TOKEN_DIR"
 else
-	warn "使用自定义令牌目录 $TOKEN_DIR：未改动其权限，请确认 $RUN_USER 能读取 $TOKEN_FILE"
+	warn "使用自定义令牌目录 ${TOKEN_DIR}：未改动其权限，请确认 $RUN_USER 能读取 $TOKEN_FILE"
 fi
 
 # 令牌：优先用参数写入；否则要求文件已存在（支持不把令牌写进命令行的场景）。
@@ -193,7 +193,7 @@ if [ -n "$TOKEN" ]; then
 	printf '%s\n' "$TOKEN" > "$TOKEN_FILE"
 	chown "$RUN_USER":"$RUN_GROUP" "$TOKEN_FILE" 2>/dev/null || chown "$RUN_USER" "$TOKEN_FILE" 2>/dev/null || true
 	chmod 0600 "$TOKEN_FILE"
-	log "已写入令牌 $TOKEN_FILE（0600，属主 $RUN_USER）"
+	log "已写入令牌 ${TOKEN_FILE}（0600，属主 ${RUN_USER}）"
 elif [ ! -s "$TOKEN_FILE" ]; then
 	die "缺少 --token，且 $TOKEN_FILE 不存在；请使用 /nexthost 生成的完整命令"
 fi
@@ -201,7 +201,7 @@ fi
 # 自检：以服务用户身份确认能读到令牌。目录缺少执行（进入）权限时，非 root 服务会在
 # 启动阶段直接退出（mnagent 报“读取令牌失败: permission denied”），这里提前告警。
 if command -v runuser >/dev/null 2>&1 && ! runuser -u "$RUN_USER" -- test -r "$TOKEN_FILE" 2>/dev/null; then
-	warn "服务用户 $RUN_USER 读不到 $TOKEN_FILE：请确认 $TOKEN_DIR 的属主/权限为 root:$RUN_GROUP 0750"
+	warn "服务用户 $RUN_USER 读不到 ${TOKEN_FILE}：请确认 $TOKEN_DIR 的属主/权限为 root:$RUN_GROUP 0750"
 fi
 
 # nexttrace 做原始套接字追踪需要 CAP_NET_RAW。有 systemd 时由服务的
@@ -218,7 +218,7 @@ if ! command -v systemctl >/dev/null 2>&1; then
 	exit 0
 fi
 if [ -z "$NEXTTRACE_PATH" ]; then
-	warn "未找到 nexttrace（$NEXTTRACE_BIN）：请安装后再试，否则追踪会失败"
+	warn "未找到 nexttrace（${NEXTTRACE_BIN}）：请安装后再试，否则追踪会失败"
 fi
 
 log "写入 systemd 服务 /etc/systemd/system/$SERVICE_NAME.service"
