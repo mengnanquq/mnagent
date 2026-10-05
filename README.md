@@ -11,49 +11,58 @@
 
 ## 安装
 
+推荐用机器人生成的**一键命令**（脚本由机器人托管，主机只要能访问机器人即可安装，不依赖 GitHub）：
+
+1. 在 Telegram 里以管理员身份添加主机：
+   ```
+   /nexthost add hk 香港节点
+   ```
+2. 机器人会回复一条命令，直接在目标主机上以 root 执行：
+   ```bash
+   curl -fsSL https://<机器人地址>/agent/install.sh | sudo bash -s -- \
+       --bot https://<机器人地址>/agent --host hk --token <令牌>
+   ```
+
+脚本会自动：下载预编译二进制（没有 Release 时回退到源码编译）、创建专用用户、写入令牌（0600）、
+为 nexttrace 授予 `cap_net_raw`、写入 systemd 单元并启动服务。重复执行即为升级。
+
+### 脚本参数
+
+| 参数 | 默认值 | 说明 |
+| --- | --- | --- |
+| `--bot` / `--host` / `--token` | 必填 | 由 `/nexthost add` 生成的命令已带全 |
+| `--token-file` | `/etc/mnagent/token` | 令牌文件路径；省略 `--token` 时要求该文件已存在 |
+| `--version` | `latest` | 安装的 Release 标签；也可用 `--from-source` 从源码编译 |
+| `--binary <path\|url>` | — | 使用自备的 mnagent（内网镜像时很有用） |
+| `--nexttrace` | `nexttrace` | nexttrace 路径或名称 |
+| `--user` / `--prefix` | `mnagent` / `/usr/local/bin` | 运行用户与安装目录 |
+| `--uninstall` | — | 卸载服务与二进制（保留令牌与用户） |
+
+### 手动安装
+
+不使用脚本时（例如没有 systemd 的系统），可自行编译并按 `deploy/mnagent.service`
+的写法启动：
+
 ```bash
-# 编译（在任意一台有 Go 的机器上，交叉编译成静态二进制）
-go build -o mnagent .
-GOOS=linux GOARCH=amd64 go build -o mnagent-linux-amd64 .
-
-# 主机上：创建专用用户与目录
-sudo useradd --system --no-create-home --shell /usr/sbin/nologin mnagent
-sudo install -m 0755 mnagent-linux-amd64 /usr/local/bin/mnagent
-sudo install -d -m 0750 -o mnagent -g mnagent /etc/mnagent
-
-# 写入令牌（与机器人 nexttrace_hosts.json 中该主机的 token/tokenFile 一致）
-openssl rand -hex 32 | sudo tee /etc/mnagent/token >/dev/null
-sudo chown mnagent:mnagent /etc/mnagent/token && sudo chmod 0600 /etc/mnagent/token
-
-# nexttrace 需要原始套接字权限：给二进制授予 CAP_NET_RAW，而不是把服务跑成 root
-sudo setcap cap_net_raw,cap_net_admin+eip /usr/local/bin/nexttrace
+go build -trimpath -ldflags "-s -w -X main.version=$(git describe --tags --always)" -o mnagent .
+install -m 0755 mnagent /usr/local/bin/mnagent
+useradd --system --no-create-home --shell /usr/sbin/nologin mnagent
+install -d -m 0750 -o mnagent -g mnagent /etc/mnagent
+printf '%s\n' '<令牌>' > /etc/mnagent/token && chmod 0600 /etc/mnagent/token && chown mnagent /etc/mnagent/token
+setcap cap_net_raw,cap_net_admin+eip "$(command -v nexttrace)"
 ```
-
-然后安装 systemd 单元（把 `-bot` 与 `-host` 改成实际值）：
-
-```bash
-sudo cp deploy/mnagent.service /etc/systemd/system/
-sudo systemctl edit mnagent     # 或直接编辑单元里的 ExecStart
-sudo systemctl enable --now mnagent
-journalctl -u mnagent -f
-```
-
-启动日志中出现 `mnagent 已启动`，并且机器人的主机键盘显示该主机为 🟢 即接入成功。
 
 ## 机器人侧配置
 
-在机器人运行目录的 `nexttrace_hosts.json` 中登记这台主机：
+主机与令牌都由机器人管理（存放在状态数据库里，不再使用配置文件）：
 
-```json
-{
-  "hosts": [
-    { "name": "hk", "label": "香港节点", "tokenFile": "/etc/mengnanbot/hk.token" }
-  ]
-}
-```
+- `/nexthost add <名称> [备注]`：添加主机并生成一键接入命令
+- `/nexthost list`：查看主机与 🟢/⚪️ 在线状态
+- `/nexthost show <名称>`：重新显示接入命令
+- `/nexthost rotate <名称>`：轮换令牌（旧令牌立即失效，主机需重新接入）
+- `/nexthost remove <名称>`：删除主机
 
-`tokenFile` 与 `token` 二者填一个即可（`tokenFile` 优先，便于把令牌与仓库分离）。
-`name` 必须与 agent 的 `-host` 完全一致；`token` 必须与该主机上的令牌一致。
+`name` 必须与 agent 的 `-host` 完全一致；令牌等同该主机的任务接受权，泄露时用 `rotate` 轮换。
 
 ## 参数
 
