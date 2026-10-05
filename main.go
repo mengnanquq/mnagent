@@ -73,7 +73,7 @@ func run(args []string) error {
 	}
 	log.Info("mnagent 已启动",
 		"version", version, "bot", cfg.botURL, "host", cfg.host,
-		"nexttrace", cfg.binary, "poll_timeout", cfg.pollTimeout)
+		"nexttrace", cfg.binary, "token_from", cfg.tokens.from, "poll_timeout", cfg.pollTimeout)
 	return agent.loop(ctx)
 }
 
@@ -173,7 +173,8 @@ func newTokenSource(value, file string) (*tokenSource, error) {
 		path = defaultTokenFile
 	}
 	if _, err := os.Stat(path); err != nil {
-		return nil, fmt.Errorf("读取令牌失败：%w（可用 -token-file 指定路径，或用 MNAGENT_TOKEN 传入）", err)
+		return nil, fmt.Errorf("读取令牌失败：%w（请确认服务用户对 %s 及其所在目录有访问权限——目录需要执行/进入权限；也可用 -token-file 或 MNAGENT_TOKEN 指定）",
+			err, path)
 	}
 	return &tokenSource{path: path, from: path}, nil
 }

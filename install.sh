@@ -169,17 +169,39 @@ if ! id -u "$RUN_USER" >/dev/null 2>&1; then
 		|| die "创建用户 $RUN_USER 失败"
 fi
 
+# 取服务用户的真实主组：它一定是该组成员，用主组给令牌目录授权最稳妥
+# （不能假设存在与用户名同名的组：useradd --system 在部分发行版不会创建同名组）。
+RUN_GROUP="$(id -gn "$RUN_USER" 2>/dev/null || echo "$RUN_USER")"
+
+# 令牌目录：root 拥有、服务用户主组可进入（0750），令牌文件本身 0600 归服务用户。
+# 服务用户必须能“穿过”该目录才能读到文件：目录若是 root:root 0750，非 root 服务
+# 会因 EACCES 直接退出（mnagent 启动时报“读取令牌失败: permission denied”）。
+TOKEN_DIR="$(dirname "$TOKEN_FILE")"
+if [ ! -d "$TOKEN_DIR" ]; then
+	install -d -m 0750 -o root -g "$RUN_GROUP" "$TOKEN_DIR"
+elif [ "$TOKEN_DIR" = "/etc/mnagent" ]; then
+	# 默认目录：修正旧版本可能留下的 root:root 0750（服务用户无法进入）
+	chown root:"$RUN_GROUP" "$TOKEN_DIR" 2>/dev/null || true
+	chmod 0750 "$TOKEN_DIR"
+else
+	warn "使用自定义令牌目录 $TOKEN_DIR：未改动其权限，请确认 $RUN_USER 能读取 $TOKEN_FILE"
+fi
+
 # 令牌：优先用参数写入；否则要求文件已存在（支持不把令牌写进命令行的场景）。
 if [ -n "$TOKEN" ]; then
-	install -d -m 0750 "$(dirname "$TOKEN_FILE")"
 	umask 077
 	printf '%s\n' "$TOKEN" > "$TOKEN_FILE"
-	chown "$RUN_USER" "$TOKEN_FILE" 2>/dev/null || true
-	chgrp "$RUN_USER" "$TOKEN_FILE" 2>/dev/null || true
+	chown "$RUN_USER":"$RUN_GROUP" "$TOKEN_FILE" 2>/dev/null || chown "$RUN_USER" "$TOKEN_FILE" 2>/dev/null || true
 	chmod 0600 "$TOKEN_FILE"
-	log "已写入令牌 $TOKEN_FILE（0600）"
+	log "已写入令牌 $TOKEN_FILE（0600，属主 $RUN_USER）"
 elif [ ! -s "$TOKEN_FILE" ]; then
 	die "缺少 --token，且 $TOKEN_FILE 不存在；请使用 /nexthost 生成的完整命令"
+fi
+
+# 自检：以服务用户身份确认能读到令牌。目录缺少执行（进入）权限时，非 root 服务会在
+# 启动阶段直接退出（mnagent 报“读取令牌失败: permission denied”），这里提前告警。
+if command -v runuser >/dev/null 2>&1 && ! runuser -u "$RUN_USER" -- test -r "$TOKEN_FILE" 2>/dev/null; then
+	warn "服务用户 $RUN_USER 读不到 $TOKEN_FILE：请确认 $TOKEN_DIR 的属主/权限为 root:$RUN_GROUP 0750"
 fi
 
 # nexttrace 需要原始套接字权限：给二进制授予能力，而不是把服务跑成 root。
