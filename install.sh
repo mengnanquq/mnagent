@@ -143,7 +143,12 @@ esac
 # uname -m 在 MIPS 上不区分大小端，只能看现有二进制的 ELF 头。
 elf_ei_data() {
 	[ -f "$1" ] || return 1
-	dd if="$1" bs=1 skip=5 count=1 2>/dev/null | od -An -tu1 2>/dev/null | tr -d ' \n'
+	byte="$(dd if="$1" bs=1 skip=5 count=1 2>/dev/null | od -An -tu1 2>/dev/null | tr -d ' ')"
+	if [ -z "$byte" ]; then
+		# 没有 od（或标志不被支持）时回退到 hexdump
+		byte="$(dd if="$1" bs=1 skip=5 count=1 2>/dev/null | hexdump -e '1/1 "%u"' 2>/dev/null)"
+	fi
+	printf '%s' "$byte"
 }
 
 # is_little_endian：借助 busybox/sh 的 ELF 头判断系统字节序。
@@ -158,7 +163,13 @@ is_little_endian() {
 }
 
 # 架构：Release 资产名为 mnagent_<os>_<arch>（均为静态二进制，musl/glibc 通用）。
-OS="$(uname -s | tr '[:upper:]' '[:lower:]')"
+# 注意不要用 tr 的字符类（[:upper:]/[:lower:]）：部分 BusyBox 构建不支持，会把
+# “Linux” 变成 “Linlx” 之类的结果（字符类被当成字面字符集），导致下载地址 404。
+case "$(uname -s)" in
+	Linux)  OS="linux";;
+	Darwin) OS="darwin";;
+	*)      OS="$(uname -s | tr 'A-Z' 'a-z')";;   # 显式区间，任何 tr 都支持
+esac
 MACHINE="$(uname -m)"
 case "$MACHINE" in
 	x86_64|amd64)   ARCH="amd64";;
@@ -306,8 +317,12 @@ case "$MODE" in
 		;;
 	auto)
 		if ! download_release; then
-			warn "下载 Release 失败（可能还没有 ${ARCH} 产物，或网络受限），改为从源码编译"
-			build_from_source
+			if command -v go >/dev/null 2>&1; then
+				warn "下载 Release 失败（可能还没有 ${OS}/${ARCH} 产物，或网络受限），改为从源码编译"
+				build_from_source
+			else
+				die "下载 ${OS}/${ARCH} 的 Release 产物失败：该架构可能暂无产物，或网络受限；本机没有 go 无法源码编译。可用 --binary <本地或镜像地址> 指定二进制，例如 --binary https://github.com/$REPO/releases/latest/download/mnagent_${OS}_${ARCH}"
+			fi
 		fi
 		;;
 esac

@@ -59,6 +59,9 @@ func TestInstallScriptIsPosixSh(t *testing.T) {
 		{"=~ 匹配符", regexp.MustCompile(`=~`)},
 		{"${!var} 间接引用", regexp.MustCompile(`\$\{!`)},
 		{"${var//} 替换", regexp.MustCompile(`\$\{[A-Za-z_][A-Za-z0-9_]*//`)},
+		// 部分 BusyBox 的 tr 不支持字符类（[:upper:] 会被当成字面字符集，
+		// 实测把 Linux 变成 Linlx 导致下载地址 404），因此只允许显式区间如 A-Z。
+		{"tr 字符类", regexp.MustCompile(`tr[^|;]*\[:[a-z]+:\]`)},
 	}
 	for i, line := range strings.Split(script, "\n") {
 		trimmed := strings.TrimSpace(line)
