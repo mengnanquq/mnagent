@@ -1,0 +1,39 @@
+[Unit]
+Description=mnagent (mengnanbot nexttrace agent)
+Documentation=https://github.com/mengnanquq/mnagent
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+# 建议专用低权限用户；nexttrace 需要的 CAP_NET_RAW 通过 setcap 授予二进制，
+# 不要为了追踪把整个服务跑成 root：
+#   sudo useradd --system --no-create-home --shell /usr/sbin/nologin mnagent
+#   sudo install -m 0755 mnagent /usr/local/bin/mnagent
+#   sudo setcap cap_net_raw,cap_net_admin+eip /usr/local/bin/nexttrace
+User=mnagent
+Group=mnagent
+
+# 令牌放在只有该用户可读的文件里（chmod 0600）。
+ExecStart=/usr/local/bin/mnagent \
+    -bot https://mnbot.example.org/agent \
+    -host hk \
+    -token-file /etc/mnagent/token \
+    -nexttrace /usr/local/bin/nexttrace
+
+Restart=always
+RestartSec=5
+
+# 基础加固：不提升权限、根文件系统只读、私有 /tmp。
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+ProtectKernelTunables=true
+ProtectControlGroups=true
+RestrictSUIDSGID=true
+LockPersonality=true
+MemoryDenyWriteExecute=true
+
+[Install]
+WantedBy=multi-user.target
