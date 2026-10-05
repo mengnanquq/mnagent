@@ -20,7 +20,14 @@ jobs:
         include:
           - { goos: linux, goarch: amd64 }
           - { goos: linux, goarch: arm64 }
-          - { goos: linux, goarch: arm }
+          # GOARM=5 的 32 位 ARM 二进制可运行在 ARMv5/6/7 上（OpenWrt 路由器多为 armv7/armv6）
+          - { goos: linux, goarch: arm, goarm: '5' }
+          # OpenWrt 上常见的 MIPS / RISC-V 目标（静态二进制，musl 通用）
+          - { goos: linux, goarch: mipsle }
+          - { goos: linux, goarch: mips }
+          - { goos: linux, goarch: mips64le }
+          - { goos: linux, goarch: mips64 }
+          - { goos: linux, goarch: riscv64 }
           - { goos: darwin, goarch: amd64 }
           - { goos: darwin, goarch: arm64 }
     steps:
@@ -34,6 +41,7 @@ jobs:
         env:
           GOOS: ${{ matrix.goos }}
           GOARCH: ${{ matrix.goarch }}
+          GOARM: ${{ matrix.goarm || '7' }}
           CGO_ENABLED: '0'
         run: |
           go build -trimpath -ldflags "-s -w -X main.version=${GITHUB_REF_NAME}" \
