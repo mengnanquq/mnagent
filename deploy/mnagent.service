@@ -20,6 +20,11 @@ ExecStart=/usr/local/bin/mnagent \
     -token-file /etc/mnagent/token \
     -nexttrace /usr/local/bin/nexttrace
 
+# nexttrace 需要可写的主目录来存放配置与 IP 库；ProtectSystem=strict 下只有
+# StateDirectory 指向的目录可写。
+StateDirectory=mnagent
+Environment=HOME=/var/lib/mnagent
+
 Restart=always
 RestartSec=5
 

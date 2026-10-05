@@ -233,6 +233,10 @@ Type=simple
 User=$RUN_USER
 Group=$RUN_USER
 ExecStart=$PREFIX/mnagent -bot $BOT_URL -host $HOST_NAME -token-file $TOKEN_FILE -nexttrace ${NEXTTRACE_PATH:-$NEXTTRACE_BIN}
+# nexttrace 需要可写的主目录来存放配置与 IP 库；ProtectSystem=strict 下只有
+# StateDirectory 指向的目录可写。
+StateDirectory=mnagent
+Environment=HOME=/var/lib/mnagent
 Restart=always
 RestartSec=5
 # 原始套接字权限由服务携带（ambient）并传给子进程 nexttrace；
@@ -253,8 +257,12 @@ WantedBy=multi-user.target
 EOF
 
 systemctl daemon-reload
-systemctl enable --now "$SERVICE_NAME"
+systemctl enable "$SERVICE_NAME" >/dev/null 2>&1 || true
+# 注意用 restart 而不是 enable --now：后者对“已经在运行”的服务不做任何事，
+# 升级时会出现“二进制换了、进程还是旧版本”的情况。
+systemctl restart "$SERVICE_NAME"
 sleep 1
 systemctl --no-pager --lines=5 status "$SERVICE_NAME" || true
+log "已重启服务，运行版本：$("$PREFIX/mnagent" -version 2>/dev/null || echo 未知)"
 
 log "安装完成。请在 Telegram 里发送 /nexthost list 确认该主机显示 🟢 在线"

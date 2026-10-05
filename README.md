@@ -25,7 +25,7 @@ curl -fsSL https://github.com/mengnanquq/mnagent/releases/latest/download/instal
     --bot https://<机器人地址>/agent --host hk --token <令牌>
 ```
 
-脚本会自动：从本仓库的 Release 下载预编译二进制（`mnagent_<os>_<arch>`，没有 Release 或网络受限时回退到源码编译）、创建专用用户、写入令牌（0600）、为 nexttrace 授予 `cap_net_raw`、写入 systemd 单元并启动服务。重复执行即为升级。
+脚本会自动：从本仓库的 Release 下载预编译二进制（`mnagent_<os>_<arch>`，没有 Release 或网络受限时回退到源码编译）、创建专用用户、写入令牌（0600）、写入 systemd 单元并**重启服务**（因此重复执行即为升级，会真正换上并运行新版本）。原始套接字能力由单元的 `AmbientCapabilities` 提供，并给服务准备了可写的主目录（`StateDirectory=mnagent`）供 `nexttrace` 存放配置与 IP 库。
 
 > 如果主机访问 GitHub 受限：把 `install.sh` 与对应架构的二进制放到内网镜像，用 `--binary https://内网镜像/mnagent_linux_amd64` 指定二进制即可；机器人侧也可用 `MNAGENT_INSTALL_URL` 把生成的脚本地址指向你的镜像。
 
