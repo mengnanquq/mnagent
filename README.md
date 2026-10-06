@@ -13,7 +13,7 @@
 
 ## 安装
 
-推荐用机器人生成的**一键命令**（管理员在 Telegram 里执行 `/nexthost add 香港节点`，机器人会直接回复下面这条命令）：
+推荐用机器人生成的**一键命令**（管理员在 Telegram 里执行 `/host add 香港节点`，机器人会直接回复下面这条命令）：
 
 ```sh
 (curl -fsSL https://raw.githubusercontent.com/mengnanquq/mnagent/main/install.sh \
@@ -91,7 +91,7 @@ GitHub Releases，发现比当前版本新的正式版就下载、原子替换�
 
 | 参数 | 默认值 | 说明 |
 | --- | --- | --- |
-| `--bot` / `--token` | 必填 | 由 `/nexthost add` 生成的命令已带全 |
+| `--bot` / `--token` | 必填 | 由 `/host add` 生成的命令已带全 |
 | `--token-file` | `/etc/mnagent/token` | 令牌文件路径；省略 `--token` 时要求该文件已存在 |
 | `--version` | `latest` | 安装的 Release 标签；也可用 `--from-source` 从源码编译 |
 | `--binary <path\|url>` | — | 使用自备的 mnagent（内网镜像时很有用） |
@@ -119,11 +119,11 @@ setcap cap_net_raw,cap_net_admin+eip "$(command -v nexttrace)"
 
 主机与令牌都由机器人管理（存放在状态数据库里，不再使用配置文件）：
 
-- `/nexthost add <名称> [备注]`：添加主机并生成一键接入命令
-- `/nexthost list`：查看主机与 🟢/⚪️ 在线状态
-- `/nexthost show <名称>`：重新显示接入命令
-- `/nexthost rotate <名称>`：轮换令牌（旧令牌立即失效，主机需重新接入）
-- `/nexthost remove <名称>`：删除主机
+- `/host add <名称> [备注]`：添加主机并生成一键接入命令
+- `/host list`：查看主机与 🟢/⚪️ 在线状态
+- `/host show <名称>`：重新显示接入命令
+- `/host rotate <名称>`：轮换令牌（旧令牌立即失效，主机需重新接入）
+- `/host remove <名称>`：删除主机
 
 名称只用于展示与 `/nexttrace @名称` 选择；令牌等同该主机的任务接受权，泄露时用 `rotate` 轮换。
 
@@ -178,7 +178,7 @@ POST /agent/results                 {"id":"…","output":"…","exit_code":0,"er
 
 | 现象 | 排查方向 |
 | --- | --- |
-| 日志反复 `鉴权失败` | 令牌与机器人不一致或已被轮换：用 `/nexthost rotate <名称>` 生成新命令重跑安装（或对比 `/etc/mnagent/token`） |
+| 日志反复 `鉴权失败` | 令牌与机器人不一致或已被轮换：用 `/host rotate <名称>` 生成新命令重跑安装（或对比 `/etc/mnagent/token`） |
 | 机器人显示 ⚪️ 离线 | agent 未运行、`-bot` 地址不可达（出站 443 被拦？）、或机器人的 `/agent/jobs` 未对外暴露 |
 | 任务报 `执行超时` | 主机到目标网络不通，或需要更长超时；也可在命令里减少跳数 |
 | 任务报 `执行失败（退出码 N）` | 手动在该主机执行同参数 `nexttrace` 复现；注意 `nexttrace -j` 需要 v1.7+，旧版本 agent 会自动去掉 `-j` 重试 |

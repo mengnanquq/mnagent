@@ -14,7 +14,7 @@ import (
 )
 
 // errUnauthorized 表示机器人拒绝了令牌，通常意味着配置错误或令牌已轮换。
-var errUnauthorized = errors.New("接入令牌被拒绝（请检查 /nexthost 配置与本机令牌是否一致）")
+var errUnauthorized = errors.New("接入令牌被拒绝（请检查 /host 配置与本机令牌是否一致）")
 
 // errUpdating 表示正在应用自动更新，暂停轮询。
 var errUpdating = errors.New("正在应用更新")

@@ -1,7 +1,7 @@
 #!/bin/sh
 # mnagent 一键安装脚本（本项目是它的唯一来源）。
 #
-# 机器人的 /nexthost add 会生成这样的命令，在目标主机上执行即可：
+# 机器人的 /host add 会生成这样的命令，在目标主机上执行即可：
 #   (curl -fsSL <脚本地址> || wget -qO- <脚本地址>) | sh -s -- \
 #     --bot https://<机器人地址>/agent --token <令牌>
 # 令牌即身份：机器人按令牌识别主机，主机上不需要（也不接受）名称参数。
@@ -271,7 +271,7 @@ case "$BOT_URL" in
 	http://*|https://*) ;;
 	*) die "--bot 必须是完整的 http(s) 地址：$BOT_URL";;
 esac
-# 主机名允许中英文（机器人侧 /nexthost add 可直接写“香港节点”），
+# 主机名允许中英文（机器人侧 /host add 可直接写“香港节点”），
 # 但必须挡住会被写进服务单元/命令行的特殊字符。
 
 # ---------- 安装二进制 ----------
@@ -377,7 +377,7 @@ if [ -n "$TOKEN" ]; then
 	chmod 0600 "$TOKEN_FILE"
 	log "已写入令牌 ${TOKEN_FILE}（0600，属主 ${RUN_USER}）"
 elif [ ! -s "$TOKEN_FILE" ]; then
-	die "缺少 --token，且 $TOKEN_FILE 不存在；请使用 /nexthost 生成的完整命令"
+	die "缺少 --token，且 $TOKEN_FILE 不存在；请使用 /host 生成的完整命令"
 fi
 
 # 自检：以服务用户身份确认能读到令牌（目录缺少进入权限时，非 root 服务启动即退出）。
@@ -457,7 +457,7 @@ install_procd_init() {
 	# OpenWrt：procd 服务脚本，以 root 运行，日志走 syslog（logread）。
 	cat > "$INIT_DIR/$SERVICE_NAME" <<EOF
 #!/bin/sh /etc/rc.common
-# mnagent：由机器人 /nexthost 生成的一键脚本安装；重跑安装脚本即为升级。
+# mnagent：由机器人 /host 生成的一键脚本安装；重跑安装脚本即为升级。
 
 START=95
 STOP=10
@@ -526,4 +526,4 @@ case "$PLATFORM" in
 		;;
 esac
 
-log "安装完成（平台：${PLATFORM}，架构：${ARCH}）。请在 Telegram 里发送 /nexthost list 确认该主机显示 🟢 在线"
+log "安装完成（平台：${PLATFORM}，架构：${ARCH}）。请在 Telegram 里发送 /host list 确认该主机显示 🟢 在线"
