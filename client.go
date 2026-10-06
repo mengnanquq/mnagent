@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"strings"
 	"sync/atomic"
@@ -82,10 +83,25 @@ type client struct {
 
 // newClient 构建通信客户端；轮询超时略大于机器人侧的长轮询保持时间。
 func newClient(cfg *config) *client {
+	transport := &http.Transport{
+		Proxy: http.ProxyFromEnvironment,
+		DialContext: (&net.Dialer{
+			Timeout:   15 * time.Second,
+			KeepAlive: 15 * time.Second,
+		}).DialContext,
+		ForceAttemptHTTP2:     true,
+		MaxIdleConns:          10,
+		IdleConnTimeout:       90 * time.Second,
+		TLSHandshakeTimeout:   10 * time.Second,
+		ExpectContinueTimeout: 1 * time.Second,
+	}
 	return &client{
 		baseURL: cfg.botURL,
 		tokens:  cfg.tokens,
-		http:    &http.Client{Timeout: cfg.pollTimeout},
+		http: &http.Client{
+			Transport: transport,
+			Timeout:   cfg.pollTimeout,
+		},
 	}
 }
 
