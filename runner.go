@@ -3,6 +3,7 @@ package main
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"math/rand/v2"
@@ -73,7 +74,48 @@ func newRunner(binary string, log logger) *runner {
 
 // run 执行一次任务，返回输出、错误文案与退出码。
 // 退出码 -1 表示任务本身非法（未执行）。
-func (r *runner) run(ctx context.Context, job Job) (output string, errText string, exitCode int) {
+// runResult 是一次任务的执行结果。
+type runResult struct {
+	Output   string          // 原始输出（trace）或摘要文本
+	Data     json.RawMessage // 结构化探针结果（ping/tcping/http/dns）
+	ErrText  string          // 面向用户的错误文案（成功为空）
+	ExitCode int
+}
+
+func (r *runner) run(ctx context.Context, job Job) runResult {
+	// 进程内探针：不依赖外部二进制，OpenWrt 等精简系统同样可用。
+	switch kind := probeKind(job); {
+	case kind == kindTrace:
+		return r.runTrace(ctx, job)
+	case isProbeKind(kind):
+		return r.runProbeJob(ctx, job, kind)
+	default:
+		// 未知类型立即失败，绝不退化成执行 nexttrace。
+		return runResult{ErrText: "未知探针类型：" + job.Kind, ExitCode: -1}
+	}
+}
+
+// runProbeJob 执行 ping/tcping/http/dns 探针并映射为统一结果。
+func (r *runner) runProbeJob(ctx context.Context, job Job, kind string) runResult {
+	runCtx, cancel := context.WithTimeout(ctx, job.Timeout())
+	defer cancel()
+	outcome, err := runProbe(runCtx, job)
+	result := runResult{Output: outcome.Output, Data: outcome.Data}
+	if err != nil {
+		result.ErrText = err.Error()
+		result.ExitCode = -1
+	}
+	return result
+}
+
+// runTrace 通过外部 nexttrace 执行一次路由追踪。
+func (r *runner) runTrace(ctx context.Context, job Job) runResult {
+	out, errText, exitCode := r.runNexttrace(ctx, job)
+	return runResult{Output: out, ErrText: errText, ExitCode: exitCode}
+}
+
+// runNexttrace 组装 argv、执行并处理 -j 兼容回退。
+func (r *runner) runNexttrace(ctx context.Context, job Job) (output string, errText string, exitCode int) {
 	args, err := r.argv(job)
 	if err != nil {
 		return "", err.Error(), -1
@@ -389,16 +431,18 @@ func (a *agent) updateOnce(ctx context.Context) bool {
 // execute 执行任务并回传结果。
 func (a *agent) execute(ctx context.Context, job Job) {
 	start := time.Now()
-	a.logger.Info("开始执行任务", "job", job.ID, "target", job.Target,
-		"hops", job.Hops, "port", job.Port, "protocol", job.Protocol)
+	a.logger.Info("开始执行任务", "job", job.ID, "kind", probeKind(job), "target", job.Target,
+		"hops", job.Hops, "port", job.Port, "protocol", job.Protocol, "count", job.Count)
 
-	output, errText, exitCode := a.runner.run(ctx, job)
+	run := a.runner.run(ctx, job)
+	output, errText, exitCode := run.Output, run.ErrText, run.ExitCode
 
 	// 回传不依赖任务上下文：即使任务超时或进程正在退出，也尽量让机器人拿到结果，
 	// 否则用户要一直等到超时。
 	sendCtx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 	defer cancel()
-	if err := a.client.sendResult(sendCtx, Result{ID: job.ID, Output: output, ExitCode: exitCode, Error: errText}); err != nil {
+	res := Result{ID: job.ID, Kind: probeKind(job), Output: output, ExitCode: exitCode, Error: errText, Data: run.Data}
+	if err := a.client.sendResult(sendCtx, res); err != nil {
 		a.logger.Warn("回传结果失败", "job", job.ID, "error", err)
 		return
 	}

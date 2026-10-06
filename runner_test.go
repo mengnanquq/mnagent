@@ -78,14 +78,14 @@ func TestRunnerExecutesWithoutShell(t *testing.T) {
 	r := newRunner(script, nil)
 
 	job := Job{Target: "1.1.1.1", Hops: 5}
-	out, errText, code := r.run(context.Background(), job)
-	if errText != "" || code != 0 {
-		t.Fatalf("执行失败: errText=%q code=%d", errText, code)
+	res := r.run(context.Background(), job)
+	if res.ErrText != "" || res.ExitCode != 0 {
+		t.Fatalf("执行失败: res.ErrText=%q res.ExitCode=%d", res.ErrText, res.ExitCode)
 	}
-	lines := strings.Split(strings.TrimSpace(out), "\n")
+	lines := strings.Split(strings.TrimSpace(res.Output), "\n")
 	want := []string{"-j", "-m", "5", "1.1.1.1"}
 	if len(lines) != len(want) {
-		t.Fatalf("参数个数 = %d（%q），期望 %d 个: %v", len(lines), out, len(want), want)
+		t.Fatalf("参数个数 = %d（%q），期望 %d 个: %v", len(lines), res.Output, len(want), want)
 	}
 	for i := range want {
 		if lines[i] != want[i] {
@@ -103,12 +103,12 @@ fi
 echo "TRACE OK"`)
 	r := newRunner(script, nil)
 
-	out, errText, code := r.run(context.Background(), Job{Target: "1.1.1.1"})
-	if errText != "" || code != 0 {
-		t.Fatalf("回退后应成功: errText=%q code=%d out=%q", errText, code, out)
+	res := r.run(context.Background(), Job{Target: "1.1.1.1"})
+	if res.ErrText != "" || res.ExitCode != 0 {
+		t.Fatalf("回退后应成功: res.ErrText=%q res.ExitCode=%d res.Output=%q", res.ErrText, res.ExitCode, res.Output)
 	}
-	if !strings.Contains(out, "TRACE OK") {
-		t.Fatalf("输出 = %q", out)
+	if !strings.Contains(res.Output, "TRACE OK") {
+		t.Fatalf("输出 = %q", res.Output)
 	}
 	if r.jsonOutput.Load() {
 		t.Fatal("回退后应记住该主机不支持 -j")
@@ -134,9 +134,9 @@ func TestRunnerTimeout(t *testing.T) {
 	r.waitDelay = 50 * time.Millisecond // 脚本派生的孙进程会占着管道，靠 WaitDelay 兜底
 
 	start := time.Now()
-	_, errText, _ := r.run(context.Background(), Job{Target: "1.1.1.1"})
-	if !strings.Contains(errText, "执行超时") {
-		t.Fatalf("应报告超时，实际 %q", errText)
+	res := r.run(context.Background(), Job{Target: "1.1.1.1"})
+	if !strings.Contains(res.ErrText, "执行超时") {
+		t.Fatalf("应报告超时，实际 %q", res.ErrText)
 	}
 	if elapsed := time.Since(start); elapsed > 2*time.Second {
 		t.Fatalf("超时未生效，耗时 %s", elapsed)
@@ -146,9 +146,9 @@ func TestRunnerTimeout(t *testing.T) {
 // TestRunnerReportsExitCode 验证非零退出码会被记录。
 func TestRunnerReportsExitCode(t *testing.T) {
 	r := newRunner(writeScript(t, `echo "boom" >&2; exit 7`), nil)
-	_, errText, code := r.run(context.Background(), Job{Target: "1.1.1.1"})
-	if code != 7 || !strings.Contains(errText, "退出码 7") {
-		t.Fatalf("code=%d errText=%q", code, errText)
+	res := r.run(context.Background(), Job{Target: "1.1.1.1"})
+	if res.ExitCode != 7 || !strings.Contains(res.ErrText, "退出码 7") {
+		t.Fatalf("code=%d res.ErrText=%q", res.ExitCode, res.ErrText)
 	}
 }
 
@@ -263,15 +263,15 @@ func TestSleepRespectsContext(t *testing.T) {
 // 而不是只报一个无从排查的“退出码 -1”。
 func TestRunnerReportsStartFailure(t *testing.T) {
 	r := newRunner(filepath.Join(t.TempDir(), "missing-nexttrace"), nil)
-	_, errText, code := r.run(context.Background(), Job{Target: "1.1.1.1"})
-	if code != -1 {
-		t.Fatalf("退出码 = %d，期望 -1", code)
+	res := r.run(context.Background(), Job{Target: "1.1.1.1"})
+	if res.ExitCode != -1 {
+		t.Fatalf("退出码 = %d，期望 -1", res.ExitCode)
 	}
-	if !strings.Contains(errText, "无法启动 nexttrace") || !strings.Contains(errText, "no such file") {
-		t.Fatalf("错误提示应包含真实原因: %q", errText)
+	if !strings.Contains(res.ErrText, "无法启动 nexttrace") || !strings.Contains(res.ErrText, "no such file") {
+		t.Fatalf("错误提示应包含真实原因: %q", res.ErrText)
 	}
-	if strings.Contains(errText, "退出码 -1）") {
-		t.Fatalf("不应只报退出码 -1: %q", errText)
+	if strings.Contains(res.ErrText, "退出码 -1）") {
+		t.Fatalf("不应只报退出码 -1: %q", res.ErrText)
 	}
 }
 

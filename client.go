@@ -19,13 +19,19 @@ var errUnauthorized = errors.New("接入令牌被拒绝（请检查 /nexthost �
 // errUpdating 表示正在应用自动更新，暂停轮询。
 var errUpdating = errors.New("正在应用更新")
 
-// Job 是机器人下发的追踪任务，字段与机器人侧 AgentJob 保持一致。
+// Job 是机器人下发的探测任务，字段与机器人侧 internal/agent 的 Job 保持一致。
+//
+// Kind 决定执行方式：空/"trace" 走 nexttrace；"ping"/"tcping"/"http"/"dns"
+// 由本进程内的探针实现（不依赖外部二进制）。
 type Job struct {
 	ID        string `json:"id"`
+	Kind      string `json:"kind,omitempty"`
 	Target    string `json:"target"`
 	Hops      int    `json:"hops,omitempty"`
 	Port      int    `json:"port,omitempty"`
 	Protocol  string `json:"protocol,omitempty"`
+	Count     int    `json:"count,omitempty"`
+	Query     string `json:"query,omitempty"`
 	TimeoutMS int64  `json:"timeout_ms"`
 }
 
@@ -47,12 +53,15 @@ func (j Job) Timeout() time.Duration {
 	return timeout
 }
 
-// Result 是回传给机器人的执行结果，字段与机器人侧 AgentResult 保持一致。
+// Result 是回传给机器人的执行结果，字段与机器人侧 internal/agent 的 Result 保持一致。
+// Data 携带结构化探针结果（ping/tcping/http/dns），由机器人负责排版展示。
 type Result struct {
-	ID       string `json:"id"`
-	Output   string `json:"output"`
-	ExitCode int    `json:"exit_code"`
-	Error    string `json:"error,omitempty"`
+	ID       string          `json:"id"`
+	Kind     string          `json:"kind,omitempty"`
+	Output   string          `json:"output"`
+	ExitCode int             `json:"exit_code"`
+	Error    string          `json:"error,omitempty"`
+	Data     json.RawMessage `json:"data,omitempty"`
 }
 
 // maxResponseBytes 限制解析响应体时读取的字节数。
