@@ -6,7 +6,10 @@ import (
 	"errors"
 	"fmt"
 	"math/rand/v2"
+	"net/http"
+	"os"
 	"os/exec"
+	"path/filepath"
 	"regexp"
 	"strconv"
 	"strings"
@@ -199,6 +202,7 @@ type agent struct {
 	logger logger
 	client *client
 	runner *runner
+	update *updater
 }
 
 // logger 是本包用到的最小日志接口，便于测试注入。
@@ -208,17 +212,33 @@ type logger interface {
 	Debug(msg string, args ...any)
 }
 
-// loop 不断领取任务并执行，直到 ctx 结束。
+// loop 不断领取任务并执行，直到 ctx 结束；启用自动更新时按周期检查新版本。
 func (a *agent) loop(ctx context.Context) error {
 	backoff := a.cfg.minBackoff
+	var nextCheck time.Time
 	for {
 		if ctx.Err() != nil {
 			return nil
+		}
+		if a.update != nil && a.cfg.autoUpdate && time.Now().After(nextCheck) {
+			if a.updateOnce(ctx) {
+				return nil // 已应用更新并重启：进程即将被替换。
+			}
+			// 加入抖动，避免多个部署实例在完全相同的时间并发请求。
+			jitter := time.Duration(rand.Int64N(int64(autoUpdateDefaultJitter)))
+			nextCheck = time.Now().Add(a.cfg.updateInterval + jitter)
 		}
 		job, err := a.client.poll(ctx)
 		if err != nil {
 			if ctx.Err() != nil {
 				return nil
+			}
+			if errors.Is(err, errUpdating) {
+				// 更新期间暂停轮询：短暂等待后继续。
+				if !sleep(ctx, 3*time.Second) {
+					return nil
+				}
+				continue
 			}
 			if errors.Is(err, errUnauthorized) {
 				// 令牌不对：配置问题，用最大间隔重试，避免刷日志。
@@ -241,6 +261,129 @@ func (a *agent) loop(ctx context.Context) error {
 		}
 		a.execute(ctx, *job)
 	}
+}
+
+// newUpdater 构建自更新器（自动更新、check/apply CLI 共用）。
+// newUpdater 构建自更新器（自动更新、check/apply CLI 共用）。
+func newUpdater(cfg *config, log logger) *updater {
+	exe, err := os.Executable()
+	if err != nil {
+		exe = cfg.binary // 极少出现；退回 -nexttrace 路径（仅用于日志）
+	}
+	platform, arch := detectPlatformArch()
+	return &updater{
+		repo:     "mengnanquq/mnagent",
+		platform: platform,
+		arch:     arch,
+		// 不自动跟随重定向：检查更新要读 Location 头（里面带版本号）。
+		client: &http.Client{
+			Timeout: updateCheckTimeout,
+			CheckRedirect: func(*http.Request, []*http.Request) error {
+				return http.ErrUseLastResponse
+			},
+		},
+		downloadClient: &http.Client{
+			Timeout: updateDownloadTimeout,
+		},
+		executable: exe,
+		skipFile:   filepath.Join(os.TempDir(), "mnagent-skip-versions"),
+		restart: func() error {
+			if log != nil {
+				log.Info("正在重启服务以应用新版本", "version", version)
+			}
+			// systemd 或 OpenWrt procd 都会通过各自的 init 重启；未知平台则直接退出，
+			// 交由守护进程（如进程管理器）拉起新版本。
+			return restartService()
+		},
+	}
+}
+
+// handleUpdateCLI 处理 --check-update / --apply-update / --skip-update。
+func handleUpdateCLI(cfg *config, log logger) (handled bool, err error) {
+	u := newUpdater(cfg, log)
+	exe, _ := os.Executable()
+	u.executable = exe
+	switch {
+	case cfg.skipUpdate != "":
+		ver := strings.TrimSpace(cfg.skipUpdate)
+		if _, ok := parseVersion(ver); !ok {
+			return true, fmt.Errorf("版本号格式非法：%q", ver)
+		}
+		if err := u.Skip(ver, 0); err != nil {
+			return true, err
+		}
+		fmt.Printf("已跳过版本 %s（24 小时内不再提示）\n", ver)
+		return true, nil
+	case cfg.checkUpdateOnce:
+		latest, ok, err := u.Check()
+		if err != nil {
+			return true, err
+		}
+		if ok {
+			fmt.Printf("发现新版本：%s（当前 %s）\n", latest, version)
+		} else {
+			fmt.Printf("已是最新版本（%s）\n", version)
+		}
+		return true, nil
+	case cfg.applyUpdate != "":
+		ver := cfg.applyUpdate
+		if ver == "latest" {
+			l, _, err := u.latestVersion()
+			if err != nil {
+				return true, err
+			}
+			ver = l
+		} else if _, ok := parseVersion(ver); !ok {
+			return true, fmt.Errorf("版本号格式非法：%q", ver)
+		}
+		fmt.Printf("正在下载并安装 %s ...\n", ver)
+		if err := u.Apply(ver); err != nil {
+			return true, err
+		}
+		fmt.Printf("已安装 %s，服务已重启\n", ver)
+		return true, nil
+	}
+	return false, nil
+}
+
+// restartService 重启 mnagent 服务（systemd 或 OpenWrt procd）。
+func restartService() error {
+	if _, err := exec.LookPath("systemctl"); err == nil {
+		out, err := exec.Command("systemctl", "restart", "mnagent").CombinedOutput()
+		if err != nil {
+			return fmt.Errorf("systemctl restart mnagent 失败: %w (%s)", err, strings.TrimSpace(string(out)))
+		}
+		return nil
+	}
+	if _, err := os.Stat("/etc/init.d/mnagent"); err == nil {
+		// OpenWrt procd 服务脚本
+		out, err := exec.Command("/etc/init.d/mnagent", "restart").CombinedOutput()
+		if err != nil {
+			return fmt.Errorf("/etc/init.d/mnagent restart 失败: %w (%s)", err, strings.TrimSpace(string(out)))
+		}
+		return nil
+	}
+	return errors.New("未找到 systemd 或 /etc/init.d/mnagent，无法自动重启（请手动重启服务）")
+}
+
+// updateOnce 执行一次自动更新检查；返回 true 表示已应用更新（进程将被重启）。
+func (a *agent) updateOnce(ctx context.Context) bool {
+	latest, ok, err := a.update.Check()
+	if err != nil {
+		a.logger.Warn("检查更新失败", "error", err)
+		return false
+	}
+	if !ok {
+		return false
+	}
+	a.logger.Info("发现新版本，开始更新", "from", version, "to", latest)
+	a.client.paused.Store(true) // 更新期间暂停轮询，避免新旧版本交替领取任务。
+	defer a.client.paused.Store(false)
+	if err := a.update.Apply(latest); err != nil {
+		a.logger.Warn("应用更新失败", "version", latest, "error", err)
+		return false
+	}
+	return true
 }
 
 // execute 执行任务并回传结果。

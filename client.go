@@ -10,11 +10,15 @@ import (
 	"net/http"
 	"net/url"
 	"strings"
+	"sync/atomic"
 	"time"
 )
 
 // errUnauthorized 表示机器人拒绝了令牌，通常意味着配置错误或令牌已轮换。
-var errUnauthorized = errors.New("接入令牌被拒绝（请检查 nexttrace_hosts.json 与本机令牌是否一致）")
+var errUnauthorized = errors.New("接入令牌被拒绝（请检查 /nexthost 配置与本机令牌是否一致）")
+
+// errUpdating 表示正在应用自动更新，暂停轮询。
+var errUpdating = errors.New("正在应用更新")
 
 // Job 是机器人下发的追踪任务，字段与机器人侧 AgentJob 保持一致。
 type Job struct {
@@ -64,6 +68,8 @@ type client struct {
 	host    string
 	tokens  *tokenSource
 	http    *http.Client
+
+	paused atomic.Bool // 更新期间暂停轮询，避免新旧版本交替领取任务。
 }
 
 // newClient 构建通信客户端；轮询超时略大于机器人侧的长轮询保持时间。
@@ -78,6 +84,9 @@ func newClient(cfg *config) *client {
 
 // poll 领取一个任务；无任务时返回 (nil, nil)。
 func (c *client) poll(ctx context.Context) (*Job, error) {
+	if c.paused.Load() {
+		return nil, errUpdating
+	}
 	resp, err := c.do(ctx, http.MethodPost, "/jobs", nil)
 	if err != nil {
 		return nil, err

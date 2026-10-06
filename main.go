@@ -45,6 +45,12 @@ type config struct {
 	maxBackoff  time.Duration
 	pollTimeout time.Duration
 	logLevel    slog.Level
+
+	autoUpdate      bool
+	updateInterval  time.Duration
+	checkUpdateOnce bool
+	applyUpdate     string
+	skipUpdate      string
 }
 
 func main() {
@@ -65,15 +71,22 @@ func run(args []string) error {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
+	// CLI 模式：检查/应用/跳过更新（不进入常驻循环）。
+	if handled, err := handleUpdateCLI(cfg, log); handled {
+		return err
+	}
+
 	agent := &agent{
 		cfg:    cfg,
 		logger: log,
 		client: newClient(cfg),
 		runner: newRunner(cfg.binary, log),
+		update: newUpdater(cfg, log),
 	}
 	log.Info("mnagent 已启动",
 		"version", version, "bot", cfg.botURL, "host", cfg.host,
-		"nexttrace", cfg.binary, "token_from", cfg.tokens.from, "poll_timeout", cfg.pollTimeout)
+		"nexttrace", cfg.binary, "token_from", cfg.tokens.from,
+		"poll_timeout", cfg.pollTimeout, "auto_update", cfg.autoUpdate)
 	return agent.loop(ctx)
 }
 
@@ -89,6 +102,11 @@ func parseConfig(args []string) (*config, error) {
 		minBackoff = fs.Duration("min-backoff", defaultMinBackoff, "轮询失败后的最小重试间隔")
 		maxBackoff = fs.Duration("max-backoff", defaultMaxBackoff, "轮询失败后的最大重试间隔")
 		pollWait   = fs.Duration("poll-timeout", defaultPollWait, "单次长轮询的客户端超时")
+		autoUpdate = fs.Bool("auto-update", false, "自动更新：定期检查 GitHub Releases，有新版本时下载并重启服务")
+		updateIntv = fs.Duration("update-interval", autoUpdateDefaultInterval, "自动更新检查间隔")
+		checkUpd   = fs.Bool("check-update", false, "检查一次更新后退出（不下载）")
+		applyUpd   = fs.String("apply-update", "", "下载并安装指定版本后退出（如 v0.1.7）；latest 表示最新版")
+		skipUpd    = fs.String("skip-update", "", "跳过指定版本一段时间（如 v0.1.7，默认 24 小时）")
 		logLevel   = fs.String("log-level", "info", "日志级别：debug / info / warn / error")
 		showVer    = fs.Bool("version", false, "输出版本后退出")
 	)
@@ -100,15 +118,19 @@ func parseConfig(args []string) (*config, error) {
 		os.Exit(0)
 	}
 
+	isUpdateCLI := *checkUpd || strings.TrimSpace(*applyUpd) != "" || strings.TrimSpace(*skipUpd) != ""
+
 	endpoint := strings.TrimRight(strings.TrimSpace(*botURL), "/")
-	if endpoint == "" {
+	if endpoint == "" && !isUpdateCLI {
 		return nil, errors.New("必须指定 -bot（例如 https://mnbot.example.org/agent）")
 	}
-	parsed, err := url.Parse(endpoint)
-	if err != nil || (parsed.Scheme != "http" && parsed.Scheme != "https") || parsed.Host == "" {
-		return nil, fmt.Errorf("-bot 必须是完整的 http(s) 地址，收到 %q", *botURL)
+	if endpoint != "" {
+		parsed, err := url.Parse(endpoint)
+		if err != nil || (parsed.Scheme != "http" && parsed.Scheme != "https") || parsed.Host == "" {
+			return nil, fmt.Errorf("-bot 必须是完整的 http(s) 地址，收到 %q", *botURL)
+		}
 	}
-	if !hostNameRe.MatchString(strings.TrimSpace(*hostName)) {
+	if !isUpdateCLI && !hostNameRe.MatchString(strings.TrimSpace(*hostName)) {
 		return nil, errors.New("-host 只能包含字母、数字、点、下划线与连字符，且不能为空")
 	}
 	if *minBackoff <= 0 || *maxBackoff < *minBackoff {
@@ -118,15 +140,28 @@ func parseConfig(args []string) (*config, error) {
 		return nil, errors.New("-poll-timeout 应大于 1 秒")
 	}
 
-	tokens, err := newTokenSource(*tokenValue, *tokenFile)
-	if err != nil {
-		return nil, err
+	var tokens *tokenSource
+	if !isUpdateCLI {
+		var err error
+		tokens, err = newTokenSource(*tokenValue, *tokenFile)
+		if err != nil {
+			return nil, err
+		}
 	}
-	path, err := exec.LookPath(*binary)
-	if err != nil {
-		return nil, fmt.Errorf("找不到 nexttrace 可执行文件 %q：%w", *binary, err)
+	var path string
+	if !isUpdateCLI {
+		var err error
+		path, err = exec.LookPath(*binary)
+		if err != nil {
+			return nil, fmt.Errorf("找不到 nexttrace 可执行文件 %q：%w", *binary, err)
+		}
+	} else {
+		path = *binary
 	}
 
+	if *updateIntv <= 0 {
+		*updateIntv = autoUpdateDefaultInterval
+	}
 	return &config{
 		botURL:      endpoint,
 		host:        strings.TrimSpace(*hostName),
@@ -136,6 +171,12 @@ func parseConfig(args []string) (*config, error) {
 		maxBackoff:  *maxBackoff,
 		pollTimeout: *pollWait,
 		logLevel:    parseLogLevel(*logLevel),
+
+		autoUpdate:      *autoUpdate,
+		updateInterval:  *updateIntv,
+		checkUpdateOnce: *checkUpd,
+		applyUpdate:     strings.TrimSpace(*applyUpd),
+		skipUpdate:      strings.TrimSpace(*skipUpd),
 	}, nil
 }
 

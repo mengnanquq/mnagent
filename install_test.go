@@ -154,10 +154,11 @@ func TestInstallScriptKeepsKeySafeguards(t *testing.T) {
 		{"服务用户主组取自 id -gn", `RUN_GROUP="$(id -gn "$RUN_USER"`},
 		{"默认令牌目录权限修正", `[ "$TOKEN_DIR" = "/etc/mnagent" ]`},
 		{"安装后校验服务用户可读令牌", "runuser -u"},
-		{"升级时真正重启服务", `systemctl restart "$SERVICE_NAME"`},
-		{"原始套接字能力由服务携带", "AmbientCapabilities=CAP_NET_RAW CAP_NET_ADMIN"},
-		{"为 nexttrace 准备可写主目录", "StateDirectory=mnagent"},
-	} {
+			{"升级时真正重启服务", `systemctl restart "$SERVICE_NAME"`},
+			{"原始套接字能力由服务携带", "AmbientCapabilities=CAP_NET_RAW CAP_NET_ADMIN"},
+			{"为 nexttrace 准备可写主目录", "StateDirectory=mnagent"},
+			{"自动更新可写目录", "ReadWritePaths=$PREFIX"},
+		} {
 		if !strings.Contains(script, want.needle) {
 			t.Errorf("install.sh 缺少“%s”（应包含 %q）", want.name, want.needle)
 		}

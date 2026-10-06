@@ -34,6 +34,8 @@ MODE="auto"        # auto | release | source | binary
 BINARY_SRC=""
 UNINSTALL="no"
 SERVICE_NAME="mnagent"
+AUTO_UPDATE="no"
+UPDATE_INTERVAL="6h"
 
 log()  { printf '\033[1;32m==>\033[0m %s\n' "$*"; }
 warn() { printf '\033[1;33m警告:\033[0m %s\n' "$*" >&2; }
@@ -101,6 +103,8 @@ while [ $# -gt 0 ]; do
 		--user)        RUN_USER="${2:-}"; shift 2;;
 		--prefix)      PREFIX="${2:-}"; shift 2;;
 		--uninstall)   UNINSTALL="yes"; shift;;
+		--auto-update) AUTO_UPDATE="yes"; shift;;
+		--update-interval) UPDATE_INTERVAL="${2:-}"; shift 2;;
 		*) die "未知参数：$1（用 --help 查看用法）";;
 	esac
 done
@@ -395,6 +399,12 @@ NEXTTRACE_PATH="$(command -v "$NEXTTRACE_BIN" 2>/dev/null || true)"
 [ -n "$NEXTTRACE_PATH" ] || warn "未找到 nexttrace（${NEXTTRACE_BIN}）：请安装后再试，否则追踪会失败"
 NEXTTRACE_EXEC="${NEXTTRACE_PATH:-$NEXTTRACE_BIN}"
 
+# 自动更新参数：启用时追加到服务命令（systemd 与 procd 共用）。
+AUTO_UPDATE_ARGS=""
+if [ "$AUTO_UPDATE" = "yes" ]; then
+	AUTO_UPDATE_ARGS=" -auto-update -update-interval $UPDATE_INTERVAL"
+fi
+
 # ---------- 安装服务 ----------
 
 install_systemd_unit() {
@@ -410,12 +420,13 @@ Wants=network-online.target
 Type=simple
 User=$RUN_USER
 Group=$RUN_GROUP
-ExecStart=$PREFIX/mnagent -bot $BOT_URL -host $HOST_NAME -token-file $TOKEN_FILE -nexttrace $NEXTTRACE_EXEC
-# nexttrace 需要可写的主目录来存放配置与 IP 库；ProtectSystem=strict 下只有
-# StateDirectory 指向的目录可写。
-StateDirectory=mnagent
-Environment=HOME=/var/lib/mnagent
-Restart=always
+ExecStart=$PREFIX/mnagent -bot $BOT_URL -host $HOST_NAME -token-file $TOKEN_FILE -nexttrace $NEXTTRACE_EXEC$AUTO_UPDATE_ARGS
+	# nexttrace 需要可写的主目录来存放配置与 IP 库；ProtectSystem=strict 下只有
+	# StateDirectory 指向的目录可写。
+	StateDirectory=mnagent
+	Environment=HOME=/var/lib/mnagent
+	ReadWritePaths=$PREFIX
+	Restart=always
 RestartSec=5
 AmbientCapabilities=CAP_NET_RAW CAP_NET_ADMIN
 CapabilityBoundingSet=CAP_NET_RAW CAP_NET_ADMIN
@@ -455,14 +466,14 @@ START=95
 STOP=10
 USE_PROCD=1
 
-start_service() {
-	procd_open_instance
-	procd_set_param command $PREFIX/mnagent \\
-		-bot $BOT_URL \\
-		-host $HOST_NAME \\
-		-token-file $TOKEN_FILE \\
-		-nexttrace $NEXTTRACE_EXEC
-	procd_set_param respawn
+	start_service() {
+		procd_open_instance
+		procd_set_param command $PREFIX/mnagent \\
+			-bot $BOT_URL \\
+			-host $HOST_NAME \\
+			-token-file $TOKEN_FILE \\
+			-nexttrace $NEXTTRACE_EXEC$AUTO_UPDATE_ARGS
+		procd_set_param respawn
 	procd_set_param stdout 1
 	procd_set_param stderr 1
 EOF
