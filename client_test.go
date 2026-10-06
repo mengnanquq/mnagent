@@ -203,3 +203,21 @@ func TestParseConfigValidation(t *testing.T) {
 		t.Fatalf("botURL 未去除末尾斜杠: %q", cfg.botURL)
 	}
 }
+
+// TestParseConfigHostOptional 验证 -host 可省略：令牌即身份，名称只用于展示。
+func TestParseConfigHostOptional(t *testing.T) {
+	cfg, err := parseConfig([]string{"-bot", "https://x/agent", "-token", "t", "-nexttrace", "/bin/echo"})
+	if err != nil {
+		t.Fatalf("省略 -host 应当合法：%v", err)
+	}
+	if cfg.host != "" {
+		t.Fatalf("未提供名称时 host 应为空，实际 %q", cfg.host)
+	}
+	// 提供名称时仍要校验字符集。
+	if _, err := parseConfig([]string{"-bot", "https://x/agent", "-token", "t", "-host", "a b", "-nexttrace", "/bin/echo"}); err == nil {
+		t.Fatal("含空格的名称应报错")
+	}
+	if _, err := parseConfig([]string{"-bot", "https://x/agent", "-token", "t", "-host", "四川资阳电信", "-nexttrace", "/bin/echo"}); err != nil {
+		t.Fatalf("中文名称应当合法：%v", err)
+	}
+}

@@ -5,6 +5,7 @@
 它主动向机器人**长轮询**领取任务、在本机执行 `nexttrace`、再回传结果。因此：
 
 - 主机**不需要公网地址**，不需要端口映射、反向隧道或 VPN——只要能在出站方向访问机器人；
+- 接入只需一个令牌（`--token`）：机器人按令牌识别是哪台主机，主机上不需要填名称；
 - 主机**不需要 SSH**，不需要开放任何入站端口，机器人也不持有登录这些主机的密钥；
 - 机器人下发的只是**已校验的追踪参数**（目标/跳数/端口/协议），执行哪个程序由本机的 `-nexttrace` 参数决定，网络侧无法指定命令；
 - 长轮询本身就是心跳，机器人的主机选择键盘可以显示 🟢 在线 / ⚪️ 离线。
@@ -16,8 +17,11 @@
 ```sh
 (curl -fsSL https://raw.githubusercontent.com/mengnanquq/mnagent/main/install.sh \
   || wget -qO- https://raw.githubusercontent.com/mengnanquq/mnagent/main/install.sh) \
-  | sh -s -- --bot https://<机器人地址>/agent --host hk --token <令牌>
+  | sh -s -- --bot https://<机器人地址>/agent --token <令牌>
 ```
+
+命令里只有令牌：**令牌即身份**，机器人按令牌识别是哪台主机，因此不需要在主机上写名称
+（`--host` 仍可用，仅用于让日志里显示得更好认）。
 
 命令用 `sh` 并带 `wget` 回退，因此 VPS 与 OpenWrt 路由器可以粘同一条；非 root 用户由脚本自己通过 `sudo` 提权重跑。
 
@@ -25,7 +29,7 @@
 
 ```sh
 SCRIPT=https://github.com/mengnanquq/mnagent/releases/latest/download/install.sh
-(curl -fsSL "$SCRIPT" || wget -qO- "$SCRIPT") | sh -s -- --bot https://<机器人地址>/agent --host hk --token <令牌>
+(curl -fsSL "$SCRIPT" || wget -qO- "$SCRIPT") | sh -s -- --bot https://<机器人地址>/agent --token <令牌>
 ```
 
 脚本会自动：从本仓库的 Release 下载预编译二进制（`mnagent_<os>_<arch>`，没有 Release 或网络受限时回退到源码编译）、创建专用用户、写入令牌（0600）、写入 systemd 单元并**重启服务**（因此重复执行即为升级，会真正换上并运行新版本）。原始套接字能力由单元的 `AmbientCapabilities` 提供，并给服务准备了可写的主目录（`StateDirectory=mnagent`）供 `nexttrace` 存放配置与 IP 库。
@@ -74,7 +78,7 @@ GitHub Releases，发现比当前版本新的正式版就下载、原子替换�
 
 | 参数 | 默认值 | 说明 |
 | --- | --- | --- |
-| `--bot` / `--host` / `--token` | 必填 | 由 `/nexthost add` 生成的命令已带全 |
+| `--bot` / `--token` | 必填 | 由 `/nexthost add` 生成的命令已带全（无需 `--host`） |
 | `--token-file` | `/etc/mnagent/token` | 令牌文件路径；省略 `--token` 时要求该文件已存在 |
 | `--version` | `latest` | 安装的 Release 标签；也可用 `--from-source` 从源码编译 |
 | `--binary <path\|url>` | — | 使用自备的 mnagent（内网镜像时很有用） |

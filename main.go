@@ -113,7 +113,7 @@ func parseConfig(args []string) (*config, error) {
 	fs := flag.NewFlagSet("mnagent", flag.ContinueOnError)
 	var (
 		botURL     = fs.String("bot", "", "机器人 agent 端点基地址，例如 https://mnbot.example.org/agent")
-		hostName   = fs.String("host", "", "本机名称，需与机器人 nexttrace_hosts.json 中的 name 一致")
+		hostName   = fs.String("host", "", "本机名称（可选）：令牌已能识别主机，名称仅用于展示；与机器人 /nexthost 里的名称一致时更直观")
 		tokenValue = fs.String("token", "", "接入令牌（不推荐：优先用 -token-file 或 MNAGENT_TOKEN）")
 		tokenFile  = fs.String("token-file", "", "存放接入令牌的文件路径（默认 "+defaultTokenFile+"）")
 		binary     = fs.String("nexttrace", "nexttrace", "nexttrace 可执行文件路径或在 PATH 中的名称")
@@ -148,8 +148,9 @@ func parseConfig(args []string) (*config, error) {
 			return nil, fmt.Errorf("-bot 必须是完整的 http(s) 地址，收到 %q", *botURL)
 		}
 	}
-	if !isUpdateCLI && !validHostName(strings.TrimSpace(*hostName)) {
-		return nil, fmt.Errorf("-host 不能为空、不能超过 %d 个字符，也不能包含空白或特殊字符（如斜杠、引号、美元符号、分号、反引号等）", maxHostNameRunes)
+	// -host 可选：令牌即身份，名称只是给机器人做展示；提供时仍做校验。
+	if name := strings.TrimSpace(*hostName); !isUpdateCLI && name != "" && !validHostName(name) {
+		return nil, fmt.Errorf("-host 不能超过 %d 个字符，也不能包含空白或特殊字符（如斜杠、引号、美元符号、分号、反引号等）", maxHostNameRunes)
 	}
 	if *minBackoff <= 0 || *maxBackoff < *minBackoff {
 		return nil, errors.New("-min-backoff / -max-backoff 不合法")

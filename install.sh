@@ -48,7 +48,7 @@ usage() {
 
 参数：
   --bot <url>          机器人 agent 端点基地址（必填，如 https://mnbot.example.org/agent）
-  --host <name>        本机名称，需与机器人的 /nexthost add 名称一致（必填）
+  --host <name>        本机名称（可省略）：令牌即身份，名称只用于展示
   --token <token>      接入令牌（必填；也可省略，前提是 --token-file 已存在）
   --token-file <path>  令牌文件路径（默认 /etc/mnagent/token）
   --nexttrace <path>   nexttrace 可执行文件路径或名称（默认 nexttrace）
@@ -273,15 +273,16 @@ case "$BOT_URL" in
 	http://*|https://*) ;;
 	*) die "--bot 必须是完整的 http(s) 地址：$BOT_URL";;
 esac
-[ -n "$HOST_NAME" ] || die "缺少 --host"
 # 主机名允许中英文（机器人侧 /nexthost add 可直接写“香港节点”），
 # 但必须挡住会被写进服务单元/命令行的特殊字符。
+if [ -n "$HOST_NAME" ]; then
 case "$HOST_NAME" in
 	*" "*|*"'"*|*'"'*|*'\'*|*'$'*|*'`'*|*';'*|*'|'*|*'&'*|*'<'*|*'>'*|*'('*|*')'*|*'['*|*']'*|*'{'*|*'}'*|*'*'*|*'?'*|*'!'*|*'~'*|*'#'*|*'%'*|*','*|*':'*|*'/'*)
 		die "--host 不能包含空白、斜杠、引号、反引号、美元符号、分号、& | < > 等特殊字符"
 		;;
 esac
 [ "${#HOST_NAME}" -le 32 ] || die "--host 过长（最多 32 个字符）"
+fi
 
 # ---------- 安装二进制 ----------
 
@@ -404,6 +405,12 @@ NEXTTRACE_PATH="$(command -v "$NEXTTRACE_BIN" 2>/dev/null || true)"
 [ -n "$NEXTTRACE_PATH" ] || warn "未找到 nexttrace（${NEXTTRACE_BIN}）：请安装后再试，否则追踪会失败"
 NEXTTRACE_EXEC="${NEXTTRACE_PATH:-$NEXTTRACE_BIN}"
 
+# 名称参数（可选）：令牌即身份，未提供名称时不追加 -host。
+HOST_ARGS=""
+if [ -n "$HOST_NAME" ]; then
+	HOST_ARGS=" -host '$HOST_NAME'"
+fi
+
 # 自动更新参数：启用时追加到服务命令（systemd 与 procd 共用）。
 AUTO_UPDATE_ARGS=""
 if [ "$AUTO_UPDATE" = "yes" ]; then
@@ -425,7 +432,7 @@ Wants=network-online.target
 Type=simple
 User=$RUN_USER
 Group=$RUN_GROUP
-ExecStart=$PREFIX/mnagent -bot $BOT_URL -host "$HOST_NAME" -token-file $TOKEN_FILE -nexttrace $NEXTTRACE_EXEC$AUTO_UPDATE_ARGS
+ExecStart=$PREFIX/mnagent -bot $BOT_URL$HOST_ARGS -token-file $TOKEN_FILE -nexttrace $NEXTTRACE_EXEC$AUTO_UPDATE_ARGS
 	# nexttrace 需要可写的主目录来存放配置与 IP 库；ProtectSystem=strict 下只有
 	# StateDirectory 指向的目录可写。
 	StateDirectory=mnagent
@@ -474,13 +481,12 @@ USE_PROCD=1
 	start_service() {
 		procd_open_instance
 		procd_set_param command $PREFIX/mnagent \\
-			-bot $BOT_URL \\
-			-host '$HOST_NAME' \\
+			-bot $BOT_URL$HOST_ARGS \\
 			-token-file $TOKEN_FILE \\
 			-nexttrace $NEXTTRACE_EXEC$AUTO_UPDATE_ARGS
 		procd_set_param respawn
-	procd_set_param stdout 1
-	procd_set_param stderr 1
+		procd_set_param stdout 1
+		procd_set_param stderr 1
 EOF
 	if [ "$RUN_USER" != "root" ]; then
 		printf '\tprocd_set_param user %s\n' "$RUN_USER" >> "$INIT_DIR/$SERVICE_NAME"
