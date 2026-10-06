@@ -3,7 +3,8 @@
 #
 # 机器人的 /nexthost add 会生成这样的命令，在目标主机上执行即可：
 #   (curl -fsSL <脚本地址> || wget -qO- <脚本地址>) | sh -s -- \
-#     --bot https://<机器人地址>/agent --host <名称> --token <令牌>
+#     --bot https://<机器人地址>/agent --token <令牌>
+# 令牌即身份：机器人按令牌识别主机，因此无需在主机上填写名称（--host 可选，仅用于展示）。
 #
 # 支持两类平台：
 #   * systemd（Debian/Ubuntu/CentOS 等）：生成 /etc/systemd/system/mnagent.service，
