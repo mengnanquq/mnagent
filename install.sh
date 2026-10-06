@@ -34,7 +34,7 @@ MODE="auto"        # auto | release | source | binary
 BINARY_SRC=""
 UNINSTALL="no"
 SERVICE_NAME="mnagent"
-AUTO_UPDATE="no"
+AUTO_UPDATE="yes"   # 默认开启自动更新（可 --auto-update no 关闭）
 UPDATE_INTERVAL="6h"
 
 log()  { printf '\033[1;32m==>\033[0m %s\n' "$*"; }
@@ -103,7 +103,8 @@ while [ $# -gt 0 ]; do
 		--user)        RUN_USER="${2:-}"; shift 2;;
 		--prefix)      PREFIX="${2:-}"; shift 2;;
 		--uninstall)   UNINSTALL="yes"; shift;;
-		--auto-update) AUTO_UPDATE="yes"; shift;;
+		--auto-update)  AUTO_UPDATE="yes"; shift;;
+		--no-auto-update) AUTO_UPDATE="no"; shift;;
 		--update-interval) UPDATE_INTERVAL="${2:-}"; shift 2;;
 		*) die "未知参数：$1（用 --help 查看用法）";;
 	esac
@@ -273,10 +274,14 @@ case "$BOT_URL" in
 	*) die "--bot 必须是完整的 http(s) 地址：$BOT_URL";;
 esac
 [ -n "$HOST_NAME" ] || die "缺少 --host"
+# 主机名允许中英文（机器人侧 /nexthost add 可直接写“香港节点”），
+# 但必须挡住会被写进服务单元/命令行的特殊字符。
 case "$HOST_NAME" in
-	*[!A-Za-z0-9._-]*) die "--host 只能包含字母、数字、点、下划线与连字符：$HOST_NAME";;
+	*" "*|*"'"*|*'"'*|*'\'*|*'$'*|*'`'*|*';'*|*'|'*|*'&'*|*'<'*|*'>'*|*'('*|*')'*|*'['*|*']'*|*'{'*|*'}'*|*'*'*|*'?'*|*'!'*|*'~'*|*'#'*|*'%'*|*','*|*':'*|*'/'*)
+		die "--host 不能包含空白、斜杠、引号、反引号、美元符号、分号、& | < > 等特殊字符"
+		;;
 esac
-[ "${#HOST_NAME}" -le 64 ] || die "--host 过长（最多 64 字符）"
+[ "${#HOST_NAME}" -le 32 ] || die "--host 过长（最多 32 个字符）"
 
 # ---------- 安装二进制 ----------
 
@@ -420,7 +425,7 @@ Wants=network-online.target
 Type=simple
 User=$RUN_USER
 Group=$RUN_GROUP
-ExecStart=$PREFIX/mnagent -bot $BOT_URL -host $HOST_NAME -token-file $TOKEN_FILE -nexttrace $NEXTTRACE_EXEC$AUTO_UPDATE_ARGS
+ExecStart=$PREFIX/mnagent -bot $BOT_URL -host "$HOST_NAME" -token-file $TOKEN_FILE -nexttrace $NEXTTRACE_EXEC$AUTO_UPDATE_ARGS
 	# nexttrace 需要可写的主目录来存放配置与 IP 库；ProtectSystem=strict 下只有
 	# StateDirectory 指向的目录可写。
 	StateDirectory=mnagent
@@ -470,7 +475,7 @@ USE_PROCD=1
 		procd_open_instance
 		procd_set_param command $PREFIX/mnagent \\
 			-bot $BOT_URL \\
-			-host $HOST_NAME \\
+			-host '$HOST_NAME' \\
 			-token-file $TOKEN_FILE \\
 			-nexttrace $NEXTTRACE_EXEC$AUTO_UPDATE_ARGS
 		procd_set_param respawn

@@ -15,17 +15,35 @@ import (
 	"os"
 	"os/exec"
 	"os/signal"
-	"regexp"
 	"strings"
 	"syscall"
 	"time"
+	"unicode/utf8"
 )
 
 // version 由构建时注入（-ldflags "-X main.version=..."），默认 dev。
 var version = "dev"
 
-// hostNameRe 限制主机名可用字符：它会出现在请求参数里，也可能被用于日志。
-var hostNameRe = regexp.MustCompile(`^[A-Za-z0-9._-]{1,64}$`)
+// hostNameForbidden 是不能出现在主机名里的字符：空白、shell/systemd 元字符，
+// 以及会破坏 URL 与路径的字符。主机名会被写进服务单元与命令行，必须挡住它们。
+const hostNameForbidden = " \t\n\r/\\'\"`$;&|<>()[]{}*?!~#%,:"
+
+// maxHostNameRunes 限制主机名长度（按字符数计，中文名同样适用）。
+const maxHostNameRunes = 32
+
+// validHostName 校验主机名：允许中英文等可见字符（/nexthost add 里可以直接写
+// “香港节点”这类名字），但不允许空白、控制字符与上表中的特殊字符。
+func validHostName(name string) bool {
+	if name == "" || utf8.RuneCountInString(name) > maxHostNameRunes {
+		return false
+	}
+	for _, r := range name {
+		if r < 0x21 || r == 0x7f || strings.ContainsRune(hostNameForbidden, r) {
+			return false
+		}
+	}
+	return true
+}
 
 // 默认参数。
 const (
@@ -130,8 +148,8 @@ func parseConfig(args []string) (*config, error) {
 			return nil, fmt.Errorf("-bot 必须是完整的 http(s) 地址，收到 %q", *botURL)
 		}
 	}
-	if !isUpdateCLI && !hostNameRe.MatchString(strings.TrimSpace(*hostName)) {
-		return nil, errors.New("-host 只能包含字母、数字、点、下划线与连字符，且不能为空")
+	if !isUpdateCLI && !validHostName(strings.TrimSpace(*hostName)) {
+		return nil, fmt.Errorf("-host 不能为空、不能超过 %d 个字符，也不能包含空白或特殊字符（如斜杠、引号、美元符号、分号、反引号等）", maxHostNameRunes)
 	}
 	if *minBackoff <= 0 || *maxBackoff < *minBackoff {
 		return nil, errors.New("-min-backoff / -max-backoff 不合法")

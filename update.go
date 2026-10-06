@@ -86,8 +86,8 @@ type updater struct {
 	arch           string // amd64|arm64|arm|mipsle…（资产命名用）
 	client         *http.Client
 	downloadClient *http.Client
-	executable     string // 当前二进制路径（os.Executable 解析后）
-	skipFile       string // 跳过版本记录文件
+	executable     string       // 当前二进制路径（os.Executable 解析后）
+	skipFile       string       // 跳过版本记录文件
 	restart        func() error // 应用更新后重启服务（由主程序注入：systemd restart / procd restart）
 
 	// latestURL 生成 latest 下载地址（默认指向 GitHub；测试可覆盖为假服务器）。

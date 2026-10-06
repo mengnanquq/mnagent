@@ -58,6 +58,18 @@ logread -e mnagent              # 查看 agent 日志
 opkg install nexttrace           # 若未安装 nexttrace（或使用 --nexttrace 指定路径）
 ```
 
+### 自动更新
+
+mnagent **默认开启自动更新**：每 6 小时（带随机抖动，避免所有主机同时请求）检查一次
+GitHub Releases，发现比当前版本新的正式版就下载、原子替换自身并重启服务。
+
+- 关闭：安装脚本加 `--no-auto-update`，或改服务命令去掉 `-auto-update`；
+- 手动操作：`mnagent -check-update`（只看有没有新版）、`mnagent -apply-update latest`（立即升级）、
+  `mnagent -skip-update v0.1.8`（跳过某个版本 24 小时，避免坏版本反复拉起）；
+- 版本号是 `-ldflags "-X main.version=..."` 注入的 tag 名；本地 `go build` 出来的 `dev` 版本
+  不参与自动更新（避免开发构建被替换）；
+- 更新只在 Release（`releases/latest`）里挑版本，因此发版请打 tag（见下）。
+
 ### 脚本参数
 
 | 参数 | 默认值 | 说明 |
@@ -68,6 +80,7 @@ opkg install nexttrace           # 若未安装 nexttrace（或使用 --nexttrac
 | `--binary <path\|url>` | — | 使用自备的 mnagent（内网镜像时很有用） |
 | `--nexttrace` | `nexttrace` | nexttrace 路径或名称 |
 | `--user` / `--prefix` | systemd：`mnagent` / `/usr/local/bin`；OpenWrt：`root` / `/usr/bin` | 运行用户与安装目录 |
+| `--no-auto-update` | — | 关闭自动更新（默认开启） |
 | `--uninstall` | — | 卸载服务与二进制（保留令牌与用户） |
 
 ### 手动安装
