@@ -1,6 +1,7 @@
 # mnagent
 
-运行在追踪主机上的轻量 agent，配合 Telegram 机器人 [@mengnan_dedicated_bot](https://t.me/mengnan_dedicated_bot) 的 `/nexttrace` 使用。
+运行在拨测主机上的轻量 agent，配合 Telegram 机器人 [@mengnan_dedicated_bot](https://t.me/mengnan_dedicated_bot) 使用：
+机器人下发探测任务，agent 在本机执行并回传结果（`/nexttrace`、`/ping`、`/tcping`、`/http`、`/dns`）。
 
 它主动向机器人**长轮询**领取任务、在本机执行 `nexttrace`、再回传结果。因此：
 
@@ -60,6 +61,19 @@ logread -e mnagent              # 查看 agent 日志
 /etc/init.d/mnagent restart      # 重启服务
 opkg install nexttrace           # 若未安装 nexttrace（或使用 --nexttrace 指定路径）
 ```
+
+### 支持的探测类型
+
+| `kind` | 说明 | 依赖 |
+| --- | --- | --- |
+| `trace`（默认） | 执行 `nexttrace -j` 路由追踪 | 需要 nexttrace 可执行文件 |
+| `ping` | ICMP echo，输出丢包与延迟（min/avg/max/抖动） | 无（进程内实现；非特权 ping socket 或 CAP_NET_RAW） |
+| `tcping` | TCP 握手延迟 | 无 |
+| `http` | HTTP(S) 请求：状态码、服务端 IP、证书到期、DNS/连接/TLS/首字节分段耗时 | 无 |
+| `dns` | 用主机自身解析器查 A/AAAA/CNAME/MX/NS/TXT/PTR | 无 |
+
+参数上限由 agent 强制：次数 1-20、端口 1-65535、URL 仅 http(s)、记录类型白名单；
+未知 `kind` 直接失败，不会退化成执行其它命令。
 
 ### 自动更新
 

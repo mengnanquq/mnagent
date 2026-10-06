@@ -2,7 +2,9 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -293,5 +295,88 @@ func TestDescribeRunError(t *testing.T) {
 	}
 	if got := describeRunError(&exec.ExitError{}, 7); got != "执行失败（退出码 7）" {
 		t.Fatalf("普通失败文案异常: %q", got)
+	}
+}
+
+// TestAgentLoopProbeJobEndToEnd 用假机器人下发一个 ping 任务：
+// 验证 agent 走进程内探针并把结构化结果回传（不依赖 nexttrace 与外部二进制）。
+func TestAgentLoopProbeJobEndToEnd(t *testing.T) {
+	if conn, _, err := listenICMP(false); err != nil {
+		t.Skipf("本机无法创建 ICMP 套接字，跳过：%v", err)
+	} else {
+		conn.Close()
+	}
+
+	type posted struct {
+		ID       string          `json:"id"`
+		Kind     string          `json:"kind"`
+		ExitCode int             `json:"exit_code"`
+		Data     json.RawMessage `json:"data"`
+	}
+	results := make(chan posted, 1)
+	served := make(chan struct{})
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Header.Get("Authorization") != "Bearer tok" {
+			w.WriteHeader(http.StatusUnauthorized)
+			return
+		}
+		switch r.URL.Path {
+		case "/jobs":
+			select {
+			case <-served:
+				w.WriteHeader(http.StatusNoContent)
+				return
+			default:
+			}
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(`{"id":"j1","kind":"ping","target":"127.0.0.1","count":2,"timeout_ms":5000}`))
+		case "/results":
+			var got posted
+			body, _ := io.ReadAll(r.Body)
+			if err := json.Unmarshal(body, &got); err != nil {
+				t.Errorf("结果不是合法 JSON: %v", err)
+			}
+			close(served)
+			results <- got
+			w.WriteHeader(http.StatusNoContent)
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer srv.Close()
+
+	cfg := &config{
+		botURL:      srv.URL,
+		tokens:      &tokenSource{value: "tok"},
+		binary:      "nexttrace",
+		minBackoff:  10 * time.Millisecond,
+		maxBackoff:  50 * time.Millisecond,
+		pollTimeout: 2 * time.Second,
+	}
+	a := &agent{cfg: cfg, logger: testLogger{t}, client: newClient(cfg), runner: newRunner(cfg.binary, nil)}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	done := make(chan error, 1)
+	go func() { done <- a.loop(ctx) }()
+
+	var got posted
+	select {
+	case got = <-results:
+	case <-time.After(5 * time.Second):
+		t.Fatal("未在超时内收到回传结果")
+	}
+	cancel()
+	<-done
+
+	if got.Kind != "ping" || got.ExitCode != 0 {
+		t.Fatalf("结果异常: %+v", got)
+	}
+	var report LatencyReport
+	if err := json.Unmarshal(got.Data, &report); err != nil {
+		t.Fatalf("Data 不是合法延迟报告: %v", err)
+	}
+	if report.Kind != kindPing || report.Target != "127.0.0.1" || report.Recv != 2 {
+		t.Fatalf("延迟报告异常: %+v", report)
 	}
 }
