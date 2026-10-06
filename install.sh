@@ -4,7 +4,7 @@
 # 机器人的 /nexthost add 会生成这样的命令，在目标主机上执行即可：
 #   (curl -fsSL <脚本地址> || wget -qO- <脚本地址>) | sh -s -- \
 #     --bot https://<机器人地址>/agent --token <令牌>
-# 令牌即身份：机器人按令牌识别主机，因此无需在主机上填写名称（--host 可选，仅用于展示）。
+# 令牌即身份：机器人按令牌识别主机，主机上不需要（也不接受）名称参数。
 #
 # 支持两类平台：
 #   * systemd（Debian/Ubuntu/CentOS 等）：生成 /etc/systemd/system/mnagent.service，
@@ -23,7 +23,6 @@ PLATFORM="${MNAGENT_PLATFORM:-auto}"
 INIT_DIR="${MNAGENT_INIT_DIR:-}"
 
 BOT_URL=""
-HOST_NAME=""
 TOKEN=""
 TOKEN_FILE="/etc/mnagent/token"
 NEXTTRACE_BIN="nexttrace"
@@ -45,11 +44,10 @@ die()  { printf '\033[1;31m错误:\033[0m %s\n' "$*" >&2; exit 1; }
 usage() {
 	cat <<'EOF'
 用法：
-  (curl -fsSL <脚本地址> || wget -qO- <脚本地址>) | sh -s -- --bot <机器人地址>/agent --host <名称> --token <令牌>
+  (curl -fsSL <脚本地址> || wget -qO- <脚本地址>) | sh -s -- --bot <机器人地址>/agent --token <令牌>
 
 参数：
   --bot <url>          机器人 agent 端点基地址（必填，如 https://mnbot.example.org/agent）
-  --host <name>        本机名称（可省略）：令牌即身份，名称只用于展示
   --token <token>      接入令牌（必填；也可省略，前提是 --token-file 已存在）
   --token-file <path>  令牌文件路径（默认 /etc/mnagent/token）
   --nexttrace <path>   nexttrace 可执行文件路径或名称（默认 nexttrace）
@@ -94,7 +92,6 @@ fi
 while [ $# -gt 0 ]; do
 	case "$1" in
 		--bot)         BOT_URL="${2:-}"; shift 2;;
-		--host)        HOST_NAME="${2:-}"; shift 2;;
 		--token)       TOKEN="${2:-}"; shift 2;;
 		--token-file)  TOKEN_FILE="${2:-}"; shift 2;;
 		--nexttrace)   NEXTTRACE_BIN="${2:-}"; shift 2;;
@@ -276,14 +273,6 @@ case "$BOT_URL" in
 esac
 # 主机名允许中英文（机器人侧 /nexthost add 可直接写“香港节点”），
 # 但必须挡住会被写进服务单元/命令行的特殊字符。
-if [ -n "$HOST_NAME" ]; then
-case "$HOST_NAME" in
-	*" "*|*"'"*|*'"'*|*'\'*|*'$'*|*'`'*|*';'*|*'|'*|*'&'*|*'<'*|*'>'*|*'('*|*')'*|*'['*|*']'*|*'{'*|*'}'*|*'*'*|*'?'*|*'!'*|*'~'*|*'#'*|*'%'*|*','*|*':'*|*'/'*)
-		die "--host 不能包含空白、斜杠、引号、反引号、美元符号、分号、& | < > 等特殊字符"
-		;;
-esac
-[ "${#HOST_NAME}" -le 32 ] || die "--host 过长（最多 32 个字符）"
-fi
 
 # ---------- 安装二进制 ----------
 
@@ -406,11 +395,6 @@ NEXTTRACE_PATH="$(command -v "$NEXTTRACE_BIN" 2>/dev/null || true)"
 [ -n "$NEXTTRACE_PATH" ] || warn "未找到 nexttrace（${NEXTTRACE_BIN}）：请安装后再试，否则追踪会失败"
 NEXTTRACE_EXEC="${NEXTTRACE_PATH:-$NEXTTRACE_BIN}"
 
-# 名称参数（可选）：令牌即身份，未提供名称时不追加 -host。
-HOST_ARGS=""
-if [ -n "$HOST_NAME" ]; then
-	HOST_ARGS=" -host '$HOST_NAME'"
-fi
 
 # 自动更新参数：启用时追加到服务命令（systemd 与 procd 共用）。
 AUTO_UPDATE_ARGS=""
@@ -433,7 +417,7 @@ Wants=network-online.target
 Type=simple
 User=$RUN_USER
 Group=$RUN_GROUP
-ExecStart=$PREFIX/mnagent -bot $BOT_URL$HOST_ARGS -token-file $TOKEN_FILE -nexttrace $NEXTTRACE_EXEC$AUTO_UPDATE_ARGS
+ExecStart=$PREFIX/mnagent -bot $BOT_URL -token-file $TOKEN_FILE -nexttrace $NEXTTRACE_EXEC$AUTO_UPDATE_ARGS
 	# nexttrace 需要可写的主目录来存放配置与 IP 库；ProtectSystem=strict 下只有
 	# StateDirectory 指向的目录可写。
 	StateDirectory=mnagent
@@ -482,7 +466,7 @@ USE_PROCD=1
 	start_service() {
 		procd_open_instance
 		procd_set_param command $PREFIX/mnagent \\
-			-bot $BOT_URL$HOST_ARGS \\
+			-bot $BOT_URL \\
 			-token-file $TOKEN_FILE \\
 			-nexttrace $NEXTTRACE_EXEC$AUTO_UPDATE_ARGS
 		procd_set_param respawn
@@ -532,8 +516,8 @@ case "$PLATFORM" in
 		;;
 	*)
 		warn "未检测到 systemd 或 OpenWrt(procd)：已安装二进制，请自行守护运行"
-		printf '    %s/mnagent -bot %s -host %s -token-file %s -nexttrace %s\n' \
-			"$PREFIX" "$BOT_URL" "$HOST_NAME" "$TOKEN_FILE" "$NEXTTRACE_EXEC" >&2
+		printf '    %s/mnagent -bot %s -token-file %s -nexttrace %s\n' \
+			"$PREFIX" "$BOT_URL" "$TOKEN_FILE" "$NEXTTRACE_EXEC" >&2
 		if [ -n "$NEXTTRACE_PATH" ] && command -v setcap >/dev/null 2>&1; then
 			# 没有 systemd/procd 时只能靠二进制能力，手工前台运行也需要原始套接字权限。
 			setcap cap_net_raw,cap_net_admin+eip "$NEXTTRACE_PATH" \

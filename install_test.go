@@ -110,7 +110,7 @@ func TestInstallScriptSyntax(t *testing.T) {
 	if err != nil {
 		t.Fatalf("--help 执行失败: %v\n%s", err, out)
 	}
-	for _, want := range []string{"--bot", "--host", "--token", "--uninstall", "OpenWrt"} {
+	for _, want := range []string{"--bot", "--token", "--uninstall", "OpenWrt"} {
 		if !strings.Contains(string(out), want) {
 			t.Fatalf("--help 未提及 %s: %s", want, out)
 		}

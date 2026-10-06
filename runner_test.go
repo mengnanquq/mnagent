@@ -185,7 +185,7 @@ func TestAgentLoopEndToEnd(t *testing.T) {
 		}
 		switch r.URL.Path {
 		case "/jobs":
-			if r.URL.Query().Get("host") != "hk" {
+			if r.URL.RawQuery != "" {
 				w.WriteHeader(http.StatusBadRequest)
 				return
 			}
@@ -209,7 +209,6 @@ func TestAgentLoopEndToEnd(t *testing.T) {
 
 	cfg := &config{
 		botURL:      srv.URL,
-		host:        "hk",
 		tokens:      &tokenSource{value: "tok"},
 		binary:      writeScript(t, `echo "trace ok"`),
 		minBackoff:  10 * time.Millisecond,

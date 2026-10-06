@@ -19,7 +19,6 @@ func testConfig(endpoint string, tokens *tokenSource) *config {
 	}
 	return &config{
 		botURL:      endpoint,
-		host:        "hk",
 		tokens:      tokens,
 		binary:      "nexttrace",
 		minBackoff:  10 * time.Millisecond,
@@ -30,8 +29,11 @@ func testConfig(endpoint string, tokens *tokenSource) *config {
 
 func TestClientPollWithoutTask(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.URL.Path != "/jobs" || r.URL.Query().Get("host") != "hk" {
-			t.Errorf("请求不符: %s?%s", r.URL.Path, r.URL.RawQuery)
+		if r.URL.Path != "/jobs" {
+			t.Errorf("请求路径不符: %s", r.URL.Path)
+		}
+		if r.URL.RawQuery != "" {
+			t.Errorf("不应再附带查询参数（令牌即身份）: %q", r.URL.RawQuery)
 		}
 		if got := r.Header.Get("Authorization"); got != "Bearer tok" {
 			t.Errorf("鉴权头 = %q", got)
@@ -182,42 +184,39 @@ func TestNewTokenSourcePrefersExplicitValue(t *testing.T) {
 
 // TestParseConfigValidation 覆盖启动参数校验。
 func TestParseConfigValidation(t *testing.T) {
-	if _, err := parseConfig([]string{"-host", "hk"}); err == nil {
+	if _, err := parseConfig([]string{"-token", "t"}); err == nil {
 		t.Fatal("缺少 -bot 应报错")
 	}
-	if _, err := parseConfig([]string{"-bot", "not-a-url", "-host", "hk", "-token", "t"}); err == nil {
+	if _, err := parseConfig([]string{"-bot", "not-a-url", "-token", "t"}); err == nil {
 		t.Fatal("非法 -bot 应报错")
 	}
-	if _, err := parseConfig([]string{"-bot", "https://x/agent", "-host", "bad host", "-token", "t"}); err == nil {
-		t.Fatal("非法 -host 应报错")
-	}
-	if _, err := parseConfig([]string{"-bot", "https://x/agent", "-host", "hk", "-token", "t", "-nexttrace", "/nonexistent/nexttrace"}); err == nil {
+	if _, err := parseConfig([]string{"-bot", "https://x/agent", "-token", "t", "-nexttrace", "/nonexistent/nexttrace"}); err == nil {
 		t.Fatal("找不到的 nexttrace 应报错")
 	}
 
-	cfg, err := parseConfig([]string{"-bot", "https://x/agent/", "-host", "hk", "-token", "t", "-nexttrace", "/bin/echo"})
+	cfg, err := parseConfig([]string{"-bot", "https://x/agent/", "-token", "t", "-nexttrace", "/bin/echo"})
 	if err != nil {
 		t.Fatal(err)
 	}
 	if cfg.botURL != "https://x/agent" {
 		t.Fatalf("botURL 未去除末尾斜杠: %q", cfg.botURL)
 	}
+	if cfg.tokens == nil {
+		t.Fatal("令牌来源应已解析")
+	}
 }
 
-// TestParseConfigHostOptional 验证 -host 可省略：令牌即身份，名称只用于展示。
-func TestParseConfigHostOptional(t *testing.T) {
+// TestParseConfigRejectsHostFlag 验证 -host 选项已被移除：令牌即身份，
+// 名称由机器人按令牌识别，主机上不再需要（也不再接受）该参数。
+func TestParseConfigRejectsHostFlag(t *testing.T) {
+	if _, err := parseConfig([]string{"-bot", "https://x/agent", "-token", "t", "-host", "hk", "-nexttrace", "/bin/echo"}); err == nil {
+		t.Fatal("-host 已移除，传了应当报错（未知参数）")
+	}
 	cfg, err := parseConfig([]string{"-bot", "https://x/agent", "-token", "t", "-nexttrace", "/bin/echo"})
 	if err != nil {
-		t.Fatalf("省略 -host 应当合法：%v", err)
+		t.Fatalf("只给 --bot/--token 应当合法：%v", err)
 	}
-	if cfg.host != "" {
-		t.Fatalf("未提供名称时 host 应为空，实际 %q", cfg.host)
-	}
-	// 提供名称时仍要校验字符集。
-	if _, err := parseConfig([]string{"-bot", "https://x/agent", "-token", "t", "-host", "a b", "-nexttrace", "/bin/echo"}); err == nil {
-		t.Fatal("含空格的名称应报错")
-	}
-	if _, err := parseConfig([]string{"-bot", "https://x/agent", "-token", "t", "-host", "四川资阳电信", "-nexttrace", "/bin/echo"}); err != nil {
-		t.Fatalf("中文名称应当合法：%v", err)
+	if cfg.botURL != "https://x/agent" {
+		t.Fatalf("botURL = %q", cfg.botURL)
 	}
 }

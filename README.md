@@ -12,7 +12,7 @@
 
 ## 安装
 
-推荐用机器人生成的**一键命令**（管理员在 Telegram 里执行 `/nexthost add hk 香港节点`，机器人会直接回复下面这条命令）：
+推荐用机器人生成的**一键命令**（管理员在 Telegram 里执行 `/nexthost add 香港节点`，机器人会直接回复下面这条命令）：
 
 ```sh
 (curl -fsSL https://raw.githubusercontent.com/mengnanquq/mnagent/main/install.sh \
@@ -20,8 +20,7 @@
   | sh -s -- --bot https://<机器人地址>/agent --token <令牌>
 ```
 
-命令里只有令牌：**令牌即身份**，机器人按令牌识别是哪台主机，因此不需要在主机上写名称
-（`--host` 仍可用，仅用于让日志里显示得更好认）。
+命令里只有令牌：**令牌即身份**，机器人按令牌识别是哪台主机，主机上不需要（也不接受）名称参数。
 
 命令用 `sh` 并带 `wget` 回退，因此 VPS 与 OpenWrt 路由器可以粘同一条；非 root 用户由脚本自己通过 `sudo` 提权重跑。
 
@@ -78,7 +77,7 @@ GitHub Releases，发现比当前版本新的正式版就下载、原子替换�
 
 | 参数 | 默认值 | 说明 |
 | --- | --- | --- |
-| `--bot` / `--token` | 必填 | 由 `/nexthost add` 生成的命令已带全（无需 `--host`） |
+| `--bot` / `--token` | 必填 | 由 `/nexthost add` 生成的命令已带全 |
 | `--token-file` | `/etc/mnagent/token` | 令牌文件路径；省略 `--token` 时要求该文件已存在 |
 | `--version` | `latest` | 安装的 Release 标签；也可用 `--from-source` 从源码编译 |
 | `--binary <path\|url>` | — | 使用自备的 mnagent（内网镜像时很有用） |
@@ -112,14 +111,13 @@ setcap cap_net_raw,cap_net_admin+eip "$(command -v nexttrace)"
 - `/nexthost rotate <名称>`：轮换令牌（旧令牌立即失效，主机需重新接入）
 - `/nexthost remove <名称>`：删除主机
 
-`name` 必须与 agent 的 `-host` 完全一致；令牌等同该主机的任务接受权，泄露时用 `rotate` 轮换。
+名称只用于展示与 `/nexttrace @名称` 选择；令牌等同该主机的任务接受权，泄露时用 `rotate` 轮换。
 
 ## 参数
 
 | 参数 | 默认值 | 说明 |
 | --- | --- | --- |
 | `-bot` | 必填 | 机器人 agent 端点基地址，如 `https://mnbot.example.org/agent` |
-| `-host` | 必填 | 本机名称，需与机器人配置里的 `name` 一致 |
 | `-token` | — | 直接给出令牌（不推荐：会出现在进程列表里） |
 | `-token-file` | `/etc/mnagent/token` | 令牌文件路径；每次请求都重新读取，**轮换令牌无需重启** |
 | `-nexttrace` | `nexttrace` | nexttrace 可执行文件路径或 PATH 中的名称 |
@@ -135,11 +133,11 @@ setcap cap_net_raw,cap_net_admin+eip "$(command -v nexttrace)"
 机器人侧提供两个端点（均在机器人的公网 HTTPS 服务上）：
 
 ```
-POST /agent/jobs?host=<name>        Authorization: Bearer <token>
+POST /agent/jobs                    Authorization: Bearer <token>
    → 200 {"id":"…","target":"1.1.1.1","hops":20,"port":443,"protocol":"tcp","timeout_ms":120000}
    → 204（本次没有任务，agent 立刻重新轮询）
 
-POST /agent/results?host=<name>     {"id":"…","output":"…","exit_code":0,"error":""}
+POST /agent/results                 {"id":"…","output":"…","exit_code":0,"error":""}
    → 204
 ```
 
@@ -166,7 +164,7 @@ POST /agent/results?host=<name>     {"id":"…","output":"…","exit_code":0,"er
 
 | 现象 | 排查方向 |
 | --- | --- |
-| 日志反复 `鉴权失败` | `-host` 与配置里的 `name` 不一致，或令牌不匹配（对比 `/etc/mnagent/token` 与机器人配置） |
+| 日志反复 `鉴权失败` | 令牌与机器人不一致或已被轮换：用 `/nexthost rotate <名称>` 生成新命令重跑安装（或对比 `/etc/mnagent/token`） |
 | 机器人显示 ⚪️ 离线 | agent 未运行、`-bot` 地址不可达（出站 443 被拦？）、或机器人的 `/agent/jobs` 未对外暴露 |
 | 任务报 `执行超时` | 主机到目标网络不通，或需要更长超时；也可在命令里减少跳数 |
 | 任务报 `执行失败（退出码 N）` | 手动在该主机执行同参数 `nexttrace` 复现；注意 `nexttrace -j` 需要 v1.7+，旧版本 agent 会自动去掉 `-j` 重试 |

@@ -1,8 +1,6 @@
 package main
 
 import (
-	"crypto/sha256"
-	"encoding/hex"
 	"errors"
 	"fmt"
 	"io"
@@ -11,7 +9,6 @@ import (
 	"path/filepath"
 	"regexp"
 	"runtime"
-	"sort"
 	"strings"
 	"time"
 )
@@ -69,12 +66,6 @@ func (v versionInfo) newerThan(other versionInfo) bool {
 		return false
 	}
 	return v.pre > other.pre
-}
-
-// skipState 记录要跳过的版本（写入 skip 文件，跨重启保留）。
-type skipState struct {
-	version string
-	until   time.Time
 }
 
 // updater 负责检查并应用 mnagent 自身的新版本。
@@ -294,38 +285,6 @@ func (u *updater) Skip(version string, forDur time.Duration) error {
 	}
 	lines = append(lines, version+" "+until)
 	return os.WriteFile(u.skipFile, []byte(strings.Join(lines, "\n")+"\n"), 0o600)
-}
-
-// sha256Of 计算文件校验和（供诊断/校验使用）。
-func sha256Of(path string) (string, error) {
-	f, err := os.Open(path)
-	if err != nil {
-		return "", err
-	}
-	defer f.Close()
-	h := sha256.New()
-	if _, err := io.Copy(h, f); err != nil {
-		return "", err
-	}
-	return hex.EncodeToString(h.Sum(nil)), nil
-}
-
-// sortVersions 把版本字符串按 semver 从新到旧排序（供日志/展示用）。
-func sortVersions(versions []string) []string {
-	parsed := make([]versionInfo, 0, len(versions))
-	index := map[string]string{}
-	for _, v := range versions {
-		if p, ok := parseVersion(v); ok {
-			parsed = append(parsed, p)
-			index[p.raw] = v
-		}
-	}
-	sort.Slice(parsed, func(i, j int) bool { return parsed[i].newerThan(parsed[j]) })
-	out := make([]string, 0, len(parsed))
-	for _, p := range parsed {
-		out = append(out, index[p.raw])
-	}
-	return out
 }
 
 // detectPlatformArch 返回资产命名用的平台/架构（与安装脚本一致）。

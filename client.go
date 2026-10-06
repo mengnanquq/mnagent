@@ -8,7 +8,6 @@ import (
 	"fmt"
 	"io"
 	"net/http"
-	"net/url"
 	"strings"
 	"sync/atomic"
 	"time"
@@ -76,7 +75,6 @@ type client struct {
 func newClient(cfg *config) *client {
 	return &client{
 		baseURL: cfg.botURL,
-		host:    cfg.host,
 		tokens:  cfg.tokens,
 		http:    &http.Client{Timeout: cfg.pollTimeout},
 	}
@@ -151,7 +149,8 @@ func (c *client) do(ctx context.Context, method, path string, body []byte) (*htt
 	if err != nil {
 		return nil, err
 	}
-	endpoint := c.baseURL + path + "?host=" + url.QueryEscape(c.host)
+	// 不再附带 host 参数：机器人按令牌识别是哪台主机。
+	endpoint := c.baseURL + path
 	var reader io.Reader
 	if body != nil {
 		reader = bytes.NewReader(body)

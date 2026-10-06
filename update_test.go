@@ -275,24 +275,3 @@ func TestUpdaterCheckHTTP(t *testing.T) {
 	_ = fmt.Sprint()
 	_ = context.Background()
 }
-
-// TestValidHostName 覆盖主机名校验：中文名（如 /nexthost add 香港节点）应当可用，
-// 但仍要挡住空白与 shell/systemd 元字符——主机名会被写进服务单元与命令行。
-func TestValidHostName(t *testing.T) {
-	valid := []string{"hk", "us-west-1", "node_2", "10.0.0.1", "香港节点", "中国电信-上海"}
-	for _, name := range valid {
-		if !validHostName(name) {
-			t.Errorf("%q 应被视为合法主机名", name)
-		}
-	}
-	invalid := []string{"", "a b", "香港 节点", "a'b", `a"b`, "a`b", "a$b", "a;b", "a|b", "a&b", "a/b", "a:b", "a%b",
-		strings.Repeat("x", 33), strings.Repeat("中", 33)}
-	for _, name := range invalid {
-		if validHostName(name) {
-			t.Errorf("%q 应被拒绝", name)
-		}
-	}
-	if !validHostName(strings.Repeat("中", 32)) {
-		t.Error("32 个汉字应当合法（长度按字符计）")
-	}
-}

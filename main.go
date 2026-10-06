@@ -18,32 +18,10 @@ import (
 	"strings"
 	"syscall"
 	"time"
-	"unicode/utf8"
 )
 
 // version 由构建时注入（-ldflags "-X main.version=..."），默认 dev。
 var version = "dev"
-
-// hostNameForbidden 是不能出现在主机名里的字符：空白、shell/systemd 元字符，
-// 以及会破坏 URL 与路径的字符。主机名会被写进服务单元与命令行，必须挡住它们。
-const hostNameForbidden = " \t\n\r/\\'\"`$;&|<>()[]{}*?!~#%,:"
-
-// maxHostNameRunes 限制主机名长度（按字符数计，中文名同样适用）。
-const maxHostNameRunes = 32
-
-// validHostName 校验主机名：允许中英文等可见字符（/nexthost add 里可以直接写
-// “香港节点”这类名字），但不允许空白、控制字符与上表中的特殊字符。
-func validHostName(name string) bool {
-	if name == "" || utf8.RuneCountInString(name) > maxHostNameRunes {
-		return false
-	}
-	for _, r := range name {
-		if r < 0x21 || r == 0x7f || strings.ContainsRune(hostNameForbidden, r) {
-			return false
-		}
-	}
-	return true
-}
 
 // 默认参数。
 const (
@@ -56,7 +34,6 @@ const (
 // config 是进程启动参数解析后的运行配置。
 type config struct {
 	botURL      string
-	host        string
 	tokens      *tokenSource
 	binary      string
 	minBackoff  time.Duration
@@ -102,7 +79,7 @@ func run(args []string) error {
 		update: newUpdater(cfg, log),
 	}
 	log.Info("mnagent 已启动",
-		"version", version, "bot", cfg.botURL, "host", cfg.host,
+		"version", version, "bot", cfg.botURL,
 		"nexttrace", cfg.binary, "token_from", cfg.tokens.from,
 		"poll_timeout", cfg.pollTimeout, "auto_update", cfg.autoUpdate)
 	return agent.loop(ctx)
@@ -113,7 +90,6 @@ func parseConfig(args []string) (*config, error) {
 	fs := flag.NewFlagSet("mnagent", flag.ContinueOnError)
 	var (
 		botURL     = fs.String("bot", "", "机器人 agent 端点基地址，例如 https://mnbot.example.org/agent")
-		hostName   = fs.String("host", "", "本机名称（可选）：令牌已能识别主机，名称仅用于展示；与机器人 /nexthost 里的名称一致时更直观")
 		tokenValue = fs.String("token", "", "接入令牌（不推荐：优先用 -token-file 或 MNAGENT_TOKEN）")
 		tokenFile  = fs.String("token-file", "", "存放接入令牌的文件路径（默认 "+defaultTokenFile+"）")
 		binary     = fs.String("nexttrace", "nexttrace", "nexttrace 可执行文件路径或在 PATH 中的名称")
@@ -148,10 +124,6 @@ func parseConfig(args []string) (*config, error) {
 			return nil, fmt.Errorf("-bot 必须是完整的 http(s) 地址，收到 %q", *botURL)
 		}
 	}
-	// -host 可选：令牌即身份，名称只是给机器人做展示；提供时仍做校验。
-	if name := strings.TrimSpace(*hostName); !isUpdateCLI && name != "" && !validHostName(name) {
-		return nil, fmt.Errorf("-host 不能超过 %d 个字符，也不能包含空白或特殊字符（如斜杠、引号、美元符号、分号、反引号等）", maxHostNameRunes)
-	}
 	if *minBackoff <= 0 || *maxBackoff < *minBackoff {
 		return nil, errors.New("-min-backoff / -max-backoff 不合法")
 	}
@@ -183,7 +155,6 @@ func parseConfig(args []string) (*config, error) {
 	}
 	return &config{
 		botURL:      endpoint,
-		host:        strings.TrimSpace(*hostName),
 		tokens:      tokens,
 		binary:      path,
 		minBackoff:  *minBackoff,
