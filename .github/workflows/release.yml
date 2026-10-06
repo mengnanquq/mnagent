@@ -1,11 +1,16 @@
 name: release
 
-# 打 v* 标签时构建各平台二进制并附到 Release（同时附上 install.sh）：
+# 两种触发方式：
+# 1. 推送 main 分支：自动构建并发布（直接发布，非草稿），版本号基于最新正式版 +1 patch，
+#    形如 v0.1.8-main.20261006120000.abc1234，保证已安装的 agent 通过
+#    releases/latest 发现新版本即可自动更新。
+# 2. 打 v* 标签：构建并发布到对应标签的正式 Release（保留原有行为）。
 # 安装脚本默认从 releases/latest/download/mnagent_<os>_<arch> 下载，
 # 因此发布一个标签后，主机上的一键安装即可直接取用预编译产物；
 # 也可以用 releases/latest/download/install.sh 拿到与本版本配套的安装脚本。
 on:
   push:
+    branches: ['main']
     tags: ['v*']
   workflow_dispatch:
 
@@ -13,7 +18,45 @@ permissions:
   contents: write
 
 jobs:
+  # 统一计算本次构建要嵌入的版本号与要发布的 Release 标签。
+  # build 与 publish 都引用这里的输出，避免两边各自取时间导致版本不一致。
+  prepare:
+    runs-on: ubuntu-latest
+    outputs:
+      is_tag: ${{ steps.version.outputs.is_tag }}
+      version: ${{ steps.version.outputs.version }}
+      tag: ${{ steps.version.outputs.tag }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Compute version
+        id: version
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          if [ "${GITHUB_REF_TYPE}" = "tag" ]; then
+            echo "is_tag=true" >> "$GITHUB_OUTPUT"
+            echo "version=${GITHUB_REF_NAME}" >> "$GITHUB_OUTPUT"
+            echo "tag=${GITHUB_REF_NAME}" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          echo "is_tag=false" >> "$GITHUB_OUTPUT"
+          TS="$(git log -1 --format=%cd --date=format:%Y%m%d%H%M%S)"
+          SHA="$(git rev-parse --short HEAD)"
+          # 取最新的正式版（vX.Y.Z，排除带 -main 后缀的自动版），在其上 +1 patch，
+          # 保证自动版始终比已安装的正式版“新”，agent 才会自动更新到它。
+          BASE="$(gh release list --limit 20 --json tagName -q '.[].tagName' 2>/dev/null \
+            | grep -E '^v[0-9]+\.[0-9]+\.[0-9]+$' | head -1 || true)"
+          [ -n "$BASE" ] || BASE="v0.0.0"
+          MAJOR="$(printf '%s' "$BASE" | sed 's/^v//' | cut -d. -f1)"
+          MINOR="$(printf '%s' "$BASE" | cut -d. -f2)"
+          PATCH="$(printf '%s' "$BASE" | cut -d. -f3)"
+          PATCH=$((PATCH + 1))
+          VERSION="v${MAJOR}.${MINOR}.${PATCH}-main.${TS}.${SHA}"
+          echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
+          echo "tag=${VERSION}" >> "$GITHUB_OUTPUT"
+
   build:
+    needs: prepare
     runs-on: ubuntu-latest
     strategy:
       matrix:
@@ -39,29 +82,50 @@ jobs:
         run: go test ./...
       - name: Build
         env:
+          VERSION: ${{ needs.prepare.outputs.version }}
           GOOS: ${{ matrix.goos }}
           GOARCH: ${{ matrix.goarch }}
           GOARM: ${{ matrix.goarm || '7' }}
           CGO_ENABLED: '0'
         run: |
-          go build -trimpath -ldflags "-s -w -X main.version=${GITHUB_REF_NAME}" \
+          go build -trimpath -ldflags "-s -w -X main.version=${VERSION}" \
             -o mnagent_${GOOS}_${GOARCH} .
           sha256sum mnagent_${GOOS}_${GOARCH} > mnagent_${GOOS}_${GOARCH}.sha256
-      - name: Upload binary to release
-        uses: softprops/action-gh-release@v2
-        if: startsWith(github.ref, 'refs/tags/')
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
         with:
-          files: |
+          name: binaries-${{ matrix.goos }}-${{ matrix.goarch }}
+          path: |
             mnagent_${{ matrix.goos }}_${{ matrix.goarch }}
             mnagent_${{ matrix.goos }}_${{ matrix.goarch }}.sha256
-          overwrite_files: true
-          generate_release_notes: true
+          if-no-files-found: error
 
-      # 只由一个任务上传 install.sh：多个矩阵任务同时上传同名资产会撞车，
-      # 曾导致某个任务失败、Release 里缺少安装脚本。
-      - name: Upload install script
-        uses: softprops/action-gh-release@v2
-        if: startsWith(github.ref, 'refs/tags/') && matrix.goos == 'linux' && matrix.goarch == 'amd64'
+  publish:
+    needs: [prepare, build]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Download artifacts
+        uses: actions/download-artifact@v4
         with:
-          files: install.sh
-          overwrite_files: true
+          path: dist
+          merge-multiple: true
+      - name: Publish release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ needs.prepare.outputs.tag }}
+          IS_TAG: ${{ needs.prepare.outputs.is_tag }}
+        run: |
+          # 同一提交重跑时 Release 已存在：只补传资产。
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            gh release upload "$TAG" dist/* install.sh --clobber
+            exit 0
+          fi
+          if [ "$IS_TAG" = "true" ]; then
+            gh release create "$TAG" dist/* install.sh \
+              --title "$TAG" --generate-notes
+          else
+            gh release create "$TAG" dist/* install.sh \
+              --title "auto build $(git rev-parse --short HEAD)" \
+              --notes "$(git log -1 --format=%s)"
+          fi
