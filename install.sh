@@ -211,11 +211,15 @@ esac
 # download <url> <输出文件>
 download() {
 	if command -v curl >/dev/null 2>&1; then
-		curl -fsSL --retry 3 -o "$2" "$1"
+		curl -# -fSL --retry 3 -o "$2" "$1" || { rm -f "$2"; return 1; }
 	elif command -v wget >/dev/null 2>&1; then
-		wget -q -O "$2" "$1"
+		if wget --help 2>&1 | grep -q -- '--show-progress'; then
+			wget -q --show-progress -O "$2" "$1" || { rm -f "$2"; return 1; }
+		else
+			wget -O "$2" "$1" || { rm -f "$2"; return 1; }
+		fi
 	elif command -v uclient-fetch >/dev/null 2>&1; then
-		uclient-fetch -q -O "$2" "$1"
+		uclient-fetch -O "$2" "$1" || { rm -f "$2"; return 1; }
 	else
 		die "未找到下载工具：请安装 curl（OpenWrt：opkg install curl），或使用 uclient-fetch/wget"
 	fi

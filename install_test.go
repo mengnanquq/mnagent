@@ -149,6 +149,7 @@ func TestInstallScriptKeepsKeySafeguards(t *testing.T) {
 		{"GitHub 代理参数解析", "--gh-proxy"},
 		{"GitHub 代理函数定义", "apply_gh_proxy"},
 		{"服务参数继承代理", `AUTO_UPDATE_ARGS="$AUTO_UPDATE_ARGS -gh-proxy $GH_PROXY"`},
+		{"下载文件时显示进度条", "curl -#"},
 	} {
 		if !strings.Contains(script, want.needle) {
 			t.Errorf("install.sh 缺少“%s”（应包含 %q）", want.name, want.needle)
