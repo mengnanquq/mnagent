@@ -40,11 +40,11 @@ SCRIPT=https://github.com/mengnanquq/mnagent/releases/latest/download/install.sh
 
 ### 发布
 
-打标签即触发 Actions 构建 linux/darwin × amd64/arm64/arm 的二进制并附加到 Release（含 `install.sh` 与 sha256）：
+项目配置了自动构建与发布流水线（GitHub Actions）：
+- **推送 `main` 分支**：自动根据最新版本计算并递增生成语义化版本号（如 `v0.3.5-main.<时间戳>.<sha>`），自动编译全平台二进制、打包 `install.sh` 并发布 Release。
+- **打 `v*` 标签**：推送指定 Tag（例如 `git tag v0.4.0 && git push origin v0.4.0`）会自动发布正式 Release。
 
-```bash
-git tag v0.1.0 && git push origin v0.1.0
-```
+构建产物涵盖 linux/darwin 各主流系统及 amd64/arm64/arm/mips/mipsle/riscv64 等架构。
 
 ### OpenWrt
 
