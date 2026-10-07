@@ -1061,13 +1061,20 @@ func buildMiaospeedTestPlan(job Job) miaospeedTestPlan {
 		descriptions = append(descriptions, "连通性测试")
 		matrixSet[matrixHTTPPing] = true
 		matrixSet[matrixRTTPing] = true
+		matrixSet[matrixMaxRTTPing] = true
+		matrixSet[matrixPacketLoss] = true
 		matrixSet[matrixHTTPCode] = true
+		matrixSet[matrixOutboundGeoIP] = true
 	}
 	if modes[ModeTopology] {
 		descriptions = append(descriptions, "拓扑测试")
 		matrixSet[matrixInboundGeoIP] = true
 		matrixSet[matrixOutboundGeoIP] = true
 		matrixSet[matrixHijack] = true
+		matrixSet[matrixRTTPing] = true
+		matrixSet[matrixHTTPPing] = true
+		matrixSet[matrixUDPType] = true
+		plan.STUNURL = defaultSTUNServer
 	}
 	if modes[ModeLatency] {
 		descriptions = append(descriptions, "延迟测试")
@@ -1075,10 +1082,17 @@ func buildMiaospeedTestPlan(job Job) miaospeedTestPlan {
 		matrixSet[matrixHTTPPing] = true
 		matrixSet[matrixPacketLoss] = true
 		matrixSet[matrixMaxRTTPing] = true
+		matrixSet[matrixHTTPCode] = true
+		matrixSet[matrixOutboundGeoIP] = true
 	}
 	if modes[ModeUDP] {
 		descriptions = append(descriptions, "UDP类型测试")
 		matrixSet[matrixUDPType] = true
+		matrixSet[matrixRTTPing] = true
+		matrixSet[matrixHTTPPing] = true
+		matrixSet[matrixPacketLoss] = true
+		matrixSet[matrixHTTPCode] = true
+		matrixSet[matrixOutboundGeoIP] = true
 		plan.STUNURL = defaultSTUNServer
 	}
 	if modes[ModeSingleSpeed] {
@@ -1088,6 +1102,7 @@ func buildMiaospeedTestPlan(job Job) miaospeedTestPlan {
 		matrixSet[matrixRTTPing] = true
 		matrixSet[matrixHTTPPing] = true
 		matrixSet[matrixPacketLoss] = true
+		matrixSet[matrixHTTPCode] = true
 		matrixSet[matrixOutboundGeoIP] = true
 		plan.DownloadThreading = 1
 	}
@@ -1098,6 +1113,7 @@ func buildMiaospeedTestPlan(job Job) miaospeedTestPlan {
 		matrixSet[matrixRTTPing] = true
 		matrixSet[matrixHTTPPing] = true
 		matrixSet[matrixPacketLoss] = true
+		matrixSet[matrixHTTPCode] = true
 		matrixSet[matrixOutboundGeoIP] = true
 		th := uint(4)
 		if job.Count > 1 && job.Count <= 16 {
@@ -1112,6 +1128,7 @@ func buildMiaospeedTestPlan(job Job) miaospeedTestPlan {
 		matrixSet[matrixRTTPing] = true
 		matrixSet[matrixHTTPPing] = true
 		matrixSet[matrixPacketLoss] = true
+		matrixSet[matrixHTTPCode] = true
 		matrixSet[matrixOutboundGeoIP] = true
 		th := uint(4)
 		if job.Count > 1 && job.Count <= 16 {
@@ -1292,7 +1309,7 @@ func parseSlaveTaskResult(task *slaveTask, nodes []MiaospeedNode, plan miaospeed
 		case matrixMaxRTTPing:
 			report.MaxRTTMs = parseMatrixFloat(m.Payload)
 		case matrixHTTPCode:
-			report.HTTPCode = int(parseMatrixFloat(m.Payload))
+			report.HTTPCode = parseMatrixHTTPCode(m.Payload)
 		case matrixUDPType:
 			report.UDPType = parseMatrixString(m.Payload)
 		case matrixInboundGeoIP:
@@ -1330,6 +1347,30 @@ func parseMatrixFloat(payload string) float64 {
 		}
 	}
 	val, _ := strconv.ParseFloat(payload, 64)
+	return val
+}
+
+// parseMatrixHTTPCode 提取形如 `{"Values":[204,204]}` 或 `{"Value":200}` 或裸数值的状态码。
+func parseMatrixHTTPCode(payload string) int {
+	payload = strings.TrimSpace(payload)
+	if payload == "" {
+		return 0
+	}
+	if strings.HasPrefix(payload, "{") {
+		var obj struct {
+			Values []int `json:"Values"`
+			Value  int   `json:"Value"`
+		}
+		if err := json.Unmarshal([]byte(payload), &obj); err == nil {
+			if len(obj.Values) > 0 && obj.Values[0] > 0 {
+				return obj.Values[0]
+			}
+			if obj.Value > 0 {
+				return obj.Value
+			}
+		}
+	}
+	val, _ := strconv.Atoi(payload)
 	return val
 }
 
