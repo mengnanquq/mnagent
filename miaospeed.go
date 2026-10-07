@@ -1260,35 +1260,151 @@ func parseSlaveTaskResult(task *slaveTask, nodes []MiaospeedNode, plan miaospeed
 	for _, m := range slot.Matrices {
 		switch m.Type {
 		case matrixRTTPing:
-			report.PingRTTMs, _ = strconv.ParseFloat(m.Payload, 64)
+			report.PingRTTMs = parseMatrixFloat(m.Payload)
 		case matrixHTTPPing:
-			report.PingConnMs, _ = strconv.ParseFloat(m.Payload, 64)
+			report.PingConnMs = parseMatrixFloat(m.Payload)
 		case matrixPacketLoss:
-			report.PacketLoss, _ = strconv.ParseFloat(m.Payload, 64)
+			report.PacketLoss = parseMatrixFloat(m.Payload)
 		case matrixMaxRTTPing:
-			report.MaxRTTMs, _ = strconv.ParseFloat(m.Payload, 64)
+			report.MaxRTTMs = parseMatrixFloat(m.Payload)
 		case matrixHTTPCode:
-			report.HTTPCode, _ = strconv.Atoi(m.Payload)
+			report.HTTPCode = int(parseMatrixFloat(m.Payload))
 		case matrixUDPType:
-			report.UDPType = m.Payload
+			report.UDPType = parseMatrixString(m.Payload)
 		case matrixInboundGeoIP:
-			report.InboundGeo = m.Payload
+			_, report.InboundGeo = parseMatrixGeo(m.Payload)
 		case matrixOutboundGeoIP:
-			report.OutboundGeo = m.Payload
+			report.OutboundIP, report.OutboundGeo = parseMatrixGeo(m.Payload)
 		case matrixHijack:
-			report.Hijack = m.Payload
+			report.Hijack = parseMatrixHijack(m.Payload)
 		case matrixAverageSpeed:
-			report.AvgSpeedBps, _ = strconv.ParseFloat(m.Payload, 64)
+			report.AvgSpeedBps = parseMatrixFloat(m.Payload)
 		case matrixMaxSpeed:
-			report.MaxSpeedBps, _ = strconv.ParseFloat(m.Payload, 64)
+			report.MaxSpeedBps = parseMatrixFloat(m.Payload)
 		case matrixAverageUpload:
-			report.AvgUploadBps, _ = strconv.ParseFloat(m.Payload, 64)
+			report.AvgUploadBps = parseMatrixFloat(m.Payload)
 		case matrixMaxUpload:
-			report.MaxUploadBps, _ = strconv.ParseFloat(m.Payload, 64)
+			report.MaxUploadBps = parseMatrixFloat(m.Payload)
 		}
 	}
 
 	return report
+}
+
+// parseMatrixFloat 提取形如 `{"Value":12.3}` 或裸数值 `12.3` 的浮点数。
+func parseMatrixFloat(payload string) float64 {
+	payload = strings.TrimSpace(payload)
+	if payload == "" {
+		return 0
+	}
+	if strings.HasPrefix(payload, "{") {
+		var obj struct {
+			Value float64 `json:"Value"`
+		}
+		if err := json.Unmarshal([]byte(payload), &obj); err == nil {
+			return obj.Value
+		}
+	}
+	val, _ := strconv.ParseFloat(payload, 64)
+	return val
+}
+
+// parseMatrixString 提取形如 `{"Value":"FullCone"}` 或裸文本的字符串。
+func parseMatrixString(payload string) string {
+	payload = strings.TrimSpace(payload)
+	if payload == "" {
+		return ""
+	}
+	if strings.HasPrefix(payload, "{") {
+		var obj struct {
+			Value string `json:"Value"`
+		}
+		if err := json.Unmarshal([]byte(payload), &obj); err == nil && obj.Value != "" {
+			return obj.Value
+		}
+	}
+	return payload
+}
+
+// parseMatrixGeo 解析 MultiStacks JSON 提取地理位置与 IP。
+func parseMatrixGeo(payload string) (ip, geo string) {
+	payload = strings.TrimSpace(payload)
+	if payload == "" {
+		return "", ""
+	}
+	var stacks struct {
+		Domain    string `json:"Domain"`
+		MainStack *struct {
+			Country string `json:"country"`
+			ISP     string `json:"isp"`
+			IP      string `json:"ip"`
+		} `json:"MainStack"`
+		IPv4Stack []*struct {
+			Country string `json:"country"`
+			ISP     string `json:"isp"`
+			IP      string `json:"ip"`
+		} `json:"IPv4Stack"`
+		IPv6Stack []*struct {
+			Country string `json:"country"`
+			ISP     string `json:"isp"`
+			IP      string `json:"ip"`
+		} `json:"IPv6Stack"`
+	}
+	if err := json.Unmarshal([]byte(payload), &stacks); err == nil {
+		var targetGeo *struct {
+			Country string `json:"country"`
+			ISP     string `json:"isp"`
+			IP      string `json:"ip"`
+		}
+		if len(stacks.IPv4Stack) > 0 && stacks.IPv4Stack[0] != nil {
+			targetGeo = stacks.IPv4Stack[0]
+		} else if len(stacks.IPv6Stack) > 0 && stacks.IPv6Stack[0] != nil {
+			targetGeo = stacks.IPv6Stack[0]
+		} else if stacks.MainStack != nil {
+			targetGeo = stacks.MainStack
+		}
+
+		if targetGeo != nil {
+			ip = targetGeo.IP
+			parts := make([]string, 0, 2)
+			if targetGeo.Country != "" {
+				parts = append(parts, targetGeo.Country)
+			}
+			if targetGeo.ISP != "" && targetGeo.ISP != targetGeo.Country {
+				parts = append(parts, targetGeo.ISP)
+			}
+			if len(parts) > 0 {
+				geo = strings.Join(parts, " ")
+			}
+		}
+		if geo == "" && stacks.Domain != "" {
+			geo = stacks.Domain
+		}
+		if ip != "" || geo != "" {
+			return ip, geo
+		}
+	}
+	return "", payload
+}
+
+// parseMatrixHijack 解析防劫持 JSON
+func parseMatrixHijack(payload string) string {
+	payload = strings.TrimSpace(payload)
+	if payload == "" {
+		return "未检测"
+	}
+	var obj struct {
+		SpeedIP string `json:"SpeedIP"`
+		RealIP  string `json:"RealIP"`
+		Hijack  bool   `json:"Hijack"`
+	}
+	if err := json.Unmarshal([]byte(payload), &obj); err == nil {
+		if obj.Hijack || (obj.SpeedIP != "" && obj.RealIP != "" && obj.SpeedIP != obj.RealIP) {
+			return fmt.Sprintf("⚠️ 疑似劫持 (%s != %s)", obj.SpeedIP, obj.RealIP)
+		}
+		return "正常 (未劫持)"
+	}
+	return payload
 }
 
 func getFreeLocalPort() (int, error) {
