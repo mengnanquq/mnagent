@@ -813,6 +813,26 @@ func autoInstallMiaospeed(ctx context.Context, targetPath, ghProxy string, log l
 		}
 	}
 
+	if tag == "4.7.7" {
+		locReq, err := http.NewRequestWithContext(ctx, http.MethodHead, "https://github.com/AirportR/miaospeed/releases/latest", nil)
+		if err == nil {
+			locReq.Header.Set("User-Agent", "mnagent")
+			noFollowClient := &http.Client{
+				Timeout: 10 * time.Second,
+				CheckRedirect: func(req *http.Request, via []*http.Request) error {
+					return http.ErrUseLastResponse
+				},
+			}
+			if resp, err := noFollowClient.Do(locReq); err == nil {
+				loc := resp.Header.Get("Location")
+				_ = resp.Body.Close()
+				if idx := strings.LastIndex(loc, "/tag/"); idx != -1 {
+					tag = strings.TrimSpace(loc[idx+5:])
+				}
+			}
+		}
+	}
+
 	goos := runtime.GOOS
 	arch := mapMiaospeedArch(runtime.GOARCH)
 	tarName := fmt.Sprintf("miaospeed-%s-%s-%s.tar.gz", goos, arch, tag)

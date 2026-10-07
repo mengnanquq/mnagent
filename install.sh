@@ -27,6 +27,7 @@ TOKEN=""
 TOKEN_FILE="/etc/mnagent/token"
 NEXTTRACE_BIN="nexttrace"
 MIAOSPEED_BIN="miaospeed"
+MIAOSPEED_VERSION="latest"
 RUN_USER=""
 RUN_GROUP=""
 PREFIX=""
@@ -56,6 +57,7 @@ usage() {
   --token-file <path>  令牌文件路径（默认 /etc/mnagent/token）
   --nexttrace <path>   nexttrace 可执行文件路径或名称（默认 nexttrace）
   --miaospeed <path>   miaospeed 可执行文件路径或名称（默认 miaospeed）
+  --miaospeed-version <tag> 安装的 miaospeed 版本，默认 latest（取最新 Release）
   --version <tag>      安装的版本标签，默认 latest（取最新 Release）
   --binary <path|url>  直接使用已编译好的 mnagent（本地路径或下载地址）
   --from-source        从源码编译（不下载 Release）
@@ -110,6 +112,7 @@ while [ $# -gt 0 ]; do
 		--token-file)  TOKEN_FILE="${2:-}"; shift 2;;
 			--nexttrace)   NEXTTRACE_BIN="${2:-}"; shift 2;;
 			--miaospeed)   MIAOSPEED_BIN="${2:-}"; shift 2;;
+			--miaospeed-version) MIAOSPEED_VERSION="${2:-}"; shift 2;;
 			--version)     VERSION="${2:-}"; shift 2;;
 			--binary)      BINARY_SRC="${2:-}"; MODE="binary"; shift 2;;
 			--from-source) MODE="source"; shift;;
@@ -496,23 +499,37 @@ map_miaospeed_arch() {
 
 download_miaospeed() {
 	miao_arch="$(map_miaospeed_arch "$ARCH")"
-	miao_tag="4.7.7"
+	miao_tag="${MIAOSPEED_VERSION:-latest}"
 
-	# 1. 优先尝试从 releases/latest 重定向 Location 头解析版本标签（应用 gh-proxy）
-	latest_url="$(apply_gh_proxy "https://github.com/AirportR/miaospeed/releases/latest")"
-	if command -v curl >/dev/null 2>&1; then
-		loc_tag="$(curl -sIL "$latest_url" 2>/dev/null | grep -i '^location:' | head -n1 | sed -E 's#.*tag/([^/[:space:]]+).*#\1#' | tr -d '\r\n' || true)"
-		if [ -n "$loc_tag" ]; then
-			miao_tag="$loc_tag"
-		fi
-	fi
-
-	# 2. 若未从 Location 获取到，尝试通过 GitHub Releases API 获取（api.github.com 不走代理）
-	if [ "$miao_tag" = "4.7.7" ]; then
+	if [ "$miao_tag" = "latest" ] || [ -z "$miao_tag" ]; then
+		# 1. 优先尝试从 GitHub Releases API 获取最新版本（api.github.com 不走代理）
 		api_url="https://api.github.com/repos/AirportR/miaospeed/releases/latest"
 		tag_query="$(download_stdout "$api_url" 2>/dev/null | grep '"tag_name":' | head -n1 | sed -E 's/.*"tag_name": *"([^"]+)".*/\1/' | tr -d '\r\n' || true)"
 		if [ -n "$tag_query" ]; then
 			miao_tag="$tag_query"
+		fi
+
+		# 2. 若 API 查询失败，尝试从 releases/latest 重定向 Location 头解析
+		if [ "$miao_tag" = "latest" ] || [ -z "$miao_tag" ]; then
+			if command -v curl >/dev/null 2>&1; then
+				loc_tag="$(curl -sIL "https://github.com/AirportR/miaospeed/releases/latest" 2>/dev/null | grep -i '^location:' | head -n1 | sed -E 's#.*tag/([^/[:space:]]+).*#\1#' | tr -d '\r\n' || true)"
+				if [ -n "$loc_tag" ]; then
+					miao_tag="$loc_tag"
+				fi
+			fi
+		fi
+
+		# 3. 若仍未获取到，尝试从 releases.atom 提取
+		if [ "$miao_tag" = "latest" ] || [ -z "$miao_tag" ]; then
+			atom_tag="$(download_stdout "https://github.com/AirportR/miaospeed/releases.atom" 2>/dev/null | grep -o 'releases/tag/[^"]*' | head -n1 | sed 's#releases/tag/##' | tr -d '\r\n' || true)"
+			if [ -n "$atom_tag" ]; then
+				miao_tag="$atom_tag"
+			fi
+		fi
+
+		# 4. 极端离线/网络受限下的安全保底版本
+		if [ "$miao_tag" = "latest" ] || [ -z "$miao_tag" ]; then
+			miao_tag="4.7.7"
 		fi
 	fi
 
@@ -522,9 +539,9 @@ download_miaospeed() {
 
 	tmp="$(mktemp -d)"
 	if [ -n "$GH_PROXY" ]; then
-		log "通过 GitHub 代理下载 miaospeed（${miao_tag}，${OS}/${miao_arch}，代理：${GH_PROXY}）"
+		log "通过 GitHub 代理下载 miaospeed（最新版本：${miao_tag}，${OS}/${miao_arch}，代理：${GH_PROXY}）"
 	else
-		log "下载 miaospeed（${miao_tag}，${OS}/${miao_arch}）"
+		log "下载 miaospeed（最新版本：${miao_tag}，${OS}/${miao_arch}）"
 	fi
 	if download "$url" "$tmp/miaospeed.tar.gz"; then
 		tar -xzf "$tmp/miaospeed.tar.gz" -C "$tmp" 2>/dev/null || tar -xz -f "$tmp/miaospeed.tar.gz" -C "$tmp" 2>/dev/null || true

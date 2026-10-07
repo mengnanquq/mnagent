@@ -113,6 +113,7 @@ GitHub Releases，发现比当前版本新的正式版就下载、原子替换�
 | `--binary <path\|url>` | — | 使用自备的 mnagent（内网镜像时很有用） |
 | `--nexttrace` | `nexttrace` | nexttrace 路径或名称 |
 | `--miaospeed` | `miaospeed` | miaospeed 路径或名称 |
+| `--miaospeed-version` | `latest` | 安装的 miaospeed 版本，默认 `latest`（取官方最新 Release） |
 | `--user` / `--prefix` | systemd：`mnagent` / `/usr/local/bin`；OpenWrt：`root` / `/usr/bin` | 运行用户与安装目录 |
 | `--auto-update` | `yes` | 是否启用自动更新（支持 `yes`/`no`） |
 | `--no-auto-update` | — | 关闭自动更新（等同于 `--auto-update no`） |
