@@ -37,7 +37,7 @@ const (
 	defaultBuildToken = "MIAOKO4|580JxAo049R|GEnERAl|1X571R930|T0kEN"
 
 	defaultSTUNServer = "udp://stunserver2024.stunprotocol.org:3478"
-	defaultSpeedFile  = "https://speed.cloudflare.com/__down?during=download&bytes=1073741824"
+	defaultSpeedFile  = "https://speed.cloudflare.com/__down?bytes=50000000"
 	defaultPingURL    = "https://cp.cloudflare.com/generate_204"
 )
 
@@ -1085,12 +1085,20 @@ func buildMiaospeedTestPlan(job Job) miaospeedTestPlan {
 		descriptions = append(descriptions, "单线程测速")
 		matrixSet[matrixAverageSpeed] = true
 		matrixSet[matrixMaxSpeed] = true
+		matrixSet[matrixRTTPing] = true
+		matrixSet[matrixHTTPPing] = true
+		matrixSet[matrixPacketLoss] = true
+		matrixSet[matrixOutboundGeoIP] = true
 		plan.DownloadThreading = 1
 	}
 	if modes[ModeMultiSpeed] {
 		descriptions = append(descriptions, "多线程测速")
 		matrixSet[matrixAverageSpeed] = true
 		matrixSet[matrixMaxSpeed] = true
+		matrixSet[matrixRTTPing] = true
+		matrixSet[matrixHTTPPing] = true
+		matrixSet[matrixPacketLoss] = true
+		matrixSet[matrixOutboundGeoIP] = true
 		th := uint(4)
 		if job.Count > 1 && job.Count <= 16 {
 			th = uint(job.Count)
@@ -1101,6 +1109,10 @@ func buildMiaospeedTestPlan(job Job) miaospeedTestPlan {
 		descriptions = append(descriptions, "上行速度测试")
 		matrixSet[matrixAverageUpload] = true
 		matrixSet[matrixMaxUpload] = true
+		matrixSet[matrixRTTPing] = true
+		matrixSet[matrixHTTPPing] = true
+		matrixSet[matrixPacketLoss] = true
+		matrixSet[matrixOutboundGeoIP] = true
 		th := uint(4)
 		if job.Count > 1 && job.Count <= 16 {
 			th = uint(job.Count)
