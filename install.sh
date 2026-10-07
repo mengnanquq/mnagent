@@ -36,6 +36,7 @@ UNINSTALL="no"
 SERVICE_NAME="mnagent"
 AUTO_UPDATE="yes"   # 默认开启自动更新（可 --auto-update no 关闭）
 UPDATE_INTERVAL="6h"
+INSTALL_NEXTTRACE="yes" # 缺少 nexttrace 时默认自动按照官方脚本/包管理器安装
 
 log()  { printf '\033[1;32m==>\033[0m %s\n' "$*"; }
 warn() { printf '\033[1;33m警告:\033[0m %s\n' "$*" >&2; }
@@ -59,6 +60,8 @@ usage() {
   --auto-update [yes|no] 是否启用自动更新（默认 yes）
   --no-auto-update     关闭自动更新（等同于 --auto-update no）
   --update-interval <dur> 自动更新检查间隔（默认 6h）
+  --install-nexttrace [yes|no] 缺少 nexttrace 时是否自动安装（默认 yes）
+  --no-install-nexttrace 缺少 nexttrace 时不自动安装（等同于 --install-nexttrace no）
   --uninstall          卸载：停止并删除服务与二进制（保留令牌与用户）
   -h, --help           显示本帮助
 
@@ -104,10 +107,17 @@ while [ $# -gt 0 ]; do
 		--user)        RUN_USER="${2:-}"; shift 2;;
 		--prefix)      PREFIX="${2:-}"; shift 2;;
 		--uninstall)   UNINSTALL="yes"; shift;;
-		--auto-update)  AUTO_UPDATE="yes"; shift;;
-		--no-auto-update) AUTO_UPDATE="no"; shift;;
-		--update-interval) UPDATE_INTERVAL="${2:-}"; shift 2;;
-		*) die "未知参数：$1（用 --help 查看用法）";;
+			--auto-update)  AUTO_UPDATE="yes"; shift;;
+			--no-auto-update) AUTO_UPDATE="no"; shift;;
+			--update-interval) UPDATE_INTERVAL="${2:-}"; shift 2;;
+			--install-nexttrace)
+				case "${2:-}" in
+					no|false|0) INSTALL_NEXTTRACE="no"; shift 2;;
+					*) INSTALL_NEXTTRACE="yes"; [ -n "${2:-}" ] && [ "${2:-}" != "yes" ] && [ "${2:-}" != "true" ] || shift 2;;
+				esac
+				;;
+			--no-install-nexttrace) INSTALL_NEXTTRACE="no"; shift;;
+			*) die "未知参数：$1（用 --help 查看用法）";;
 	esac
 done
 
@@ -395,6 +405,38 @@ if [ "$RUN_USER" != "root" ]; then
 fi
 
 NEXTTRACE_PATH="$(command -v "$NEXTTRACE_BIN" 2>/dev/null || true)"
+
+# 缺少 nexttrace 时，按照官方 README 引导进行自动化安装：
+# https://github.com/nxtrace/NTrace-core/blob/main/README.md
+if [ -z "$NEXTTRACE_PATH" ] && [ "$INSTALL_NEXTTRACE" = "yes" ]; then
+	log "环境缺少 nexttrace，正在按照官方推荐方式安装..."
+	# 1. 如果是 OpenWrt / ImmortalWrt 且有 opkg，优先尝试包管理器官方包
+	if [ "$PLATFORM" = "openwrt" ] && command -v opkg >/dev/null 2>&1; then
+		log "尝试通过 opkg 安装 nexttrace"
+		opkg update >/dev/null 2>&1 || true
+		opkg install nexttrace >/dev/null 2>&1 || true
+		NEXTTRACE_PATH="$(command -v "$NEXTTRACE_BIN" 2>/dev/null || true)"
+	fi
+
+	# 2. Linux / macOS 通用官方一键脚本（curl -sL https://nxtrace.org/nt | bash）
+	if [ -z "$NEXTTRACE_PATH" ]; then
+		log "执行 nexttrace 官方一键安装脚本（https://nxtrace.org/nt）"
+		SH_BIN="sh"
+		if command -v bash >/dev/null 2>&1; then
+			SH_BIN="bash"
+		fi
+		if download_stdout "https://nxtrace.org/nt" | "$SH_BIN" >/dev/null 2>&1; then
+			NEXTTRACE_PATH="$(command -v "$NEXTTRACE_BIN" 2>/dev/null || true)"
+		fi
+	fi
+
+	if [ -n "$NEXTTRACE_PATH" ]; then
+		log "nexttrace 安装成功：$NEXTTRACE_PATH"
+	else
+		warn "自动安装 nexttrace 失败，请参考官方说明手动安装：https://github.com/nxtrace/NTrace-core"
+	fi
+fi
+
 [ -n "$NEXTTRACE_PATH" ] || warn "未找到 nexttrace（${NEXTTRACE_BIN}）：请安装后再试，否则追踪会失败"
 NEXTTRACE_EXEC="${NEXTTRACE_PATH:-$NEXTTRACE_BIN}"
 

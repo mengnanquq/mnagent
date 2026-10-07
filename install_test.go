@@ -158,6 +158,8 @@ func TestInstallScriptKeepsKeySafeguards(t *testing.T) {
 		{"原始套接字能力由服务携带", "AmbientCapabilities=CAP_NET_RAW CAP_NET_ADMIN"},
 		{"为 nexttrace 准备可写主目录", "StateDirectory=mnagent"},
 		{"自动更新可写目录", "ReadWritePaths=$PREFIX"},
+		{"缺失时自动安装 nexttrace 官方地址", "https://nxtrace.org/nt"},
+		{"OpenWrt 优先 opkg 安装 nexttrace", "opkg install nexttrace"},
 	} {
 		if !strings.Contains(script, want.needle) {
 			t.Errorf("install.sh 缺少“%s”（应包含 %q）", want.name, want.needle)

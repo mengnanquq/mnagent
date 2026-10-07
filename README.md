@@ -100,6 +100,8 @@ GitHub Releases，发现比当前版本新的正式版就下载、原子替换�
 | `--auto-update` | `yes` | 是否启用自动更新（支持 `yes`/`no`） |
 | `--no-auto-update` | — | 关闭自动更新（等同于 `--auto-update no`） |
 | `--update-interval` | `6h` | 自动更新检查间隔（如 `2h`、`12h`） |
+| `--install-nexttrace` | `yes` | 缺少 nexttrace 时是否按官方规范自动安装（默认开启） |
+| `--no-install-nexttrace` | — | 缺少 nexttrace 时不自动安装（等同于 `--install-nexttrace no`） |
 | `--uninstall` | — | 卸载服务与二进制（保留令牌与用户） |
 
 ### 手动安装
