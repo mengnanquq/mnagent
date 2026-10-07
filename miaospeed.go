@@ -36,7 +36,7 @@ const (
 	// 与主流客户端（FullTclash、miaolib、Koipy 等）保持完全一致。
 	defaultBuildToken = "MIAOKO4|580JxAo049R|GEnERAl|1X571R930|T0kEN"
 
-	defaultSTUNServer = "udp://stunserver2024.stunprotocol.org:3478"
+	defaultSTUNServer = "udp://stunserver2025.stunprotocol.org:3478"
 	defaultSpeedFile  = "https://speed.cloudflare.com/__down?bytes=50000000"
 	defaultPingURL    = "https://cp.cloudflare.com/generate_204"
 )
@@ -1178,6 +1178,11 @@ func executeMiaospeedTask(ctx context.Context, wsURL, origin, token string, node
 		})
 	}
 
+	stunURL := plan.STUNURL
+	if stunURL == "" {
+		stunURL = defaultSTUNServer
+	}
+
 	req := slaveRequest{
 		Basics: slaveRequestBasics{
 			ID:        job.ID,
@@ -1190,7 +1195,7 @@ func executeMiaospeedTask(ctx context.Context, wsURL, origin, token string, node
 			Matrices: plan.Matrices,
 		},
 		Configs: slaveRequestConfigs{
-			STUNURL:           plan.STUNURL,
+			STUNURL:           stunURL,
 			DownloadURL:       defaultSpeedFile,
 			DownloadDuration:  plan.DownloadDuration,
 			DownloadThreading: plan.DownloadThreading,
