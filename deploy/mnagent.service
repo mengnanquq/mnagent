@@ -14,16 +14,17 @@ User=mnagent
 Group=mnagent
 
 # 令牌放在只有该用户可读的文件里（chmod 0600）。
+# 如需启用自动更新，可追加 -auto-update 参数。
 ExecStart=/usr/local/bin/mnagent \
     -bot https://mnbot.example.org/agent \
-    -host hk \
     -token-file /etc/mnagent/token \
     -nexttrace /usr/local/bin/nexttrace
 
 # nexttrace 需要可写的主目录来存放配置与 IP 库；ProtectSystem=strict 下只有
-# StateDirectory 指向的目录可写。
+# StateDirectory 指向的目录可写。启用自更新时需允许替换可执行文件（ReadWritePaths）。
 StateDirectory=mnagent
 Environment=HOME=/var/lib/mnagent
+ReadWritePaths=/usr/local/bin
 
 Restart=always
 RestartSec=5

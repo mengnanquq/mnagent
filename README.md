@@ -97,7 +97,9 @@ GitHub Releases，发现比当前版本新的正式版就下载、原子替换�
 | `--binary <path\|url>` | — | 使用自备的 mnagent（内网镜像时很有用） |
 | `--nexttrace` | `nexttrace` | nexttrace 路径或名称 |
 | `--user` / `--prefix` | systemd：`mnagent` / `/usr/local/bin`；OpenWrt：`root` / `/usr/bin` | 运行用户与安装目录 |
-| `--no-auto-update` | — | 关闭自动更新（默认开启） |
+| `--auto-update` | `yes` | 是否启用自动更新（支持 `yes`/`no`） |
+| `--no-auto-update` | — | 关闭自动更新（等同于 `--auto-update no`） |
+| `--update-interval` | `6h` | 自动更新检查间隔（如 `2h`、`12h`） |
 | `--uninstall` | — | 卸载服务与二进制（保留令牌与用户） |
 
 ### 手动安装
@@ -137,6 +139,11 @@ setcap cap_net_raw,cap_net_admin+eip "$(command -v nexttrace)"
 | `-nexttrace` | `nexttrace` | nexttrace 可执行文件路径或 PATH 中的名称 |
 | `-min-backoff` / `-max-backoff` | `1s` / `1m` | 轮询失败后的重试退避区间（带抖动） |
 | `-poll-timeout` | `40s` | 单次长轮询的客户端超时（机器人侧最多保持 20 秒） |
+| `-auto-update` | `false` | 是否开启后台定期自动更新（通过 `install.sh` 安装时默认开启） |
+| `-update-interval` | `6h` | 自动更新检查间隔 |
+| `-check-update` | — | 单次检查是否有新版本并输出，不下载 |
+| `-apply-update <tag\|latest>` | — | 手动下载并安装指定版本或最新版后退出并重启服务 |
+| `-skip-update <tag>` | — | 跳过指定版本 24 小时（自动更新不再提示或应用） |
 | `-log-level` | `info` | `debug` / `info` / `warn` / `error` |
 | `-version` | — | 输出版本后退出 |
 

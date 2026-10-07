@@ -306,7 +306,6 @@ func (a *agent) loop(ctx context.Context) error {
 }
 
 // newUpdater 构建自更新器（自动更新、check/apply CLI 共用）。
-// newUpdater 构建自更新器（自动更新、check/apply CLI 共用）。
 func newUpdater(cfg *config, log logger) *updater {
 	exe, err := os.Executable()
 	if err != nil {

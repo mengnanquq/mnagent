@@ -56,6 +56,9 @@ usage() {
   --from-source        从源码编译（不下载 Release）
   --user <name>        运行服务的用户（systemd 默认 mnagent，OpenWrt 默认 root）
   --prefix <dir>       二进制安装目录（systemd 默认 /usr/local/bin，OpenWrt 默认 /usr/bin）
+  --auto-update [yes|no] 是否启用自动更新（默认 yes）
+  --no-auto-update     关闭自动更新（等同于 --auto-update no）
+  --update-interval <dur> 自动更新检查间隔（默认 6h）
   --uninstall          卸载：停止并删除服务与二进制（保留令牌与用户）
   -h, --help           显示本帮助
 

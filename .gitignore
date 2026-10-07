@@ -1,7 +1,15 @@
-# 编译产物
+# 编译产物与归档
 /mnagent
 /mnagent-*
+mnagent_*
+*.sha256
 *.exe
+dist/
+
+# 测试与覆盖率
+*.test
+coverage.out
+coverage.html
 
 # 本地令牌（切勿提交）
 /token
@@ -9,3 +17,9 @@
 
 # 编辑器与环境
 .zcode/
+.idea/
+.vscode/
+*.swp
+*.swo
+.DS_Store
+Thumbs.db

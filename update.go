@@ -124,8 +124,8 @@ func (u *updater) latestVersion() (string, string, error) {
 	if err != nil {
 		return "", "", err
 	}
-	io.Copy(io.Discard, resp.Body)
-	resp.Body.Close()
+		_, _ = io.Copy(io.Discard, resp.Body)
+		_ = resp.Body.Close()
 	if resp.StatusCode != http.StatusOK && resp.StatusCode != http.StatusFound &&
 		resp.StatusCode != http.StatusMovedPermanently {
 		return "", "", fmt.Errorf("检查更新失败：HTTP %s", resp.Status)

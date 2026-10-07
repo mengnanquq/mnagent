@@ -269,9 +269,18 @@ func TestUpdaterCheckHTTP(t *testing.T) {
 	if err != nil || !ok || latest != "v0.1.9" {
 		t.Fatalf("Check = (%q, %v, %v)", latest, ok, err)
 	}
-	if srv.hits.Load() == 0 {
-		t.Fatal("latest 端点未被访问")
+		if srv.hits.Load() == 0 {
+			t.Fatal("latest 端点未被访问")
+		}
+		_ = fmt.Sprint()
+		_ = context.Background()
 	}
-	_ = fmt.Sprint()
-	_ = context.Background()
-}
+
+	// TestDetectPlatformArch 验证平台架构映射。
+	func TestDetectPlatformArch(t *testing.T) {
+		p, a := detectPlatformArch()
+		if p == "" || a == "" {
+			t.Fatalf("detectPlatformArch() 返回空: platform=%q arch=%q", p, a)
+		}
+	}
+

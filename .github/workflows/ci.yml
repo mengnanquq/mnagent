@@ -1,0 +1,29 @@
+name: ci
+
+on:
+  push:
+    branches: ['main']
+  pull_request:
+    branches: ['main']
+
+jobs:
+  test:
+    name: Test and Vet
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+      - name: Go Format Check
+        run: |
+          diffs=$(gofmt -l .)
+          if [ -n "$diffs" ]; then
+            echo "代码格式未满足 gofmt 要求:"
+            echo "$diffs"
+            exit 1
+          fi
+      - name: Go Vet
+        run: go vet ./...
+      - name: Go Test with Race Detector
+        run: go test -race -v ./...
