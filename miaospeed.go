@@ -41,13 +41,12 @@ const (
 	defaultPingURL    = "https://cp.cloudflare.com/generate_204"
 )
 
-// 8 种测试类型与全量模式常量。
+// 7 种测试类型与全量模式常量。
 const (
 	ModeConnectivity = "connectivity" // 代理连通性测试
 	ModeTopology     = "topology"     // 拓扑测试
 	ModeMultiSpeed   = "multithread"  // 多线程测速 (下行)
 	ModeSingleSpeed  = "singlethread" // 单线程测速 (下行)
-	ModeUploadSpeed  = "upload"       // 上行速度测试
 	ModeFull         = "full"         // 全量测试
 	ModeLatency      = "latency"      // 延迟测试
 	ModeUDP          = "udp"          // UDP 类型测试
@@ -67,8 +66,6 @@ const (
 	matrixUDPType       = "UDP_TYPE"
 	matrixAverageSpeed  = "SPEED_AVERAGE"
 	matrixMaxSpeed      = "SPEED_MAX"
-	matrixAverageUpload = "USPEED_AVERAGE"
-	matrixMaxUpload     = "USPEED_MAX"
 )
 
 // MiaospeedNode 描述解析出的代理节点。
@@ -95,9 +92,6 @@ type MiaospeedReport struct {
 	DownloadThreads int              `json:"download_threads,omitempty"`
 	AvgSpeedBps     float64          `json:"avg_speed_bps,omitempty"` // 字节/秒
 	MaxSpeedBps     float64          `json:"max_speed_bps,omitempty"` // 字节/秒
-	UploadThreads   int              `json:"upload_threads,omitempty"`
-	AvgUploadBps    float64          `json:"avg_upload_bps,omitempty"` // 字节/秒
-	MaxUploadBps    float64          `json:"max_upload_bps,omitempty"` // 字节/秒
 	InboundGeo      string           `json:"inbound_geo,omitempty"`
 	OutboundIP      string           `json:"outbound_ip,omitempty"`
 	OutboundGeo     string           `json:"outbound_geo,omitempty"`
@@ -160,17 +154,6 @@ func (r MiaospeedReport) Format() string {
 		}
 		b.WriteString(fmt.Sprintf("下行 (%s): 平均 %s | 峰值 %s\n",
 			thDesc, formatBytesPerSec(r.AvgSpeedBps), formatBytesPerSec(r.MaxSpeedBps)))
-	}
-
-	if r.AvgUploadBps > 0 || r.MaxUploadBps > 0 {
-		thDesc := "多线程"
-		if r.UploadThreads == 1 {
-			thDesc = "单线程"
-		} else if r.UploadThreads > 1 {
-			thDesc = fmt.Sprintf("%d 线程", r.UploadThreads)
-		}
-		b.WriteString(fmt.Sprintf("上行 (%s): 平均 %s | 峰值 %s\n",
-			thDesc, formatBytesPerSec(r.AvgUploadBps), formatBytesPerSec(r.MaxUploadBps)))
 	}
 
 	if r.InboundGeo != "" || r.OutboundGeo != "" || r.Hijack != "" {
@@ -1013,8 +996,6 @@ func buildMiaospeedTestPlan(job Job) miaospeedTestPlan {
 			modes[ModeMultiSpeed] = true
 		case "single", "singlethread", "singlespeed", "单线程", "单线程测速":
 			modes[ModeSingleSpeed] = true
-		case "upload", "up", "uspeed", "上行", "上行速度", "上行测试", "上行速度测试":
-			modes[ModeUploadSpeed] = true
 		case "latency", "ping", "rtt", "delay", "延迟", "延迟测试":
 			modes[ModeLatency] = true
 		case "udp", "nat", "stun", "udp类型", "udp类型测试":
@@ -1039,13 +1020,9 @@ func buildMiaospeedTestPlan(job Job) miaospeedTestPlan {
 				{Type: matrixUDPType},
 				{Type: matrixAverageSpeed},
 				{Type: matrixMaxSpeed},
-				{Type: matrixAverageUpload},
-				{Type: matrixMaxUpload},
 			},
 			DownloadThreading: 4,
 			DownloadDuration:  5,
-			UploadThreading:   4,
-			UploadDuration:    4,
 			STUNURL:           defaultSTUNServer,
 		}
 	}
@@ -1054,7 +1031,6 @@ func buildMiaospeedTestPlan(job Job) miaospeedTestPlan {
 	var descriptions []string
 	plan := miaospeedTestPlan{
 		DownloadDuration: 5,
-		UploadDuration:   4,
 	}
 
 	if modes[ModeConnectivity] {
@@ -1121,30 +1097,11 @@ func buildMiaospeedTestPlan(job Job) miaospeedTestPlan {
 		}
 		plan.DownloadThreading = th
 	}
-	if modes[ModeUploadSpeed] {
-		descriptions = append(descriptions, "上行速度测试")
-		matrixSet[matrixAverageUpload] = true
-		matrixSet[matrixMaxUpload] = true
-		matrixSet[matrixRTTPing] = true
-		matrixSet[matrixHTTPPing] = true
-		matrixSet[matrixPacketLoss] = true
-		matrixSet[matrixHTTPCode] = true
-		matrixSet[matrixOutboundGeoIP] = true
-		th := uint(4)
-		if job.Count > 1 && job.Count <= 16 {
-			th = uint(job.Count)
-		} else if job.Count == 1 {
-			th = 1
-		}
-		plan.UploadThreading = th
-	}
-
 	orderedMatrixKeys := []string{
 		matrixRTTPing, matrixHTTPPing, matrixPacketLoss, matrixMaxRTTPing, matrixHTTPCode,
 		matrixInboundGeoIP, matrixOutboundGeoIP, matrixHijack,
 		matrixUDPType,
 		matrixAverageSpeed, matrixMaxSpeed,
-		matrixAverageUpload, matrixMaxUpload,
 	}
 	for _, key := range orderedMatrixKeys {
 		if matrixSet[key] {
@@ -1283,7 +1240,6 @@ func parseSlaveTaskResult(task *slaveTask, nodes []MiaospeedNode, plan miaospeed
 	report := &MiaospeedReport{
 		TestMode:        plan.ModeDescription,
 		DownloadThreads: int(plan.DownloadThreading),
-		UploadThreads:   int(plan.UploadThreading),
 		DurationMs:      duration.Milliseconds(),
 		RawResults:      task.Results,
 	}
@@ -1322,10 +1278,6 @@ func parseSlaveTaskResult(task *slaveTask, nodes []MiaospeedNode, plan miaospeed
 			report.AvgSpeedBps = parseMatrixFloat(m.Payload)
 		case matrixMaxSpeed:
 			report.MaxSpeedBps = parseMatrixFloat(m.Payload)
-		case matrixAverageUpload:
-			report.AvgUploadBps = parseMatrixFloat(m.Payload)
-		case matrixMaxUpload:
-			report.MaxUploadBps = parseMatrixFloat(m.Payload)
 		}
 	}
 

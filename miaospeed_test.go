@@ -248,8 +248,8 @@ func TestExecuteMiaospeedTask(t *testing.T) {
 	if report.HTTPCode != 204 || report.UDPType != "FullCone" {
 		t.Fatalf("连通性或 UDP 类型不符合预期: %+v", report)
 	}
-	if report.AvgSpeedBps != 52428800 || report.AvgUploadBps != 20971520 {
-		t.Fatalf("报告下行或上行速度不符合预期: %+v", report)
+	if report.AvgSpeedBps != 52428800 {
+		t.Fatalf("报告下行速度不符合预期: %+v", report)
 	}
 	if report.InboundGeo != "中国 广州 (14.215.x.x)" || report.Hijack != "正常" {
 		t.Fatalf("拓扑信息不符合预期: %+v", report)
@@ -258,8 +258,7 @@ func TestExecuteMiaospeedTask(t *testing.T) {
 	formatted := report.Format()
 	if !strings.Contains(formatted, "MiaoSpeed 测速报告 · 全量测试") ||
 		!strings.Contains(formatted, "UDP NAT 类型: FullCone") ||
-		!strings.Contains(formatted, "下行 (4 线程): 平均 50.00 MB/s") ||
-		!strings.Contains(formatted, "上行 (4 线程): 平均 20.00 MB/s") {
+		!strings.Contains(formatted, "下行 (4 线程): 平均 50.00 MB/s") {
 		t.Fatalf("格式化排版不符合预期:\n%s", formatted)
 	}
 }
@@ -314,9 +313,8 @@ func TestBuildMiaospeedTestPlan(t *testing.T) {
 			name:              "默认全量测试",
 			job:               Job{ID: "t0"},
 			wantDesc:          "全量测试",
-			wantMatrices:      []string{matrixRTTPing, matrixHTTPPing, matrixPacketLoss, matrixHTTPCode, matrixInboundGeoIP, matrixOutboundGeoIP, matrixHijack, matrixUDPType, matrixAverageSpeed, matrixMaxSpeed, matrixAverageUpload, matrixMaxUpload},
+			wantMatrices:      []string{matrixRTTPing, matrixHTTPPing, matrixPacketLoss, matrixHTTPCode, matrixInboundGeoIP, matrixOutboundGeoIP, matrixHijack, matrixUDPType, matrixAverageSpeed, matrixMaxSpeed},
 			wantDownThreading: 4,
-			wantUpThreading:   4,
 		},
 		{
 			name:         "连通性测试 (connectivity)",
@@ -343,13 +341,6 @@ func TestBuildMiaospeedTestPlan(t *testing.T) {
 			wantDesc:          "单线程测速",
 			wantMatrices:      []string{matrixRTTPing, matrixHTTPPing, matrixPacketLoss, matrixHTTPCode, matrixOutboundGeoIP, matrixAverageSpeed, matrixMaxSpeed},
 			wantDownThreading: 1,
-		},
-		{
-			name:            "上行速度测试 (upload)",
-			job:             Job{ID: "t5", Query: "upload"},
-			wantDesc:        "上行速度测试",
-			wantMatrices:    []string{matrixRTTPing, matrixHTTPPing, matrixPacketLoss, matrixHTTPCode, matrixOutboundGeoIP, matrixAverageUpload, matrixMaxUpload},
-			wantUpThreading: 4,
 		},
 		{
 			name:         "延迟测试 (latency)",
