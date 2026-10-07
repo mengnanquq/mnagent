@@ -407,57 +407,57 @@ func handleUpdateCLI(cfg *config, log logger) (handled bool, err error) {
 		}
 		fmt.Printf("已跳过版本 %s（24 小时内不再提示）\n", ver)
 		return true, nil
-		case cfg.checkUpdateOnce:
-			latest, ok, err := u.Check()
+	case cfg.checkUpdateOnce:
+		latest, ok, err := u.Check()
+		if err != nil {
+			return true, err
+		}
+		if ok {
+			fmt.Printf("发现新版本：%s（当前 %s）\n", latest, version)
+		} else {
+			fmt.Printf("已是最新版本（%s）\n", version)
+		}
+		dm := newDependencyManager(cfg.ghProxy)
+		statuses := dm.CheckAll(context.Background(), cfg)
+		for _, st := range statuses {
+			fmt.Println(st.Summary())
+		}
+		return true, nil
+	case cfg.applyUpdate != "":
+		ver := cfg.applyUpdate
+		if ver == "latest" {
+			l, _, err := u.latestVersion()
 			if err != nil {
 				return true, err
 			}
-			if ok {
-				fmt.Printf("发现新版本：%s（当前 %s）\n", latest, version)
-			} else {
-				fmt.Printf("已是最新版本（%s）\n", version)
-			}
-			dm := newDependencyManager(cfg.ghProxy)
-			statuses := dm.CheckAll(context.Background(), cfg)
-			for _, st := range statuses {
-				fmt.Println(st.Summary())
-			}
-			return true, nil
-		case cfg.applyUpdate != "":
-			ver := cfg.applyUpdate
-			if ver == "latest" {
-				l, _, err := u.latestVersion()
-				if err != nil {
-					return true, err
-				}
-				ver = l
-			} else if _, ok := parseVersion(ver); !ok {
-				return true, fmt.Errorf("版本号格式非法：%q", ver)
-			}
-
-			// 更新依赖项
-			dm := newDependencyManager(cfg.ghProxy)
-			statuses := dm.CheckAll(context.Background(), cfg)
-			for _, st := range statuses {
-				if st.HasUpdate {
-					fmt.Printf("正在更新依赖 %s 至 %s ...\n", st.Name, st.LatestVersion)
-					if _, err := dm.UpdateDependency(context.Background(), st.Name, st.BinaryPath, st.LatestVersion, log); err != nil {
-						fmt.Printf("更新依赖 %s 失败：%v\n", st.Name, err)
-					} else {
-						fmt.Printf("已更新依赖 %s（%s）\n", st.Name, st.LatestVersion)
-					}
-				}
-			}
-
-			fmt.Printf("正在下载并安装 %s ...\n", ver)
-			if err := u.Apply(ver); err != nil {
-				return true, err
-			}
-			fmt.Printf("已安装 %s，服务已重启\n", ver)
-			return true, nil
+			ver = l
+		} else if _, ok := parseVersion(ver); !ok {
+			return true, fmt.Errorf("版本号格式非法：%q", ver)
 		}
-		return false, nil
+
+		// 更新依赖项
+		dm := newDependencyManager(cfg.ghProxy)
+		statuses := dm.CheckAll(context.Background(), cfg)
+		for _, st := range statuses {
+			if st.HasUpdate {
+				fmt.Printf("正在更新依赖 %s 至 %s ...\n", st.Name, st.LatestVersion)
+				if _, err := dm.UpdateDependency(context.Background(), st.Name, st.BinaryPath, st.LatestVersion, log); err != nil {
+					fmt.Printf("更新依赖 %s 失败：%v\n", st.Name, err)
+				} else {
+					fmt.Printf("已更新依赖 %s（%s）\n", st.Name, st.LatestVersion)
+				}
+			}
+		}
+
+		fmt.Printf("正在下载并安装 %s ...\n", ver)
+		if err := u.Apply(ver); err != nil {
+			return true, err
+		}
+		fmt.Printf("已安装 %s，服务已重启\n", ver)
+		return true, nil
 	}
+	return false, nil
+}
 
 // restartService 重启 mnagent 服务（systemd 或 OpenWrt procd）。
 func restartService() error {
