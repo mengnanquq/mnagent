@@ -328,3 +328,55 @@ func TestUpdaterProxyURL(t *testing.T) {
 		})
 	}
 }
+
+// TestUpdaterCheckWithAPIFallback 验证当 HEAD latest 返回 200（无 Location 重定向头，类似代理直接返回内容）时，
+// updater 能自动通过 API 回退获取最新版本号并顺利检测到新版本。
+func TestUpdaterCheckWithAPIFallback(t *testing.T) {
+	// 假服务器：HEAD latest 返回 200 但无 Location 头；GET /api/latest 返回 JSON release 数据。
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/latest":
+			if r.Method == http.MethodHead {
+				w.WriteHeader(http.StatusOK)
+				return
+			}
+			http.NotFound(w, r)
+		case "/api/latest":
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(`{"tag_name": "v0.3.6"}`))
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer ts.Close()
+
+	u := &updater{
+		repo:     "test/repo",
+		platform: "linux",
+		arch:     "amd64",
+		client: &http.Client{
+			Timeout: time.Second,
+			CheckRedirect: func(*http.Request, []*http.Request) error {
+				return http.ErrUseLastResponse
+			},
+		},
+		downloadClient: ts.Client(),
+		executable:     filepath.Join(t.TempDir(), "mnagent"),
+		skipFile:       filepath.Join(t.TempDir(), "skip"),
+		latestURL: func() string {
+			return ts.URL + "/latest"
+		},
+		apiURL: func() string {
+			return ts.URL + "/api/latest"
+		},
+	}
+
+	version = "v0.3.5"
+	latest, ok, err := u.Check()
+	if err != nil {
+		t.Fatalf("Check 失败: %v", err)
+	}
+	if !ok || latest != "v0.3.6" {
+		t.Fatalf("Check = (%q, %v)，期望 (v0.3.6, true)", latest, ok)
+	}
+}

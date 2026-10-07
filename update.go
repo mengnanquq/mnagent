@@ -1,6 +1,7 @@
 package main
 
 import (
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -86,6 +87,8 @@ type updater struct {
 	latestURL func() string
 	// urlFor 生成指定版本（或 latest）的下载地址；测试可覆盖为假服务器。
 	urlFor func(version string) string
+	// apiURL 生成 GitHub API 获取最新 release 的地址；测试可覆盖为假服务器。
+	apiURL func() string
 }
 
 // assetName 返回当前平台的 Release 资产名（与安装脚本的命名一致）。
@@ -127,6 +130,53 @@ func (u *updater) urlForOrFallback(version string) string {
 	return u.proxyURL(raw)
 }
 
+// latestVersionByAPI 通过 GitHub API 获取最新发布版本号。
+// 当 HEAD 请求被加速代理拦截返回 200（吞掉 302 重定向），或无法从 Location 获取版本时作为备用。
+func (u *updater) latestVersionByAPI() (string, error) {
+	var targetURL string
+	if u.apiURL != nil {
+		targetURL = u.apiURL()
+	} else {
+		targetURL = u.proxyURL("https://api.github.com/repos/" + u.repo + "/releases/latest")
+	}
+
+	req, err := http.NewRequest(http.MethodGet, targetURL, nil)
+	if err != nil {
+		return "", err
+	}
+	req.Header.Set("User-Agent", "mnagent")
+	req.Header.Set("Accept", "application/vnd.github+json")
+
+	// 使用 downloadClient 允许跟随重定向
+	client := u.downloadClient
+	if client == nil {
+		client = http.DefaultClient
+	}
+	resp, err := client.Do(req)
+	if err != nil {
+		return "", err
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		return "", fmt.Errorf("GitHub API HTTP %s", resp.Status)
+	}
+
+	var data struct {
+		TagName string `json:"tag_name"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&data); err != nil {
+		return "", fmt.Errorf("解析 GitHub API 响应失败: %w", err)
+	}
+	if data.TagName == "" {
+		return "", errors.New("GitHub API 未返回 tag_name")
+	}
+	if _, ok := parseVersion(data.TagName); !ok {
+		return "", fmt.Errorf("解析 API 版本号失败：%q", data.TagName)
+	}
+	return data.TagName, nil
+}
+
 // latestVersion 返回最新发布版本号（v 前缀，如 v0.1.7），以及真实资产地址。
 // HEAD 请求统一走 urlForOrFallback("latest")：默认是 GitHub 的 latest 地址，
 // 测试可覆盖为假服务器。
@@ -138,29 +188,38 @@ func (u *updater) latestVersion() (string, string, error) {
 	// 不跟随重定向：我们要读 Location 头。
 	resp, err := u.client.Do(req)
 	if err != nil {
+		// 代理或网络失败时，尝试 API fallback
+		if v, apiErr := u.latestVersionByAPI(); apiErr == nil {
+			return v, u.urlForOrFallback(v), nil
+		}
 		return "", "", err
 	}
 	_, _ = io.Copy(io.Discard, resp.Body)
 	_ = resp.Body.Close()
-	if resp.StatusCode != http.StatusOK && resp.StatusCode != http.StatusFound &&
-		resp.StatusCode != http.StatusMovedPermanently {
-		return "", "", fmt.Errorf("检查更新失败：HTTP %s", resp.Status)
-	}
+
+	// 正常 GitHub 会返回 302/301 重定向，Location 指向具体 release tag 下载地址
 	loc := resp.Header.Get("Location")
+	if loc != "" {
+		parts := strings.Split(strings.TrimRight(loc, "/"), "/")
+		if len(parts) >= 2 {
+			version := parts[len(parts)-2]
+			if _, ok := parseVersion(version); ok {
+				return version, loc, nil
+			}
+		}
+	}
+
+	// 代理服务器（如 gh-proxy.com）在处理 /releases/latest/download/* 时，
+	// 会直接在服务端请求后端并返回 200 application/octet-stream，或者响应无 Location 头。
+	// 此时回退通过 API 获取最新版本。
+	if v, apiErr := u.latestVersionByAPI(); apiErr == nil {
+		return v, u.urlForOrFallback(v), nil
+	}
+
 	if loc == "" {
-		return "", "", errors.New("检查更新失败：响应缺少重定向地址")
+		return "", "", errors.New("检查更新失败：响应缺少重定向地址且 API 回退不可用")
 	}
-	// Location 形如 https://github.com/<repo>/releases/download/v0.1.7/<asset>：
-	// 版本号在倒数第二段，资产名在最后一段。
-	parts := strings.Split(strings.TrimRight(loc, "/"), "/")
-	if len(parts) < 2 {
-		return "", "", fmt.Errorf("解析版本号失败：%q", loc)
-	}
-	version := parts[len(parts)-2]
-	if _, ok := parseVersion(version); !ok {
-		return "", "", fmt.Errorf("解析版本号失败：%q", version)
-	}
-	return version, loc, nil
+	return "", "", fmt.Errorf("解析版本号失败：%q", loc)
 }
 
 // Check 返回是否有可应用的新版本。
