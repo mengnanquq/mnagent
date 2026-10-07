@@ -36,7 +36,9 @@ const (
 	// 与主流客户端（FullTclash、miaolib、Koipy 等）保持完全一致。
 	defaultBuildToken = "MIAOKO4|580JxAo049R|GEnERAl|1X571R930|T0kEN"
 
-	defaultSTUNServer = "udp://stunserver2025.stunprotocol.org:3478"
+	defaultSTUNServer = "udp://stunserver2024.stunprotocol.org:3478"
+	defaultSpeedFile  = "https://dl.google.com/dl/android/studio/install/3.4.1.0/android-studio-ide-183.5522156-windows.exe"
+	defaultPingURL    = "https://cp.cloudflare.com/generate_204"
 )
 
 // 8 种测试类型与全量模式常量。
@@ -1177,8 +1179,13 @@ func executeMiaospeedTask(ctx context.Context, wsURL, origin, token string, node
 		},
 		Configs: slaveRequestConfigs{
 			STUNURL:           plan.STUNURL,
+			DownloadURL:       defaultSpeedFile,
 			DownloadDuration:  plan.DownloadDuration,
 			DownloadThreading: plan.DownloadThreading,
+			PingAddress:       defaultPingURL,
+			PingAverageOver:   2,
+			TaskRetry:         2,
+			TaskTimeout:       5000,
 			DNSServers:        make([]string, 0),
 			Scripts:           make([]slaveScript, 0),
 		},
