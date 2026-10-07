@@ -114,7 +114,7 @@ GitHub Releases，发现比当前版本新的正式版就下载、原子替换�
 | `--nexttrace` | `nexttrace` | nexttrace 路径或名称 |
 | `--miaospeed` | `miaospeed` | miaospeed 路径或名称 |
 | `--miaospeed-version` | `latest` | 安装的 miaospeed 版本，默认 `latest`（取官方最新 Release） |
-| `--user` / `--prefix` | systemd：`mnagent` / `/usr/local/bin`；OpenWrt：`root` / `/usr/bin` | 运行用户与安装目录 |
+| `--user` / `--prefix` | 默认 `root` / `/usr/local/bin`（OpenWrt 为 `/usr/bin`） | 运行用户与安装目录 |
 | `--auto-update` | `yes` | 是否启用自动更新（支持 `yes`/`no`） |
 | `--no-auto-update` | — | 关闭自动更新（等同于 `--auto-update no`） |
 | `--update-interval` | `6h` | 自动更新检查间隔（如 `2h`、`12h`） |
@@ -133,10 +133,9 @@ GitHub Releases，发现比当前版本新的正式版就下载、原子替换�
 ```bash
 go build -trimpath -ldflags "-s -w -X main.version=$(git describe --tags --always)" -o mnagent .
 install -m 0755 mnagent /usr/local/bin/mnagent
-useradd --system --no-create-home --shell /usr/sbin/nologin mnagent
-install -d -m 0750 -o mnagent -g mnagent /etc/mnagent
-printf '%s\n' '<令牌>' > /etc/mnagent/token && chmod 0600 /etc/mnagent/token && chown mnagent /etc/mnagent/token
-# 手工前台运行时需要自己给 nexttrace 授权（用 systemd 时由单元的 AmbientCapabilities 提供）
+install -d -m 0750 /etc/mnagent
+printf '%s\n' '<令牌>' > /etc/mnagent/token && chmod 0600 /etc/mnagent/token
+# 手工非 root 运行时需要自己给 nexttrace 授权（用 systemd 且以 root 运行或由单元的 AmbientCapabilities 提供）
 setcap cap_net_raw,cap_net_admin+eip "$(command -v nexttrace)"
 ```
 

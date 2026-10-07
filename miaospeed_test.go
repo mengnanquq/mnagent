@@ -19,18 +19,26 @@ import (
 
 // TestSignMiaoSpeedRequest 验证 MiaoSpeed 的 SHA-512 Challenge 计算。
 func TestSignMiaoSpeedRequest(t *testing.T) {
-	reqJSON := `{"Basics":{"ID":"test1"}}`
+	req := slaveRequest{
+		Basics: slaveRequestBasics{ID: "test1"},
+	}
 	token := "token123"
 	buildToken := "MIAOKO4|580JxAo049R|GEnERAl|1X571R930|T0kEN"
 
-	sig1 := signMiaoSpeedRequest(token, buildToken, reqJSON)
-	sig2 := signMiaoSpeedRequest(token, buildToken, reqJSON)
+	sig1, err1 := signMiaoSpeedRequest(token, buildToken, req)
+	sig2, err2 := signMiaoSpeedRequest(token, buildToken, req)
+	if err1 != nil || err2 != nil {
+		t.Fatalf("签名计算报错: %v, %v", err1, err2)
+	}
 	if sig1 == "" || sig1 != sig2 {
 		t.Fatalf("签名计算结果不应为空且必须确定: sig1=%q, sig2=%q", sig1, sig2)
 	}
 
 	// 改变输入时签名应改变
-	sigDifferent := signMiaoSpeedRequest(token, buildToken, `{"Basics":{"ID":"test2"}}`)
+	req2 := slaveRequest{
+		Basics: slaveRequestBasics{ID: "test2"},
+	}
+	sigDifferent, _ := signMiaoSpeedRequest(token, buildToken, req2)
 	if sig1 == sigDifferent {
 		t.Fatalf("不同请求内容不应生成相同签名")
 	}

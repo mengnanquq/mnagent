@@ -61,7 +61,7 @@ usage() {
   --version <tag>      安装的版本标签，默认 latest（取最新 Release）
   --binary <path|url>  直接使用已编译好的 mnagent（本地路径或下载地址）
   --from-source        从源码编译（不下载 Release）
-  --user <name>        运行服务的用户（systemd 默认 mnagent，OpenWrt 默认 root）
+  --user <name>        运行服务的用户（默认 root）
   --prefix <dir>       二进制安装目录（systemd 默认 /usr/local/bin，OpenWrt 默认 /usr/bin）
   --auto-update [yes|no] 是否启用自动更新（默认 yes）
   --no-auto-update     关闭自动更新（等同于 --auto-update no）
@@ -166,12 +166,12 @@ case "$PLATFORM" in
 		;;
 	systemd)
 		[ -n "$PREFIX" ] || PREFIX="/usr/local/bin"
-		[ -n "$RUN_USER" ] || RUN_USER="mnagent"
+		[ -n "$RUN_USER" ] || RUN_USER="root"
 		[ -n "$INIT_DIR" ] || INIT_DIR="/etc/systemd/system"
 		;;
 	*)
 		[ -n "$PREFIX" ] || PREFIX="/usr/local/bin"
-		[ -n "$RUN_USER" ] || RUN_USER="mnagent"
+		[ -n "$RUN_USER" ] || RUN_USER="root"
 		;;
 esac
 
@@ -387,8 +387,8 @@ log "已安装 $PREFIX/mnagent（$("$PREFIX/mnagent" -version 2>/dev/null || ech
 
 # ---------- 运行用户 ----------
 
-# OpenWrt 默认以 root 运行：设备上没有 setcap，而 nexttrace 需要 CAP_NET_RAW；
-# 其他平台创建专用系统用户。
+# 默认以 root 运行（便于自动更新替换二进制、调用网络诊断工具与重启服务）；
+# 若指定了非 root 用户，则创建专用系统用户。
 if [ "$RUN_USER" != "root" ]; then
 	if ! id -u "$RUN_USER" >/dev/null 2>&1; then
 		log "创建系统用户 $RUN_USER"
@@ -405,8 +405,8 @@ if [ "$RUN_USER" != "root" ]; then
 			die "系统缺少 useradd/adduser，无法创建用户 ${RUN_USER}（可用 --user root 直接以 root 运行）"
 		fi
 	fi
-elif [ "$PLATFORM" = "openwrt" ]; then
-	log "以 root 运行（OpenWrt 上无法单独给 nexttrace 授予原始套接字能力）"
+else
+	log "以 root 运行"
 fi
 RUN_GROUP="$(id -gn "$RUN_USER" 2>/dev/null || echo "$RUN_USER")"
 
@@ -434,6 +434,8 @@ if [ -n "$TOKEN" ]; then
 	log "已写入令牌 ${TOKEN_FILE}（0600，属主 ${RUN_USER}）"
 elif [ ! -s "$TOKEN_FILE" ]; then
 	die "缺少 --token，且 $TOKEN_FILE 不存在；请使用 /host 生成的完整命令"
+else
+	chown "$RUN_USER":"$RUN_GROUP" "$TOKEN_FILE" 2>/dev/null || chown "$RUN_USER" "$TOKEN_FILE" 2>/dev/null || true
 fi
 
 # 自检：以服务用户身份确认能读到令牌（目录缺少进入权限时，非 root 服务启动即退出）。

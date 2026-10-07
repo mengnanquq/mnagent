@@ -2,6 +2,7 @@ package main
 
 import (
 	"archive/tar"
+	"bytes"
 	"compress/gzip"
 	"context"
 	"crypto/rand"
@@ -222,49 +223,58 @@ func formatBytesPerSec(bps float64) string {
 // --- MiaoSpeed API 请求与协议结构定义 ---
 
 type slaveRequestMatrixEntry struct {
-	Type   string `json:"Type"`
-	Params string `json:"Params,omitempty"`
+	Type   string
+	Params string
 }
 
 type slaveRequestOptions struct {
-	Filter   string                    `json:"Filter,omitempty"`
-	Matrices []slaveRequestMatrixEntry `json:"Matrices"`
+	Filter   string
+	Matrices []slaveRequestMatrixEntry
 }
 
 type slaveRequestBasics struct {
-	ID        string `json:"ID"`
-	Slave     string `json:"Slave"`
-	SlaveName string `json:"SlaveName"`
-	Invoker   string `json:"Invoker"`
-	Version   string `json:"Version"`
+	ID        string
+	Slave     string
+	SlaveName string
+	Invoker   string
+	Version   string
 }
 
 type slaveRequestNode struct {
-	Name    string `json:"Name"`
-	Payload string `json:"Payload"`
+	Name    string
+	Payload string
+}
+
+type slaveScript struct {
+	ScriptType string
+	ScriptName string
+	ScriptData string
 }
 
 type slaveRequestConfigs struct {
-	ApiVersion        int    `json:"ApiVersion"`
-	STUNURL           string `json:"STUNURL,omitempty"`
-	DownloadURL       string `json:"DownloadURL,omitempty"`
-	DownloadDuration  int64  `json:"DownloadDuration,omitempty"`
-	DownloadThreading uint   `json:"DownloadThreading,omitempty"`
-	UploadURL         string `json:"UploadURL,omitempty"`
-	UploadDuration    int64  `json:"UploadDuration,omitempty"`
-	UploadThreading   uint   `json:"UploadThreading,omitempty"`
-	PingAddress       string `json:"PingAddress,omitempty"`
-	PingAverageOver   uint16 `json:"PingAverageOver,omitempty"`
+	STUNURL           string
+	DownloadURL       string
+	DownloadDuration  int64
+	DownloadThreading uint
+
+	PingAverageOver uint16
+	PingAddress     string
+
+	TaskRetry  uint
+	DNSServers []string
+
+	TaskTimeout uint
+	Scripts     []slaveScript
 }
 
 type slaveRequest struct {
-	Basics         slaveRequestBasics  `json:"Basics"`
-	Options        slaveRequestOptions `json:"Options"`
-	Configs        slaveRequestConfigs `json:"Configs"`
-	Vendor         string              `json:"Vendor"`
-	Nodes          []slaveRequestNode  `json:"Nodes"`
-	RandomSequence string              `json:"RandomSequence"`
-	Challenge      string              `json:"Challenge"`
+	Basics         slaveRequestBasics
+	Options        slaveRequestOptions
+	Configs        slaveRequestConfigs
+	Vendor         string
+	Nodes          []slaveRequestNode
+	RandomSequence string
+	Challenge      string
 }
 
 type matrixResponse struct {
@@ -294,8 +304,20 @@ type slaveResponse struct {
 }
 
 // signMiaoSpeedRequest 计算 MiaoSpeed 请求的 Challenge 签名。
-// 算法与 AirportR/miaospeed 及 miaolib 完全一致：SHA512(request + token + buildToken)。
-func signMiaoSpeedRequest(token, buildToken, reqJSON string) string {
+// 算法与 AirportR/miaospeed 完全一致：
+// 服务端反序列化后以 Clone() 副本计算签名；Clone() 会将 Challenge 置空且未复制 Vendor（置空）。
+// 对深拷贝副本进行 json.Marshal 后计算 SHA512(request + token + buildToken)。
+func signMiaoSpeedRequest(token, buildToken string, req slaveRequest) (string, error) {
+	awaitSigned := req
+	awaitSigned.Challenge = ""
+	awaitSigned.Vendor = "" // miaospeed Clone() 漏拷 Vendor，服务端校验时此字段为空
+
+	raw, err := json.Marshal(&awaitSigned)
+	if err != nil {
+		return "", err
+	}
+	reqJSON := strings.TrimSpace(string(raw))
+
 	buildTokens := append([]string{token}, strings.Split(strings.TrimSpace(buildToken), "|")...)
 
 	hasher := sha512.New()
@@ -308,7 +330,7 @@ func signMiaoSpeedRequest(token, buildToken, reqJSON string) string {
 		hasher.Write(hasher.Sum([]byte(t)))
 	}
 
-	return base64.URLEncoding.EncodeToString(hasher.Sum(nil))
+	return base64.URLEncoding.EncodeToString(hasher.Sum(nil)), nil
 }
 
 // parseProxyTarget 将任务 Target（单节点链接、订阅 URL 或原生 YAML）解析为节点列表。
@@ -1154,12 +1176,11 @@ func executeMiaospeedTask(ctx context.Context, wsURL, origin, token string, node
 			Matrices: plan.Matrices,
 		},
 		Configs: slaveRequestConfigs{
-			ApiVersion:        3,
 			STUNURL:           plan.STUNURL,
 			DownloadDuration:  plan.DownloadDuration,
 			DownloadThreading: plan.DownloadThreading,
-			UploadDuration:    plan.UploadDuration,
-			UploadThreading:   plan.UploadThreading,
+			DNSServers:        make([]string, 0),
+			Scripts:           make([]slaveScript, 0),
 		},
 		Vendor:         "Clash",
 		Nodes:          reqNodes,
@@ -1167,11 +1188,11 @@ func executeMiaospeedTask(ctx context.Context, wsURL, origin, token string, node
 	}
 
 	// 签名
-	reqBytes, err := json.Marshal(req)
+	sig, err := signMiaoSpeedRequest(token, defaultBuildToken, req)
 	if err != nil {
-		return nil, fmt.Errorf("序列化任务请求失败: %w", err)
+		return nil, fmt.Errorf("签名任务请求失败: %w", err)
 	}
-	req.Challenge = signMiaoSpeedRequest(token, defaultBuildToken, string(reqBytes))
+	req.Challenge = sig
 
 	// 发送任务
 	if err := websocket.JSON.Send(ws, req); err != nil {
@@ -1189,8 +1210,8 @@ func executeMiaospeedTask(ctx context.Context, wsURL, origin, token string, node
 
 		_ = ws.SetReadDeadline(time.Now().Add(5 * time.Second))
 		var resp slaveResponse
-		if err := websocket.JSON.Receive(ws, &resp); err != nil {
-			if errors.Is(err, io.EOF) {
+		if err := readNextSlaveJSON(ws, &resp); err != nil {
+			if errors.Is(err, io.EOF) || errors.Is(err, io.ErrUnexpectedEOF) {
 				break
 			}
 			var netErr net.Error
@@ -1198,6 +1219,9 @@ func executeMiaospeedTask(ctx context.Context, wsURL, origin, token string, node
 				continue
 			}
 			return nil, fmt.Errorf("读取 miaospeed 响应失败: %w", err)
+		}
+		if log != nil {
+			log.Debug("收到 miaospeed 响应", "has_result", resp.Result != nil, "error", resp.Error)
 		}
 
 		if resp.Error != "" {
@@ -1298,4 +1322,30 @@ func generateRandomHex(n int) string {
 	b := make([]byte, n)
 	_, _ = rand.Read(b)
 	return hex.EncodeToString(b)
+}
+
+// readNextSlaveJSON 从 ws 连接中读取下一条完整的 JSON 响应并反序列化。
+func readNextSlaveJSON(ws *websocket.Conn, dest any) error {
+	var buf bytes.Buffer
+	chunk := make([]byte, 4096)
+	for {
+		n, err := ws.Read(chunk)
+		if n > 0 {
+			buf.Write(chunk[:n])
+			b := bytes.TrimSpace(buf.Bytes())
+			if len(b) > 0 && b[0] == '{' && b[len(b)-1] == '}' {
+				if jsonErr := json.Unmarshal(b, dest); jsonErr == nil {
+					return nil
+				}
+			}
+		}
+		if err != nil {
+			if buf.Len() > 0 {
+				if jsonErr := json.Unmarshal(bytes.TrimSpace(buf.Bytes()), dest); jsonErr == nil {
+					return nil
+				}
+			}
+			return err
+		}
+	}
 }

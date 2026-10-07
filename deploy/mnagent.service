@@ -6,12 +6,8 @@ Wants=network-online.target
 
 [Service]
 Type=simple
-# 建议专用低权限用户；原始套接字权限由下面的 AmbientCapabilities 提供，
-# 不要为了追踪把整个服务跑成 root：
-#   sudo useradd --system --no-create-home --shell /usr/sbin/nologin mnagent
-#   sudo install -m 0755 mnagent /usr/local/bin/mnagent
-User=mnagent
-Group=mnagent
+User=root
+Group=root
 
 # 令牌放在只有该用户可读的文件里（chmod 0600）。
 # 如需启用自动更新，可追加 -auto-update 参数。
