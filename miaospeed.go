@@ -1,9 +1,7 @@
 package main
 
 import (
-	"archive/tar"
 	"bytes"
-	"compress/gzip"
 	"context"
 	"crypto/rand"
 	"crypto/sha512"
@@ -18,8 +16,6 @@ import (
 	"net/url"
 	"os"
 	"os/exec"
-	"path/filepath"
-	"runtime"
 	"strconv"
 	"strings"
 	"time"
@@ -800,126 +796,8 @@ func runMiaospeedJob(ctx context.Context, binary, ghProxy string, job Job, log l
 
 // autoInstallMiaospeed 在运行时自动下载并解压 AirportR/miaospeed Release，严格继承使用 ghProxy。
 func autoInstallMiaospeed(ctx context.Context, targetPath, ghProxy string, log logger) (string, error) {
-	tag := "4.7.7"
-	// api.github.com 不走代理，直接请求
-	apiURL := "https://api.github.com/repos/AirportR/miaospeed/releases/latest"
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, apiURL, nil)
-	if err == nil {
-		req.Header.Set("User-Agent", "mnagent")
-		client := &http.Client{Timeout: 10 * time.Second}
-		if resp, err := client.Do(req); err == nil {
-			if resp.StatusCode == http.StatusOK {
-				var r struct {
-					TagName string `json:"tag_name"`
-				}
-				if json.NewDecoder(resp.Body).Decode(&r) == nil && r.TagName != "" {
-					tag = r.TagName
-				}
-			}
-			_ = resp.Body.Close()
-		}
-	}
-
-	if tag == "4.7.7" {
-		locReq, err := http.NewRequestWithContext(ctx, http.MethodHead, "https://github.com/AirportR/miaospeed/releases/latest", nil)
-		if err == nil {
-			locReq.Header.Set("User-Agent", "mnagent")
-			noFollowClient := &http.Client{
-				Timeout: 10 * time.Second,
-				CheckRedirect: func(req *http.Request, via []*http.Request) error {
-					return http.ErrUseLastResponse
-				},
-			}
-			if resp, err := noFollowClient.Do(locReq); err == nil {
-				loc := resp.Header.Get("Location")
-				_ = resp.Body.Close()
-				if idx := strings.LastIndex(loc, "/tag/"); idx != -1 {
-					tag = strings.TrimSpace(loc[idx+5:])
-				}
-			}
-		}
-	}
-
-	goos := runtime.GOOS
-	arch := mapMiaospeedArch(runtime.GOARCH)
-	tarName := fmt.Sprintf("miaospeed-%s-%s-%s.tar.gz", goos, arch, tag)
-	downloadURL := applyGHProxy(fmt.Sprintf("https://github.com/AirportR/miaospeed/releases/download/%s/%s", tag, tarName), ghProxy)
-
-	if log != nil {
-		log.Info("未检测到 miaospeed，正在自动下载安装", "tag", tag, "os", goos, "arch", arch, "url", downloadURL, "gh_proxy", ghProxy)
-	}
-
-	dlReq, err := http.NewRequestWithContext(ctx, http.MethodGet, downloadURL, nil)
-	if err != nil {
-		return "", err
-	}
-	dlReq.Header.Set("User-Agent", "mnagent")
-	client := &http.Client{Timeout: 2 * time.Minute}
-	resp, err := client.Do(dlReq)
-	if err != nil {
-		return "", fmt.Errorf("下载 miaospeed 失败: %w", err)
-	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode != http.StatusOK {
-		return "", fmt.Errorf("下载 miaospeed 返回 HTTP %d", resp.StatusCode)
-	}
-
-	dest := targetPath
-	if dest == "" || dest == "miaospeed" || !filepath.IsAbs(dest) {
-		dest = "/usr/local/bin/miaospeed"
-	}
-	dir := filepath.Dir(dest)
-	if err := os.MkdirAll(dir, 0755); err != nil {
-		dest = filepath.Join(os.TempDir(), "miaospeed")
-	} else {
-		testFile := filepath.Join(dir, fmt.Sprintf(".test_write_%d", os.Getpid()))
-		if err := os.WriteFile(testFile, []byte("ok"), 0600); err != nil {
-			dest = filepath.Join(os.TempDir(), "miaospeed")
-		} else {
-			_ = os.Remove(testFile)
-		}
-	}
-
-	if err := extractTarGzBinary(resp.Body, dest); err != nil {
-		return "", fmt.Errorf("解压安装 miaospeed 失败: %w", err)
-	}
-
-	_ = os.Chmod(dest, 0755)
-	if log != nil {
-		log.Info("miaospeed 自动安装完成", "path", dest)
-	}
-	return dest, nil
-}
-
-func extractTarGzBinary(r io.Reader, destFile string) error {
-	gz, err := gzip.NewReader(r)
-	if err != nil {
-		return err
-	}
-	defer gz.Close()
-
-	tr := tar.NewReader(gz)
-	for {
-		hdr, err := tr.Next()
-		if err == io.EOF {
-			break
-		}
-		if err != nil {
-			return err
-		}
-		name := filepath.Base(hdr.Name)
-		if strings.HasPrefix(name, "miaospeed") && !strings.HasSuffix(name, ".tar.gz") && hdr.Typeflag == tar.TypeReg {
-			f, err := os.OpenFile(destFile, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0755)
-			if err != nil {
-				return err
-			}
-			_, cpErr := io.Copy(f, tr)
-			_ = f.Close()
-			return cpErr
-		}
-	}
-	return errors.New("压缩包内未找到 miaospeed 可执行文件")
+	dm := newDependencyManager(ghProxy)
+	return dm.UpdateMiaospeed(ctx, targetPath, "latest", log)
 }
 
 func mapMiaospeedArch(arch string) string {
