@@ -37,7 +37,7 @@ const (
 	defaultBuildToken = "MIAOKO4|580JxAo049R|GEnERAl|1X571R930|T0kEN"
 
 	defaultSTUNServer = "udp://stunserver2024.stunprotocol.org:3478"
-	defaultSpeedFile  = "https://dl.google.com/dl/android/studio/install/3.4.1.0/android-studio-ide-183.5522156-windows.exe"
+	defaultSpeedFile  = "https://speed.cloudflare.com/__down?during=download&bytes=1073741824"
 	defaultPingURL    = "https://cp.cloudflare.com/generate_204"
 )
 
