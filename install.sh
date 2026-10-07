@@ -37,6 +37,7 @@ SERVICE_NAME="mnagent"
 AUTO_UPDATE="yes"   # 默认开启自动更新（可 --auto-update no 关闭）
 UPDATE_INTERVAL="6h"
 INSTALL_NEXTTRACE="yes" # 缺少 nexttrace 时默认自动按照官方脚本/包管理器安装
+GH_PROXY="${GH_PROXY:-${MNAGENT_GH_PROXY:-}}" # GitHub 代理前缀，例如 https://gh-proxy.com/
 
 log()  { printf '\033[1;32m==>\033[0m %s\n' "$*"; }
 warn() { printf '\033[1;33m警告:\033[0m %s\n' "$*" >&2; }
@@ -62,6 +63,7 @@ usage() {
   --update-interval <dur> 自动更新检查间隔（默认 6h）
   --install-nexttrace [yes|no] 缺少 nexttrace 时是否自动安装（默认 yes）
   --no-install-nexttrace 缺少 nexttrace 时不自动安装（等同于 --install-nexttrace no）
+  --gh-proxy <url>     GitHub 代理前缀，例如 https://gh-proxy.com/
   --uninstall          卸载：停止并删除服务与二进制（保留令牌与用户）
   -h, --help           显示本帮助
 
@@ -69,6 +71,7 @@ usage() {
   MNAGENT_PLATFORM=systemd|openwrt|none   强制平台检测结果
   MNAGENT_INIT_DIR=<dir>                  覆盖 init/unit 脚本所在目录
   MNAGENT_REPO=<owner/repo>               覆盖 Release 来源仓库
+  GH_PROXY=<url>                          GitHub 代理前缀（如 https://gh-proxy.com/）
 EOF
 }
 
@@ -116,8 +119,9 @@ while [ $# -gt 0 ]; do
 					*) INSTALL_NEXTTRACE="yes"; [ -n "${2:-}" ] && [ "${2:-}" != "yes" ] && [ "${2:-}" != "true" ] || shift 2;;
 				esac
 				;;
-			--no-install-nexttrace) INSTALL_NEXTTRACE="no"; shift;;
-			*) die "未知参数：$1（用 --help 查看用法）";;
+				--no-install-nexttrace) INSTALL_NEXTTRACE="no"; shift;;
+				--gh-proxy)     GH_PROXY="${2:-}"; shift 2;;
+				*) die "未知参数：$1（用 --help 查看用法）";;
 	esac
 done
 
@@ -230,6 +234,24 @@ download_stdout() {
 	fi
 }
 
+# apply_gh_proxy <url>
+# 若配置了 GH_PROXY，为 GitHub 相关目标地址添加代理前缀（例如 https://gh-proxy.com/）。
+apply_gh_proxy() {
+	target="$1"
+	if [ -z "$GH_PROXY" ]; then
+		echo "$target"
+		return
+	fi
+	proxy_prefix="$(printf '%s' "$GH_PROXY" | sed 's#/*$##')/"
+	case "$target" in
+		"$proxy_prefix"*) echo "$target" ;;
+		https://github.com/*|https://raw.githubusercontent.com/*)
+			echo "${proxy_prefix}${target}"
+			;;
+		*) echo "$target" ;;
+	esac
+}
+
 # install_file <源> <目标> <权限>
 install_file() {
 	if command -v install >/dev/null 2>&1; then
@@ -293,11 +315,11 @@ build_from_source() {
 	command -v go >/dev/null 2>&1 || die "未找到 go：请先安装 Go，或用 --binary 指定已编译好的 mnagent"
 	tmp="$(mktemp -d)"
 	log "下载源码并编译（${VERSION}）"
+	src_url="https://github.com/$REPO/archive/refs/tags/${VERSION}.tar.gz"
 	if [ "$VERSION" = "latest" ]; then
-		download_stdout "https://github.com/$REPO/archive/refs/heads/main.tar.gz" | tar -xz -C "$tmp"
-	else
-		download_stdout "https://github.com/$REPO/archive/refs/tags/${VERSION}.tar.gz" | tar -xz -C "$tmp"
+		src_url="https://github.com/$REPO/archive/refs/heads/main.tar.gz"
 	fi
+	download_stdout "$(apply_gh_proxy "$src_url")" | tar -xz -C "$tmp"
 	dir="$(ls -d "$tmp"/*/ | head -n1)"
 	( cd "$dir" && go build -trimpath -ldflags "-s -w -X main.version=${VERSION}" -o "$PREFIX/mnagent" . )
 	rm -rf "$tmp"
@@ -308,6 +330,7 @@ download_release() {
 	if [ "$VERSION" != "latest" ]; then
 		url="https://github.com/$REPO/releases/download/${VERSION}/mnagent_${OS}_${ARCH}"
 	fi
+	url="$(apply_gh_proxy "$url")"
 	log "下载 mnagent（${VERSION}，${OS}/${ARCH}）"
 	download "$url" "$PREFIX/.mnagent.new" || return 1
 	install_file "$PREFIX/.mnagent.new" "$PREFIX/mnagent" 0755
@@ -445,6 +468,9 @@ NEXTTRACE_EXEC="${NEXTTRACE_PATH:-$NEXTTRACE_BIN}"
 AUTO_UPDATE_ARGS=""
 if [ "$AUTO_UPDATE" = "yes" ]; then
 	AUTO_UPDATE_ARGS=" -auto-update -update-interval $UPDATE_INTERVAL"
+fi
+if [ -n "$GH_PROXY" ]; then
+	AUTO_UPDATE_ARGS="$AUTO_UPDATE_ARGS -gh-proxy $GH_PROXY"
 fi
 
 # ---------- 安装服务 ----------

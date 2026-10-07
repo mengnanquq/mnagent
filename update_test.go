@@ -283,3 +283,48 @@ func TestDetectPlatformArch(t *testing.T) {
 		t.Fatalf("detectPlatformArch() 返回空: platform=%q arch=%q", p, a)
 	}
 }
+
+// TestUpdaterProxyURL 验证 GitHub 代理前缀转换逻辑。
+func TestUpdaterProxyURL(t *testing.T) {
+	cases := []struct {
+		name    string
+		proxy   string
+		raw     string
+		wantURL string
+	}{
+		{
+			name:    "未配置代理",
+			proxy:   "",
+			raw:     "https://github.com/foo/bar/releases/download/v1.0.0/asset",
+			wantURL: "https://github.com/foo/bar/releases/download/v1.0.0/asset",
+		},
+		{
+			name:    "代理带末尾斜杠",
+			proxy:   "https://gh-proxy.com/",
+			raw:     "https://github.com/foo/bar/releases/download/v1.0.0/asset",
+			wantURL: "https://gh-proxy.com/https://github.com/foo/bar/releases/download/v1.0.0/asset",
+		},
+		{
+			name:    "代理不带末尾斜杠",
+			proxy:   "https://gh-proxy.com",
+			raw:     "https://github.com/foo/bar/releases/download/v1.0.0/asset",
+			wantURL: "https://gh-proxy.com/https://github.com/foo/bar/releases/download/v1.0.0/asset",
+		},
+		{
+			name:    "目标已有代理前缀不重复叠加",
+			proxy:   "https://gh-proxy.com/",
+			raw:     "https://gh-proxy.com/https://github.com/foo/bar/releases/download/v1.0.0/asset",
+			wantURL: "https://gh-proxy.com/https://github.com/foo/bar/releases/download/v1.0.0/asset",
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			u := &updater{ghProxy: tc.proxy}
+			got := u.proxyURL(tc.raw)
+			if got != tc.wantURL {
+				t.Errorf("proxyURL(%q) = %q, want %q", tc.raw, got, tc.wantURL)
+			}
+		})
+	}
+}

@@ -328,6 +328,7 @@ func newUpdater(cfg *config, log logger) *updater {
 		},
 		executable: exe,
 		skipFile:   filepath.Join(os.TempDir(), "mnagent-skip-versions"),
+		ghProxy:    cfg.ghProxy,
 		restart: func() error {
 			if log != nil {
 				log.Info("正在重启服务以应用新版本", "version", version)

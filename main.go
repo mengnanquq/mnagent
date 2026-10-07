@@ -46,6 +46,7 @@ type config struct {
 	checkUpdateOnce bool
 	applyUpdate     string
 	skipUpdate      string
+	ghProxy         string
 }
 
 func main() {
@@ -101,6 +102,7 @@ func parseConfig(args []string) (*config, error) {
 		checkUpd   = fs.Bool("check-update", false, "检查一次更新后退出（不下载）")
 		applyUpd   = fs.String("apply-update", "", "下载并安装指定版本后退出（如 v0.1.7）；latest 表示最新版")
 		skipUpd    = fs.String("skip-update", "", "跳过指定版本一段时间（如 v0.1.7，默认 24 小时）")
+		ghProxy    = fs.String("gh-proxy", "", "GitHub 代理加速前缀，例如 https://gh-proxy.com/")
 		logLevel   = fs.String("log-level", "info", "日志级别：debug / info / warn / error")
 		showVer    = fs.Bool("version", false, "输出版本后退出")
 	)
@@ -153,6 +155,13 @@ func parseConfig(args []string) (*config, error) {
 	if *updateIntv <= 0 {
 		*updateIntv = autoUpdateDefaultInterval
 	}
+	proxyVal := strings.TrimSpace(*ghProxy)
+	if proxyVal == "" {
+		proxyVal = strings.TrimSpace(os.Getenv("GH_PROXY"))
+	}
+	if proxyVal == "" {
+		proxyVal = strings.TrimSpace(os.Getenv("MNAGENT_GH_PROXY"))
+	}
 	return &config{
 		botURL:      endpoint,
 		tokens:      tokens,
@@ -167,6 +176,7 @@ func parseConfig(args []string) (*config, error) {
 		checkUpdateOnce: *checkUpd,
 		applyUpdate:     strings.TrimSpace(*applyUpd),
 		skipUpdate:      strings.TrimSpace(*skipUpd),
+		ghProxy:         proxyVal,
 	}, nil
 }
 

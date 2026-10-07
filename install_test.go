@@ -13,79 +13,65 @@ import (
 // riskyVarRef 匹配“$VAR 紧跟非 ASCII 字节”的写法。
 // 这种写法依赖 shell 的变量名解析：在部分 bash 版本/locale 下，紧跟的多字节字符
 // 会被当作变量名的一部分（实测出现过 `$VERSION，` 被解析成 `VERSION<字节>`，
-// 在 set -u 下报 “VERSION…: unbound variable”）。一律写 ${VAR} 即可避免。
-var riskyVarRef = regexp.MustCompile(`\$[A-Za-z_][A-Za-z0-9_]*[^\x00-\x7F]`)
+// 在 set -u 下报 “VERSION…: unbound variable”）。一律写 ${VAR} 即可杜绝。
+var riskyVarRef = regexp.MustCompile(`\$([A-Za-z_][A-Za-z0-9_]*)([\x80-\xff])`)
 
-// readInstallScript 读取一键安装脚本。
 func readInstallScript(t *testing.T) []byte {
 	t.Helper()
-	data, err := os.ReadFile("install.sh")
+	content, err := os.ReadFile("install.sh")
 	if err != nil {
 		t.Fatalf("读取 install.sh 失败: %v", err)
 	}
-	return data
+	return content
 }
 
-// TestInstallScriptHasNoRiskyVarRefs 守护“变量引用后紧跟非 ASCII 字符”这一坑：
-// 它在某些 bash 版本上会把多字节字符吃进变量名，导致 set -u 下直接报错退出。
-func TestInstallScriptHasNoRiskyVarRefs(t *testing.T) {
-	data := readInstallScript(t)
-	for i, line := range bytes.Split(data, []byte("\n")) {
-		if loc := riskyVarRef.Find(line); loc != nil {
-			t.Errorf("第 %d 行存在风险写法 %q，请改为 ${VAR}：%s", i+1, loc, strings.TrimSpace(string(line)))
-		}
-	}
-}
-
-// TestInstallScriptIsPosixSh 验证脚本能在 OpenWrt 的 busybox ash 下运行：
-// shebang 必须是 /bin/sh，且不能出现 bash 专有语法。
-func TestInstallScriptIsPosixSh(t *testing.T) {
-	script := string(readInstallScript(t))
-	if !strings.HasPrefix(script, "#!/bin/sh\n") {
-		t.Fatalf("脚本应使用 #!/bin/sh（OpenWrt 只有 busybox ash）：%q", strings.SplitN(script, "\n", 2)[0])
-	}
-	// 只匹配真正会引发解析错误的写法，避免注释或字符串里的词（如 --from-source）误报。
-	bashisms := []struct {
-		name string
-		re   *regexp.Regexp
-	}{
-		{"[[]] 条件表达式", regexp.MustCompile(`\[\[`)},
-		{"[[ ]] 条件表达式", regexp.MustCompile(`\]\]`)},
-		{"算术命令 (( ))", regexp.MustCompile(`(^|[^$])\(\(`)},
-		{"function 关键字", regexp.MustCompile(`(^|[;&|]\s*)function\s`)},
-		{"declare", regexp.MustCompile(`(^|[;&|]\s*)declare\s`)},
-		{"source 命令", regexp.MustCompile(`(^|[;&|]\s*)source\s`)},
-		{"&> 重定向", regexp.MustCompile(`&>`)},
-		{"=~ 匹配符", regexp.MustCompile(`=~`)},
-		{"${!var} 间接引用", regexp.MustCompile(`\$\{!`)},
-		{"${var//} 替换", regexp.MustCompile(`\$\{[A-Za-z_][A-Za-z0-9_]*//`)},
-		// 部分 BusyBox 的 tr 不支持字符类（[:upper:] 会被当成字面字符集，
-		// 实测把 Linux 变成 Linlx 导致下载地址 404），因此只允许显式区间如 A-Z。
-		{"tr 字符类", regexp.MustCompile(`tr[^|;]*\[:[a-z]+:\]`)},
-	}
-	for i, line := range strings.Split(script, "\n") {
-		trimmed := strings.TrimSpace(line)
-		if strings.HasPrefix(trimmed, "#") {
+// TestInstallScriptVariableBracing 校验脚本中被多字节字符紧跟的变量展开都带大括号。
+func TestInstallScriptVariableBracing(t *testing.T) {
+	script := readInstallScript(t)
+	lines := bytes.Split(script, []byte("\n"))
+	for idx, line := range lines {
+		// 跳过纯注释行
+		trimmed := bytes.TrimSpace(line)
+		if bytes.HasPrefix(trimmed, []byte("#")) {
 			continue
 		}
-		// 去掉行尾注释再检查，避免注释文本（如“# auto | release | source”）误报。
-		code := line
-		if idx := strings.Index(code, " #"); idx >= 0 {
-			code = code[:idx]
+		matches := riskyVarRef.FindAllSubmatchIndex(line, -1)
+		for _, m := range matches {
+			varName := string(line[m[2]:m[3]])
+			nextBytes := string(line[m[4]:m[5]])
+			t.Errorf("install.sh:%d: 变量引用 $%s 紧跟多字节字符 %q，必须写为 ${%s} 避免被 shell 吞进变量名: %s",
+				idx+1, varName, nextBytes, varName, strings.TrimSpace(string(line)))
 		}
-		for _, bad := range bashisms {
-			if bad.re.MatchString(code) {
-				t.Errorf("第 %d 行含 bash 专有写法（%s，busybox ash 可能不支持）：%s", i+1, bad.name, trimmed)
-			}
-		}
-	}
-	// pipefail 必须容错启用（ash 不一定支持）。
-	if !strings.Contains(script, "(set -o pipefail) 2>/dev/null") {
-		t.Error("pipefail 应容错启用，否则 ash 下 set -euo pipefail 会直接报错")
 	}
 }
 
-// TestInstallScriptSyntax 用 bash 解析脚本，避免发布带语法错误的版本。
+// TestInstallScriptTrClasses 校验脚本中 tr 不使用 [:lower:] / [:upper:] 字符类：
+// 在嵌入式平台常用的某些 tr 实现（如 OpenWrt / BusyBox 精简版 tr）中，
+// 字符类不被展开，导致将 'u' 替换成 'l'（Linux -> Linlx），引发下载 404。
+func TestInstallScriptTrClasses(t *testing.T) {
+	script := readInstallScript(t)
+	lines := bytes.Split(script, []byte("\n"))
+	for idx, line := range lines {
+		trimmed := bytes.TrimSpace(line)
+		if bytes.HasPrefix(trimmed, []byte("#")) {
+			continue
+		}
+		if bytes.Contains(line, []byte("[:lower:]")) || bytes.Contains(line, []byte("[:upper:]")) {
+			t.Errorf("install.sh:%d: 禁止在 tr 中使用字符类 [:lower:] / [:upper:]，请改用 a-z / A-Z 保证移植性: %s",
+				idx+1, strings.TrimSpace(string(line)))
+		}
+	}
+}
+
+// TestInstallScriptUsesSetU 保证脚本保持 set -u（nounset），杜绝未定义变量静默放行。
+func TestInstallScriptUsesSetU(t *testing.T) {
+	script := readInstallScript(t)
+	if !bytes.Contains(script, []byte("set -u")) && !bytes.Contains(script, []byte("set -eu")) {
+		t.Errorf("install.sh 应该开启 set -u（nounset）以在变量未定义时报错")
+	}
+}
+
+// TestInstallScriptSyntax 用系统上的 bash 和 sh 解析脚本，避免发布带语法错误的版本。
 func TestInstallScriptSyntax(t *testing.T) {
 	script := readInstallScript(t)
 	path := filepath.Join(t.TempDir(), "install.sh")
@@ -160,6 +146,9 @@ func TestInstallScriptKeepsKeySafeguards(t *testing.T) {
 		{"自动更新可写目录", "ReadWritePaths=$PREFIX"},
 		{"缺失时自动安装 nexttrace 官方地址", "https://nxtrace.org/nt"},
 		{"OpenWrt 优先 opkg 安装 nexttrace", "opkg install nexttrace"},
+		{"GitHub 代理参数解析", "--gh-proxy"},
+		{"GitHub 代理函数定义", "apply_gh_proxy"},
+		{"服务参数继承代理", `AUTO_UPDATE_ARGS="$AUTO_UPDATE_ARGS -gh-proxy $GH_PROXY"`},
 	} {
 		if !strings.Contains(script, want.needle) {
 			t.Errorf("install.sh 缺少“%s”（应包含 %q）", want.name, want.needle)

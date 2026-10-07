@@ -79,6 +79,7 @@ type updater struct {
 	downloadClient *http.Client
 	executable     string       // 当前二进制路径（os.Executable 解析后）
 	skipFile       string       // 跳过版本记录文件
+	ghProxy        string       // GitHub 代理加速前缀（如 https://gh-proxy.com/）
 	restart        func() error // 应用更新后重启服务（由主程序注入：systemd restart / procd restart）
 
 	// latestURL 生成 latest 下载地址（默认指向 GitHub；测试可覆盖为假服务器）。
@@ -92,12 +93,26 @@ func (u *updater) assetName() string {
 	return "mnagent_" + u.platform + "_" + u.arch
 }
 
+// proxyURL 将 GitHub 目标地址应用 ghProxy 代理前缀（如果已配置）。
+func (u *updater) proxyURL(rawURL string) string {
+	if u.ghProxy == "" {
+		return rawURL
+	}
+	prefix := strings.TrimRight(strings.TrimSpace(u.ghProxy), "/") + "/"
+	// 避免重复叠加代理前缀
+	if strings.HasPrefix(rawURL, prefix) {
+		return rawURL
+	}
+	return prefix + rawURL
+}
+
 // latestURLOrFallback 返回 latest 下载地址；测试可覆盖为假服务器地址。
 func (u *updater) latestURLOrFallback() string {
 	if u.latestURL != nil {
 		return u.latestURL()
 	}
-	return "https://github.com/" + u.repo + "/releases/latest/download/" + u.assetName()
+	raw := "https://github.com/" + u.repo + "/releases/latest/download/" + u.assetName()
+	return u.proxyURL(raw)
 }
 
 // urlForOrFallback 返回指定版本（或 latest）的下载地址；测试可覆盖。
@@ -108,7 +123,8 @@ func (u *updater) urlForOrFallback(version string) string {
 	if version == "" || version == "latest" {
 		return u.latestURLOrFallback()
 	}
-	return "https://github.com/" + u.repo + "/releases/download/" + version + "/" + u.assetName()
+	raw := "https://github.com/" + u.repo + "/releases/download/" + version + "/" + u.assetName()
+	return u.proxyURL(raw)
 }
 
 // latestVersion 返回最新发布版本号（v 前缀，如 v0.1.7），以及真实资产地址。

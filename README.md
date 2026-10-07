@@ -34,7 +34,9 @@ SCRIPT=https://github.com/mengnanquq/mnagent/releases/latest/download/install.sh
 
 脚本会自动：从本仓库的 Release 下载预编译二进制（`mnagent_<os>_<arch>`，没有 Release 或网络受限时回退到源码编译）、创建专用用户、写入令牌（0600）、写入 systemd 单元并**重启服务**（因此重复执行即为升级，会真正换上并运行新版本）。原始套接字能力由单元的 `AmbientCapabilities` 提供，并给服务准备了可写的主目录（`StateDirectory=mnagent`）供 `nexttrace` 存放配置与 IP 库。
 
-> 如果主机访问 GitHub 受限：把 `install.sh` 与对应架构的二进制放到内网镜像，用 `--binary https://内网镜像/mnagent_linux_amd64` 指定二进制即可；机器人侧也可用 `MNAGENT_INSTALL_URL` 把生成的脚本地址指向你的镜像。
+> 如果主机访问 GitHub 受限：
+> 1. 可以使用 GitHub 加速代理（如 `https://gh-proxy.com/`），在安装命令中添加 `--gh-proxy https://gh-proxy.com/`（或设置环境变量 `GH_PROXY=https://gh-proxy.com/`）。安装脚本以及后续 agent 后台自更新都会自动通过代理下载 Release 资产与源码包。
+> 2. 或者把 `install.sh` 与对应架构的二进制放到内网镜像，用 `--binary https://内网镜像/mnagent_linux_amd64` 指定二进制即可；机器人侧也可用 `MNAGENT_INSTALL_URL` 把生成的脚本地址指向你的镜像。
 
 ### 发布
 
@@ -100,6 +102,7 @@ GitHub Releases，发现比当前版本新的正式版就下载、原子替换�
 | `--auto-update` | `yes` | 是否启用自动更新（支持 `yes`/`no`） |
 | `--no-auto-update` | — | 关闭自动更新（等同于 `--auto-update no`） |
 | `--update-interval` | `6h` | 自动更新检查间隔（如 `2h`、`12h`） |
+| `--gh-proxy <url>` | — | GitHub 代理前缀（如 `https://gh-proxy.com/`），安装脚本与 agent 自更新均生效 |
 | `--install-nexttrace` | `yes` | 缺少 nexttrace 时是否按官方规范自动安装（默认开启） |
 | `--no-install-nexttrace` | — | 缺少 nexttrace 时不自动安装（等同于 `--install-nexttrace no`） |
 | `--uninstall` | — | 卸载服务与二进制（保留令牌与用户） |
@@ -143,6 +146,7 @@ setcap cap_net_raw,cap_net_admin+eip "$(command -v nexttrace)"
 | `-poll-timeout` | `40s` | 单次长轮询的客户端超时（机器人侧最多保持 20 秒） |
 | `-auto-update` | `false` | 是否开启后台定期自动更新（通过 `install.sh` 安装时默认开启） |
 | `-update-interval` | `6h` | 自动更新检查间隔 |
+| `-gh-proxy` | — | GitHub 代理前缀（如 `https://gh-proxy.com/`，环境变量 `GH_PROXY` / `MNAGENT_GH_PROXY` 同效） |
 | `-check-update` | — | 单次检查是否有新版本并输出，不下载 |
 | `-apply-update <tag\|latest>` | — | 手动下载并安装指定版本或最新版后退出并重启服务 |
 | `-skip-update <tag>` | — | 跳过指定版本 24 小时（自动更新不再提示或应用） |
