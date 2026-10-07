@@ -18,7 +18,8 @@ Group=mnagent
 ExecStart=/usr/local/bin/mnagent \
     -bot https://mnbot.example.org/agent \
     -token-file /etc/mnagent/token \
-    -nexttrace /usr/local/bin/nexttrace
+    -nexttrace /usr/local/bin/nexttrace \
+    -miaospeed /usr/local/bin/miaospeed
 
 # nexttrace 需要可写的主目录来存放配置与 IP 库；ProtectSystem=strict 下只有
 # StateDirectory 指向的目录可写。启用自更新时需允许替换可执行文件（ReadWritePaths）。

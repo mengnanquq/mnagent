@@ -33,13 +33,14 @@ const (
 
 // config 是进程启动参数解析后的运行配置。
 type config struct {
-	botURL      string
-	tokens      *tokenSource
-	binary      string
-	minBackoff  time.Duration
-	maxBackoff  time.Duration
-	pollTimeout time.Duration
-	logLevel    slog.Level
+	botURL          string
+	tokens          *tokenSource
+	binary          string
+	miaospeedBinary string
+	minBackoff      time.Duration
+	maxBackoff      time.Duration
+	pollTimeout     time.Duration
+	logLevel        slog.Level
 
 	autoUpdate      bool
 	updateInterval  time.Duration
@@ -76,12 +77,13 @@ func run(args []string) error {
 		cfg:    cfg,
 		logger: log,
 		client: newClient(cfg),
-		runner: newRunner(cfg.binary, log),
+		runner: newRunnerFull(cfg.binary, cfg.miaospeedBinary, cfg.ghProxy, log),
 		update: newUpdater(cfg, log),
 	}
 	log.Info("mnagent 已启动",
 		"version", version, "bot", cfg.botURL,
-		"nexttrace", cfg.binary, "token_from", cfg.tokens.from,
+		"nexttrace", cfg.binary, "miaospeed", cfg.miaospeedBinary,
+		"token_from", cfg.tokens.from,
 		"poll_timeout", cfg.pollTimeout, "auto_update", cfg.autoUpdate)
 	return agent.loop(ctx)
 }
@@ -94,6 +96,7 @@ func parseConfig(args []string) (*config, error) {
 		tokenValue = fs.String("token", "", "接入令牌（不推荐：优先用 -token-file 或 MNAGENT_TOKEN）")
 		tokenFile  = fs.String("token-file", "", "存放接入令牌的文件路径（默认 "+defaultTokenFile+"）")
 		binary     = fs.String("nexttrace", "nexttrace", "nexttrace 可执行文件路径或在 PATH 中的名称")
+		miaospeed  = fs.String("miaospeed", "miaospeed", "miaospeed 可执行文件路径或在 PATH 中的名称")
 		minBackoff = fs.Duration("min-backoff", defaultMinBackoff, "轮询失败后的最小重试间隔")
 		maxBackoff = fs.Duration("max-backoff", defaultMaxBackoff, "轮询失败后的最大重试间隔")
 		pollWait   = fs.Duration("poll-timeout", defaultPollWait, "单次长轮询的客户端超时")
@@ -152,6 +155,13 @@ func parseConfig(args []string) (*config, error) {
 		path = *binary
 	}
 
+	var miaoPath string
+	if p, err := exec.LookPath(*miaospeed); err == nil {
+		miaoPath = p
+	} else {
+		miaoPath = *miaospeed
+	}
+
 	if *updateIntv <= 0 {
 		*updateIntv = autoUpdateDefaultInterval
 	}
@@ -163,13 +173,14 @@ func parseConfig(args []string) (*config, error) {
 		proxyVal = strings.TrimSpace(os.Getenv("MNAGENT_GH_PROXY"))
 	}
 	return &config{
-		botURL:      endpoint,
-		tokens:      tokens,
-		binary:      path,
-		minBackoff:  *minBackoff,
-		maxBackoff:  *maxBackoff,
-		pollTimeout: *pollWait,
-		logLevel:    parseLogLevel(*logLevel),
+		botURL:          endpoint,
+		tokens:          tokens,
+		binary:          path,
+		miaospeedBinary: miaoPath,
+		minBackoff:      *minBackoff,
+		maxBackoff:      *maxBackoff,
+		pollTimeout:     *pollWait,
+		logLevel:        parseLogLevel(*logLevel),
 
 		autoUpdate:      *autoUpdate,
 		updateInterval:  *updateIntv,

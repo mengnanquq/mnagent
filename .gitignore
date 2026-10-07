@@ -17,6 +17,7 @@ coverage.html
 
 # 编辑器与环境
 .zcode/
+.zcodeignore
 .idea/
 .vscode/
 *.swp

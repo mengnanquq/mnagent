@@ -55,10 +55,12 @@ func (w *cappedBuffer) String() string {
 	return w.buf.String()
 }
 
-// runner 负责校验任务参数并执行 nexttrace。
+// runner 负责校验任务参数并执行 nexttrace 或外部工具。
 type runner struct {
-	binary     string
-	jsonOutput atomic.Bool // 是否附加 -j（旧版本 nexttrace 不支持时自动关闭）。
+	binary          string
+	miaospeedBinary string
+	ghProxy         string
+	jsonOutput      atomic.Bool // 是否附加 -j（旧版本 nexttrace 不支持时自动关闭）。
 	// waitDelay 限制“进程已被杀掉、但仍有子进程占着输出管道”时的额外等待，
 	// 避免超时任务因为派生的孙进程而把 agent 卡死。
 	waitDelay time.Duration
@@ -67,7 +69,23 @@ type runner struct {
 
 // newRunner 构建执行器，默认请求 JSON 输出。
 func newRunner(binary string, log logger) *runner {
-	r := &runner{binary: binary, waitDelay: 5 * time.Second, logger: log}
+	return newRunnerFull(binary, "miaospeed", "", log)
+}
+
+// newRunnerWithMiaospeed 构建执行器，可指定 miaospeed 可执行文件路径。
+func newRunnerWithMiaospeed(binary, miaospeed string, log logger) *runner {
+	return newRunnerFull(binary, miaospeed, "", log)
+}
+
+// newRunnerFull 构建执行器，可指定 miaospeed 路径与 GitHub 代理前缀。
+func newRunnerFull(binary, miaospeed, ghProxy string, log logger) *runner {
+	r := &runner{
+		binary:          binary,
+		miaospeedBinary: miaospeed,
+		ghProxy:         ghProxy,
+		waitDelay:       5 * time.Second,
+		logger:          log,
+	}
 	r.jsonOutput.Store(true)
 	return r
 }
@@ -77,7 +95,7 @@ func newRunner(binary string, log logger) *runner {
 // runResult 是一次任务的执行结果。
 type runResult struct {
 	Output   string          // 原始输出（trace）或摘要文本
-	Data     json.RawMessage // 结构化探针结果（ping/tcping/http/dns）
+	Data     json.RawMessage // 结构化探针结果（ping/tcping/http/dns/miaospeed）
 	ErrText  string          // 面向用户的错误文案（成功为空）
 	ExitCode int
 }
@@ -89,9 +107,42 @@ func (r *runner) run(ctx context.Context, job Job) runResult {
 		return r.runTrace(ctx, job)
 	case isProbeKind(kind):
 		return r.runProbeJob(ctx, job, kind)
+	case isMiaospeedKind(kind):
+		return r.runMiaospeed(ctx, job)
 	default:
 		// 未知类型立即失败，绝不退化成执行 nexttrace。
 		return runResult{ErrText: "未知探针类型：" + job.Kind, ExitCode: -1}
+	}
+}
+
+// isMiaospeedKind 判断是否为 miaospeed 代理测速任务。
+func isMiaospeedKind(kind string) bool {
+	switch kind {
+	case kindMiaospeed, kindSpeed:
+		return true
+	default:
+		return false
+	}
+}
+
+// runMiaospeed 执行 miaospeed 代理测速。
+func (r *runner) runMiaospeed(ctx context.Context, job Job) runResult {
+	runCtx, cancel := context.WithTimeout(ctx, job.Timeout())
+	defer cancel()
+
+	output, data, err := runMiaospeedJob(runCtx, r.miaospeedBinary, r.ghProxy, job, r.logger)
+	if err != nil {
+		return runResult{
+			Output:   output,
+			Data:     data,
+			ErrText:  err.Error(),
+			ExitCode: -1,
+		}
+	}
+	return runResult{
+		Output:   output,
+		Data:     data,
+		ExitCode: 0,
 	}
 }
 

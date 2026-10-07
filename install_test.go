@@ -96,7 +96,7 @@ func TestInstallScriptSyntax(t *testing.T) {
 	if err != nil {
 		t.Fatalf("--help 执行失败: %v\n%s", err, out)
 	}
-	for _, want := range []string{"--bot", "--token", "--uninstall", "OpenWrt"} {
+	for _, want := range []string{"--bot", "--token", "--uninstall", "OpenWrt", "--miaospeed"} {
 		if !strings.Contains(string(out), want) {
 			t.Fatalf("--help 未提及 %s: %s", want, out)
 		}
@@ -111,6 +111,7 @@ func TestInstallScriptSupportsOpenWrt(t *testing.T) {
 		{"procd 服务标记", "USE_PROCD=1"},
 		{"procd 实例定义", "procd_open_instance"},
 		{"procd 命令行参数", "procd_set_param command"},
+		{"procd 传递 miaospeed 参数", "-miaospeed $MIAOSPEED_EXEC"},
 		{"procd 崩溃自动重启", "procd_set_param respawn"},
 		{"procd 日志进 syslog", "procd_set_param stdout 1"},
 		{"rc.common shebang", "#!/bin/sh /etc/rc.common"},
@@ -146,6 +147,9 @@ func TestInstallScriptKeepsKeySafeguards(t *testing.T) {
 		{"自动更新可写目录", "ReadWritePaths=$PREFIX"},
 		{"缺失时自动安装 nexttrace 官方地址", "https://nxtrace.org/nt"},
 		{"OpenWrt 优先 opkg 安装 nexttrace", "opkg install nexttrace"},
+		{"自动安装 miaospeed 来源", "AirportR/miaospeed"},
+		{"自动安装 miaospeed 继承 gh-proxy", `apply_gh_proxy "$url"`},
+		{"systemd 传递 miaospeed 参数", "-miaospeed $MIAOSPEED_EXEC"},
 		{"GitHub 代理参数解析", "--gh-proxy"},
 		{"GitHub 代理函数定义", "apply_gh_proxy"},
 		{"服务参数继承代理", `AUTO_UPDATE_ARGS="$AUTO_UPDATE_ARGS -gh-proxy $GH_PROXY"`},

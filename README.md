@@ -1,7 +1,7 @@
 # mnagent
 
 运行在拨测主机上的轻量 agent，配合 Telegram 机器人 [@mengnan_dedicated_bot](https://t.me/mengnan_dedicated_bot) 使用：
-机器人下发探测任务，agent 在本机执行并回传结果（`/nexttrace`、`/ping`、`/tcping`、`/http`、`/dns`）。
+机器人下发探测任务，agent 在本机执行并回传结果（`/nexttrace`、`/ping`、`/tcping`、`/http`、`/dns`、`/miaospeed`）。
 
 它主动向机器人**长轮询**领取任务、在本机执行 `nexttrace`、再回传结果。因此：
 
@@ -69,10 +69,24 @@ opkg install nexttrace           # 若未安装 nexttrace（或使用 --nexttrac
 | `kind` | 说明 | 依赖 |
 | --- | --- | --- |
 | `trace`（默认） | 执行 `nexttrace -j` 路由追踪 | 需要 nexttrace 可执行文件 |
+| `miaospeed` / `speed` | 调用 [AirportR/miaospeed](https://github.com/AirportR/miaospeed) 执行代理节点或订阅测速（支持 8 种测试类型） | 需要 miaospeed 可执行文件（install.sh 自动下载安装） |
 | `ping` | ICMP echo，输出丢包与延迟（min/avg/max/抖动） | 无（进程内实现；非特权 ping socket 或 CAP_NET_RAW） |
 | `tcping` | TCP 握手延迟 | 无 |
 | `http` | HTTP(S) 请求：状态码、服务端 IP、证书到期、DNS/连接/TLS/首字节分段耗时 | 无 |
 | `dns` | 用主机自身解析器查 A/AAAA/CNAME/MX/NS/TXT/PTR | 无 |
+
+#### MiaoSpeed 测速支持的测试模式
+
+`miaospeed` 任务支持单节点链接（`ss://`, `vmess://`, `trojan://`, `vless://`, `hysteria2://`）或订阅地址（`http(s)://`）。任务的 `query` 或 `protocol` 可指定以下测试类型（未指定默认执行**全量测试**，也支持以英文逗号拼接多个模式）：
+
+1. **代理连通性测试**（`connectivity` / `conn` / `连通性`）：测试代理可用性、HTTP 响应状态码及 RTT 延迟；
+2. **拓扑测试**（`topology` / `topo` / `拓扑`）：测试链路入站/出站国家地区、落地 IP 及 DNS 劫持检测；
+3. **多线程测速**（`multithread` / `multi` / `多线程`）：多连接并行下行带宽测速（可通过 `count` 自定义线程数，默认 4）；
+4. **单线程测速**（`singlethread` / `single` / `单线程`）：单连接下行带宽测速；
+5. **上行速度测试**（`upload` / `uspeed` / `上行`）：多连接节点上行带宽测速；
+6. **延迟测试**（`latency` / `ping` / `延迟`）：精确测量 TCP RTT 延迟、HTTP Ping 延迟、丢包率与抖动；
+7. **UDP 类型测试**（`udp` / `nat` / `stun` / `udp类型`）：通过 STUN 服务器探测代理节点的 UDP 支持与 NAT 类型（FullCone / Symmetric / RestrictedCone 等）；
+8. **全量测试**（`full` / `all` / `全量`）：综合执行上述全部专项测试并输出完整报告。
 
 参数上限由 agent 强制：次数 1-20、端口 1-65535、URL 仅 http(s)、记录类型白名单；
 未知 `kind` 直接失败，不会退化成执行其它命令。
@@ -98,6 +112,7 @@ GitHub Releases，发现比当前版本新的正式版就下载、原子替换�
 | `--version` | `latest` | 安装的 Release 标签；也可用 `--from-source` 从源码编译 |
 | `--binary <path\|url>` | — | 使用自备的 mnagent（内网镜像时很有用） |
 | `--nexttrace` | `nexttrace` | nexttrace 路径或名称 |
+| `--miaospeed` | `miaospeed` | miaospeed 路径或名称 |
 | `--user` / `--prefix` | systemd：`mnagent` / `/usr/local/bin`；OpenWrt：`root` / `/usr/bin` | 运行用户与安装目录 |
 | `--auto-update` | `yes` | 是否启用自动更新（支持 `yes`/`no`） |
 | `--no-auto-update` | — | 关闭自动更新（等同于 `--auto-update no`） |
@@ -105,6 +120,8 @@ GitHub Releases，发现比当前版本新的正式版就下载、原子替换�
 | `--gh-proxy <url>` | — | GitHub 代理前缀（如 `https://gh-proxy.com/`），安装脚本与 agent 自更新均生效 |
 | `--install-nexttrace` | `yes` | 缺少 nexttrace 时是否按官方规范自动安装（默认开启） |
 | `--no-install-nexttrace` | — | 缺少 nexttrace 时不自动安装（等同于 `--install-nexttrace no`） |
+| `--install-miaospeed` | `yes` | 缺少 miaospeed 时是否从 Release 自动下载安装（默认开启） |
+| `--no-install-miaospeed` | — | 缺少 miaospeed 时不自动安装（等同于 `--install-miaospeed no`） |
 | `--uninstall` | — | 卸载服务与二进制（保留令牌与用户） |
 
 ### 手动安装
@@ -142,6 +159,7 @@ setcap cap_net_raw,cap_net_admin+eip "$(command -v nexttrace)"
 | `-token` | — | 直接给出令牌（不推荐：会出现在进程列表里） |
 | `-token-file` | `/etc/mnagent/token` | 令牌文件路径；每次请求都重新读取，**轮换令牌无需重启** |
 | `-nexttrace` | `nexttrace` | nexttrace 可执行文件路径或 PATH 中的名称 |
+| `-miaospeed` | `miaospeed` | miaospeed 可执行文件路径或 PATH 中的名称 |
 | `-min-backoff` / `-max-backoff` | `1s` / `1m` | 轮询失败后的重试退避区间（带抖动） |
 | `-poll-timeout` | `40s` | 单次长轮询的客户端超时（机器人侧最多保持 20 秒） |
 | `-auto-update` | `false` | 是否开启后台定期自动更新（通过 `install.sh` 安装时默认开启） |

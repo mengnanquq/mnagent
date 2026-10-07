@@ -380,3 +380,28 @@ func TestAgentLoopProbeJobEndToEnd(t *testing.T) {
 		t.Fatalf("延迟报告异常: %+v", report)
 	}
 }
+
+// TestRunnerMiaospeedDispatch 验证 runner 对 miaospeed/speed 任务的分发与错误返回。
+func TestRunnerMiaospeedDispatch(t *testing.T) {
+	r := newRunnerWithMiaospeed("nexttrace", "non-existent-miaospeed-path", nil)
+
+	// 1. 无效目标链接
+	res := r.run(context.Background(), Job{
+		ID:     "miao-1",
+		Kind:   "miaospeed",
+		Target: "not-a-valid-proxy-uri",
+	})
+	if res.ExitCode == 0 || !strings.Contains(res.ErrText, "不支持的代理协议") {
+		t.Fatalf("应拒绝非法代理 URI: exitCode=%d errText=%q", res.ExitCode, res.ErrText)
+	}
+
+	// 2. speed 别名同样能正确分发
+	resSpeed := r.run(context.Background(), Job{
+		ID:     "miao-2",
+		Kind:   "speed",
+		Target: "not-a-valid-proxy-uri",
+	})
+	if resSpeed.ExitCode == 0 || !strings.Contains(resSpeed.ErrText, "不支持的代理协议") {
+		t.Fatalf("speed 别名应分发至 miaospeed: exitCode=%d errText=%q", resSpeed.ExitCode, resSpeed.ErrText)
+	}
+}

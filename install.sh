@@ -26,6 +26,7 @@ BOT_URL=""
 TOKEN=""
 TOKEN_FILE="/etc/mnagent/token"
 NEXTTRACE_BIN="nexttrace"
+MIAOSPEED_BIN="miaospeed"
 RUN_USER=""
 RUN_GROUP=""
 PREFIX=""
@@ -37,6 +38,7 @@ SERVICE_NAME="mnagent"
 AUTO_UPDATE="yes"   # 默认开启自动更新（可 --auto-update no 关闭）
 UPDATE_INTERVAL="6h"
 INSTALL_NEXTTRACE="yes" # 缺少 nexttrace 时默认自动按照官方脚本/包管理器安装
+INSTALL_MIAOSPEED="yes" # 缺少 miaospeed 时默认自动从 GitHub Releases 下载安装
 GH_PROXY="${GH_PROXY:-${MNAGENT_GH_PROXY:-}}" # GitHub 代理前缀，例如 https://gh-proxy.com/
 
 log()  { printf '\033[1;32m==>\033[0m %s\n' "$*"; }
@@ -53,6 +55,7 @@ usage() {
   --token <token>      接入令牌（必填；也可省略，前提是 --token-file 已存在）
   --token-file <path>  令牌文件路径（默认 /etc/mnagent/token）
   --nexttrace <path>   nexttrace 可执行文件路径或名称（默认 nexttrace）
+  --miaospeed <path>   miaospeed 可执行文件路径或名称（默认 miaospeed）
   --version <tag>      安装的版本标签，默认 latest（取最新 Release）
   --binary <path|url>  直接使用已编译好的 mnagent（本地路径或下载地址）
   --from-source        从源码编译（不下载 Release）
@@ -63,6 +66,8 @@ usage() {
   --update-interval <dur> 自动更新检查间隔（默认 6h）
   --install-nexttrace [yes|no] 缺少 nexttrace 时是否自动安装（默认 yes）
   --no-install-nexttrace 缺少 nexttrace 时不自动安装（等同于 --install-nexttrace no）
+  --install-miaospeed [yes|no] 缺少 miaospeed 时是否自动安装（默认 yes）
+  --no-install-miaospeed 缺少 miaospeed 时不自动安装（等同于 --install-miaospeed no）
   --gh-proxy <url>     GitHub 代理前缀，例如 https://gh-proxy.com/
   --uninstall          卸载：停止并删除服务与二进制（保留令牌与用户）
   -h, --help           显示本帮助
@@ -103,13 +108,14 @@ while [ $# -gt 0 ]; do
 		--bot)         BOT_URL="${2:-}"; shift 2;;
 		--token)       TOKEN="${2:-}"; shift 2;;
 		--token-file)  TOKEN_FILE="${2:-}"; shift 2;;
-		--nexttrace)   NEXTTRACE_BIN="${2:-}"; shift 2;;
-		--version)     VERSION="${2:-}"; shift 2;;
-		--binary)      BINARY_SRC="${2:-}"; MODE="binary"; shift 2;;
-		--from-source) MODE="source"; shift;;
-		--user)        RUN_USER="${2:-}"; shift 2;;
-		--prefix)      PREFIX="${2:-}"; shift 2;;
-		--uninstall)   UNINSTALL="yes"; shift;;
+			--nexttrace)   NEXTTRACE_BIN="${2:-}"; shift 2;;
+			--miaospeed)   MIAOSPEED_BIN="${2:-}"; shift 2;;
+			--version)     VERSION="${2:-}"; shift 2;;
+			--binary)      BINARY_SRC="${2:-}"; MODE="binary"; shift 2;;
+			--from-source) MODE="source"; shift;;
+			--user)        RUN_USER="${2:-}"; shift 2;;
+			--prefix)      PREFIX="${2:-}"; shift 2;;
+			--uninstall)   UNINSTALL="yes"; shift;;
 			--auto-update)  AUTO_UPDATE="yes"; shift;;
 			--no-auto-update) AUTO_UPDATE="no"; shift;;
 			--update-interval) UPDATE_INTERVAL="${2:-}"; shift 2;;
@@ -119,8 +125,15 @@ while [ $# -gt 0 ]; do
 					*) INSTALL_NEXTTRACE="yes"; [ -n "${2:-}" ] && [ "${2:-}" != "yes" ] && [ "${2:-}" != "true" ] || shift 2;;
 				esac
 				;;
-				--no-install-nexttrace) INSTALL_NEXTTRACE="no"; shift;;
-				--gh-proxy)     GH_PROXY="${2:-}"; shift 2;;
+			--no-install-nexttrace) INSTALL_NEXTTRACE="no"; shift;;
+			--install-miaospeed)
+				case "${2:-}" in
+					no|false|0) INSTALL_MIAOSPEED="no"; shift 2;;
+					*) INSTALL_MIAOSPEED="yes"; [ -n "${2:-}" ] && [ "${2:-}" != "yes" ] && [ "${2:-}" != "true" ] || shift 2;;
+				esac
+				;;
+			--no-install-miaospeed) INSTALL_MIAOSPEED="no"; shift;;
+			--gh-proxy)     GH_PROXY="${2:-}"; shift 2;;
 				*) die "未知参数：$1（用 --help 查看用法）";;
 	esac
 done
@@ -467,6 +480,84 @@ fi
 [ -n "$NEXTTRACE_PATH" ] || warn "未找到 nexttrace（${NEXTTRACE_BIN}）：请安装后再试，否则追踪会失败"
 NEXTTRACE_EXEC="${NEXTTRACE_PATH:-$NEXTTRACE_BIN}"
 
+map_miaospeed_arch() {
+	case "$1" in
+		amd64) echo "amd64";;
+		arm64) echo "arm64";;
+		armv7) echo "armv7";;
+		armv6) echo "armv6";;
+		386)   echo "386";;
+		mips)  echo "mips-softfloat";;
+		mipsle) echo "mipsle-softfloat";;
+		riscv64) echo "riscv64";;
+		*) echo "$1";;
+	esac
+}
+
+download_miaospeed() {
+	miao_arch="$(map_miaospeed_arch "$ARCH")"
+	miao_tag="4.7.7"
+
+	# 1. 优先尝试从 releases/latest 重定向 Location 头解析版本标签（应用 gh-proxy）
+	latest_url="$(apply_gh_proxy "https://github.com/AirportR/miaospeed/releases/latest")"
+	if command -v curl >/dev/null 2>&1; then
+		loc_tag="$(curl -sIL "$latest_url" 2>/dev/null | grep -i '^location:' | head -n1 | sed -E 's#.*tag/([^/[:space:]]+).*#\1#' | tr -d '\r\n' || true)"
+		if [ -n "$loc_tag" ]; then
+			miao_tag="$loc_tag"
+		fi
+	fi
+
+	# 2. 若未从 Location 获取到，尝试通过 GitHub Releases API 获取（api.github.com 不走代理）
+	if [ "$miao_tag" = "4.7.7" ]; then
+		api_url="https://api.github.com/repos/AirportR/miaospeed/releases/latest"
+		tag_query="$(download_stdout "$api_url" 2>/dev/null | grep '"tag_name":' | head -n1 | sed -E 's/.*"tag_name": *"([^"]+)".*/\1/' | tr -d '\r\n' || true)"
+		if [ -n "$tag_query" ]; then
+			miao_tag="$tag_query"
+		fi
+	fi
+
+	tar_name="miaospeed-${OS}-${miao_arch}-${miao_tag}.tar.gz"
+	url="https://github.com/AirportR/miaospeed/releases/download/${miao_tag}/${tar_name}"
+	url="$(apply_gh_proxy "$url")"
+
+	tmp="$(mktemp -d)"
+	if [ -n "$GH_PROXY" ]; then
+		log "通过 GitHub 代理下载 miaospeed（${miao_tag}，${OS}/${miao_arch}，代理：${GH_PROXY}）"
+	else
+		log "下载 miaospeed（${miao_tag}，${OS}/${miao_arch}）"
+	fi
+	if download "$url" "$tmp/miaospeed.tar.gz"; then
+		tar -xzf "$tmp/miaospeed.tar.gz" -C "$tmp" 2>/dev/null || tar -xz -f "$tmp/miaospeed.tar.gz" -C "$tmp" 2>/dev/null || true
+		miao_file="$(find "$tmp" -maxdepth 2 -type f -name "miaospeed*" ! -name "*.tar.gz" | head -n1)"
+		if [ -n "$miao_file" ] && [ -f "$miao_file" ]; then
+			install_file "$miao_file" "$PREFIX/miaospeed" 0755
+			chmod 0755 "$PREFIX/miaospeed" 2>/dev/null || true
+		fi
+	fi
+	rm -rf "$tmp"
+}
+
+MIAOSPEED_PATH="$(command -v "$MIAOSPEED_BIN" 2>/dev/null || true)"
+if [ -z "$MIAOSPEED_PATH" ] && [ -x "$PREFIX/miaospeed" ]; then
+	MIAOSPEED_PATH="$PREFIX/miaospeed"
+fi
+
+# 缺少 miaospeed 时，尝试从 GitHub Releases 自动下载安装
+if [ -z "$MIAOSPEED_PATH" ] && [ "$INSTALL_MIAOSPEED" = "yes" ]; then
+	log "环境缺少 miaospeed，正在从 AirportR/miaospeed 获取并安装..."
+	download_miaospeed
+	MIAOSPEED_PATH="$(command -v "$MIAOSPEED_BIN" 2>/dev/null || true)"
+	if [ -z "$MIAOSPEED_PATH" ] && [ -x "$PREFIX/miaospeed" ]; then
+		MIAOSPEED_PATH="$PREFIX/miaospeed"
+	fi
+	if [ -n "$MIAOSPEED_PATH" ]; then
+		log "miaospeed 安装成功：${MIAOSPEED_PATH}"
+	else
+		warn "自动安装 miaospeed 失败，如需测速请参考官方说明手动安装：https://github.com/AirportR/miaospeed"
+	fi
+fi
+
+MIAOSPEED_EXEC="${MIAOSPEED_PATH:-$MIAOSPEED_BIN}"
 
 # 自动更新参数：启用时追加到服务命令（systemd 与 procd 共用）。
 AUTO_UPDATE_ARGS=""
@@ -492,7 +583,7 @@ Wants=network-online.target
 Type=simple
 User=$RUN_USER
 Group=$RUN_GROUP
-ExecStart=$PREFIX/mnagent -bot $BOT_URL -token-file $TOKEN_FILE -nexttrace $NEXTTRACE_EXEC$AUTO_UPDATE_ARGS
+ExecStart=$PREFIX/mnagent -bot $BOT_URL -token-file $TOKEN_FILE -nexttrace $NEXTTRACE_EXEC -miaospeed $MIAOSPEED_EXEC$AUTO_UPDATE_ARGS
 	# nexttrace 需要可写的主目录来存放配置与 IP 库；ProtectSystem=strict 下只有
 	# StateDirectory 指向的目录可写。
 	StateDirectory=mnagent
@@ -543,7 +634,8 @@ USE_PROCD=1
 		procd_set_param command $PREFIX/mnagent \\
 			-bot $BOT_URL \\
 			-token-file $TOKEN_FILE \\
-			-nexttrace $NEXTTRACE_EXEC$AUTO_UPDATE_ARGS
+			-nexttrace $NEXTTRACE_EXEC \\
+			-miaospeed $MIAOSPEED_EXEC$AUTO_UPDATE_ARGS
 		procd_set_param respawn
 		procd_set_param stdout 1
 		procd_set_param stderr 1
