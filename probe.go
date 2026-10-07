@@ -147,14 +147,17 @@ func runProbe(ctx context.Context, job Job) (probeOutcome, error) {
 }
 
 // marshalProbe 把报告序列化为 Data，并生成一行简短文本。
-// 部分失败（如丢包）不算错误：报告本身已包含明细。
+// 探测过程中的正常数据（如 ping 丢包）err 为 nil，只有无法执行/连接失败等致命错误 err 非空。
 func marshalProbe(report any, err error) (probeOutcome, error) {
+	if err != nil {
+		return probeOutcome{Output: err.Error()}, err
+	}
 	raw, marshalErr := json.Marshal(report)
 	if marshalErr != nil {
 		return probeOutcome{}, marshalErr
 	}
 	out := probeOutcome{Data: raw, Output: summarizeProbe(report)}
-	return out, err
+	return out, nil
 }
 
 // summarizeProbe 生成一句话摘要（写日志与兜底展示用）。
@@ -482,7 +485,7 @@ func httpProbe(ctx context.Context, job Job) (HTTPReport, error) {
 	}
 	resp, err := client.Do(req)
 	if err != nil {
-		return report, err
+		return HTTPReport{}, errors.New(shortHTTPError(err))
 	}
 	defer resp.Body.Close()
 
@@ -628,5 +631,36 @@ func sleepCtx(ctx context.Context, d time.Duration) {
 	select {
 	case <-ctx.Done():
 	case <-timer.C:
+	}
+}
+
+// shortHTTPError 把 HTTP 请求失败的底层错误精简为易读原因。
+func shortHTTPError(err error) string {
+	if err == nil {
+		return ""
+	}
+	var netErr net.Error
+	if errors.As(err, &netErr) && netErr.Timeout() {
+		return "连接超时"
+	}
+	msg := err.Error()
+	switch {
+	case strings.Contains(msg, "context deadline exceeded") || strings.Contains(msg, "i/o timeout"):
+		return "连接超时"
+	case strings.Contains(msg, "connection refused"):
+		return "连接被拒绝"
+	case strings.Contains(msg, "connection reset by peer"):
+		return "连接被重置"
+	case strings.Contains(msg, "no such host"):
+		return "DNS 解析失败"
+	case strings.Contains(msg, "certificate"):
+		return "证书验证失败"
+	case strings.Contains(msg, "network is unreachable"):
+		return "网络不可达"
+	default:
+		if len(msg) > 100 {
+			msg = msg[:100] + "…"
+		}
+		return msg
 	}
 }
