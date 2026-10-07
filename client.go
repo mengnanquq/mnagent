@@ -186,6 +186,7 @@ func (c *client) do(ctx context.Context, method, path string, body []byte) (*htt
 	}
 	req.Header.Set("Authorization", "Bearer "+token)
 	req.Header.Set("User-Agent", "mnagent/"+version)
+	req.Header.Set("X-Agent-Version", version)
 	if body != nil {
 		req.Header.Set("Content-Type", "application/json")
 	}

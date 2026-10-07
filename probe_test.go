@@ -240,23 +240,23 @@ func TestRunProbeJobProducesData(t *testing.T) {
 	if report.Kind != kindTCPing || report.Recv != 1 {
 		t.Fatalf("Data 内容异常: %+v", report)
 	}
-		if res.Output == "" || !strings.Contains(res.Output, fmt.Sprintf("%d", report.Sent)) {
-			t.Fatalf("摘要文本异常: %q", res.Output)
-		}
+	if res.Output == "" || !strings.Contains(res.Output, fmt.Sprintf("%d", report.Sent)) {
+		t.Fatalf("摘要文本异常: %q", res.Output)
 	}
+}
 
-	// TestHTTPProbeConnectionFailureClearsData 验证连接失败时不回传零值 Data，且错误信息精简易读。
-	func TestHTTPProbeConnectionFailureClearsData(t *testing.T) {
-		r := newRunner("nexttrace", nil)
-		// 探测一个不可达的保留 IP 地址
-		res := r.run(context.Background(), Job{Kind: kindHTTP, Target: "http://192.0.2.1:1", TimeoutMS: 500})
-		if res.ExitCode == 0 {
-			t.Fatalf("不可达目标应返回非零退出码，实际：%d", res.ExitCode)
-		}
-		if res.ErrText == "" {
-			t.Fatal("不可达目标应返回 ErrText")
-		}
-		if len(res.Data) != 0 {
-			t.Fatalf("连接失败时不应返回零值 Data，实际：%s", string(res.Data))
-		}
+// TestHTTPProbeConnectionFailureClearsData 验证连接失败时不回传零值 Data，且错误信息精简易读。
+func TestHTTPProbeConnectionFailureClearsData(t *testing.T) {
+	r := newRunner("nexttrace", nil)
+	// 探测一个不可达的保留 IP 地址
+	res := r.run(context.Background(), Job{Kind: kindHTTP, Target: "http://192.0.2.1:1", TimeoutMS: 500})
+	if res.ExitCode == 0 {
+		t.Fatalf("不可达目标应返回非零退出码，实际：%d", res.ExitCode)
 	}
+	if res.ErrText == "" {
+		t.Fatal("不可达目标应返回 ErrText")
+	}
+	if len(res.Data) != 0 {
+		t.Fatalf("连接失败时不应返回零值 Data，实际：%s", string(res.Data))
+	}
+}

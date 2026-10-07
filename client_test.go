@@ -48,6 +48,28 @@ func TestClientPollWithoutTask(t *testing.T) {
 	}
 }
 
+// TestClientPollSendsVersion 验证长轮询请求携带版本号（供机器人 /host list 展示）。
+func TestClientPollSendsVersion(t *testing.T) {
+	original := version
+	version = "v9.9.9-test"
+	t.Cleanup(func() { version = original })
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if got := r.Header.Get("X-Agent-Version"); got != "v9.9.9-test" {
+			t.Errorf("X-Agent-Version = %q，期望 v9.9.9-test", got)
+		}
+		if got := r.Header.Get("User-Agent"); got != "mnagent/v9.9.9-test" {
+			t.Errorf("User-Agent = %q，期望 mnagent/v9.9.9-test", got)
+		}
+		w.WriteHeader(http.StatusNoContent)
+	}))
+	defer srv.Close()
+
+	if _, err := newClient(testConfig(srv.URL, nil)).poll(context.Background()); err != nil {
+		t.Fatalf("poll 失败: %v", err)
+	}
+}
+
 func TestClientPollReturnsJob(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
