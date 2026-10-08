@@ -124,7 +124,7 @@ jobs:
         run: |
           # 同一标签重跑时 Release 已存在：只补传/覆盖资产，避免任务失败。
           if gh release view "$TAG" >/dev/null 2>&1; then
-            gh release upload "$TAG" dist/* install.sh install.ps1 --clobber
+            gh release upload "$TAG" dist/* --clobber
           else
-            gh release create "$TAG" dist/* install.sh install.ps1 --title "$TAG" --generate-notes
+            gh release create "$TAG" dist/* --title "$TAG" --generate-notes
           fi

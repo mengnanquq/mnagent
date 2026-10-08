@@ -25,13 +25,6 @@
 
 命令用 `sh` 并带 `wget` 回退，因此 VPS 与 OpenWrt 路由器可以粘同一条；非 root 用户由脚本自己通过 `sudo` 提权重跑。
 
-也可以固定到某个发布版本（脚本与二进制版本一致）：
-
-```sh
-SCRIPT=https://github.com/mengnanquq/mnagent/releases/latest/download/install.sh
-(curl -fsSL "$SCRIPT" || wget -qO- "$SCRIPT") | sh -s -- --bot https://<机器人地址>/agent --token <令牌>
-```
-
 脚本会自动：从本仓库的 Release 下载预编译二进制（`mnagent_<os>_<arch>`，没有 Release 或网络受限时回退到源码编译）、创建专用用户、写入令牌（0600）、写入 systemd 单元并**重启服务**（因此重复执行即为升级，会真正换上并运行新版本）。原始套接字能力由单元的 `AmbientCapabilities` 提供，并给服务准备了可写的主目录（`StateDirectory=mnagent`）供 `nexttrace` 存放配置与 IP 库。
 
 > 如果主机访问 GitHub 受限：
@@ -41,7 +34,7 @@ SCRIPT=https://github.com/mengnanquq/mnagent/releases/latest/download/install.sh
 ### 发布
 
 项目配置了自动构建与发布流水线（GitHub Actions）：
-- **推送 `main` 分支**：自动根据最新版本计算并递增生成语义化版本号（如 `v0.3.5-main.<时间戳>.<sha>`），自动编译全平台二进制、打包 `install.sh` 并发布 Release。
+- **推送 `main` 分支**：自动根据最新版本计算并递增生成语义化版本号（如 `v0.3.5-main.<时间戳>.<sha>`），自动编译全平台二进制并发布 Release。
 - **打 `v*` 标签**：推送指定 Tag（例如 `git tag v0.4.0 && git push origin v0.4.0`）会自动发布正式 Release。
 
 构建产物涵盖 linux/darwin 各主流系统及 amd64/arm64/arm/mips/mipsle/riscv64 等架构。
@@ -146,13 +139,13 @@ mnagent 原生支持 Windows（x86_64 及 ARM64），并内置 Windows 服务控
 在 PowerShell 中执行以下**一键安装命令**（自动提权并注册开机自启系统服务）：
 
 ```powershell
-irm https://github.com/mengnanquq/mnagent/releases/latest/download/install.ps1 | iex -args -Bot "https://<机器人地址>/agent" -Token "<令牌>"
+irm https://raw.githubusercontent.com/mengnanquq/mnagent/main/install.ps1 | iex -args -Bot "https://<机器人地址>/agent" -Token "<令牌>"
 ```
 
 若网络访问 GitHub 受限，可附加 `-GhProxy` 参数使用加速代理：
 
 ```powershell
-irm https://gh-proxy.com/https://github.com/mengnanquq/mnagent/releases/latest/download/install.ps1 | iex -args -Bot "https://<机器人地址>/agent" -Token "<令牌>" -GhProxy "https://gh-proxy.com/"
+irm https://gh-proxy.com/https://raw.githubusercontent.com/mengnanquq/mnagent/main/install.ps1 | iex -args -Bot "https://<机器人地址>/agent" -Token "<令牌>" -GhProxy "https://gh-proxy.com/"
 ```
 
 脚本将自动执行以下操作：
