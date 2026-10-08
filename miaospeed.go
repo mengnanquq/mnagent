@@ -75,25 +75,26 @@ type MiaospeedNode struct {
 
 // MiaospeedReport 包含测速任务的结构化结果。
 type MiaospeedReport struct {
-	TestMode        string           `json:"test_mode,omitempty"`
-	NodeName        string           `json:"node_name"`
-	Protocol        string           `json:"protocol,omitempty"`
-	Server          string           `json:"server,omitempty"`
-	HTTPCode        int              `json:"http_code,omitempty"`
-	PingRTTMs       float64          `json:"ping_rtt_ms,omitempty"`
-	PingConnMs      float64          `json:"ping_conn_ms,omitempty"`
-	MaxRTTMs        float64          `json:"max_rtt_ms,omitempty"`
-	PacketLoss      float64          `json:"packet_loss_pct,omitempty"`
-	UDPType         string           `json:"udp_type,omitempty"`
-	DownloadThreads int              `json:"download_threads,omitempty"`
-	AvgSpeedBps     float64          `json:"avg_speed_bps,omitempty"` // 字节/秒
-	MaxSpeedBps     float64          `json:"max_speed_bps,omitempty"` // 字节/秒
-	InboundGeo      string           `json:"inbound_geo,omitempty"`
-	OutboundIP      string           `json:"outbound_ip,omitempty"`
-	OutboundGeo     string           `json:"outbound_geo,omitempty"`
-	Hijack          string           `json:"hijack,omitempty"`
-	DurationMs      int64            `json:"duration_ms"`
-	RawResults      []slaveEntrySlot `json:"raw_results,omitempty"`
+	TestMode        string            `json:"test_mode,omitempty"`
+	NodeName        string            `json:"node_name"`
+	Protocol        string            `json:"protocol,omitempty"`
+	Server          string            `json:"server,omitempty"`
+	HTTPCode        int               `json:"http_code,omitempty"`
+	PingRTTMs       float64           `json:"ping_rtt_ms,omitempty"`
+	PingConnMs      float64           `json:"ping_conn_ms,omitempty"`
+	MaxRTTMs        float64           `json:"max_rtt_ms,omitempty"`
+	PacketLoss      float64           `json:"packet_loss_pct,omitempty"`
+	UDPType         string            `json:"udp_type,omitempty"`
+	DownloadThreads int               `json:"download_threads,omitempty"`
+	AvgSpeedBps     float64           `json:"avg_speed_bps,omitempty"` // 字节/秒
+	MaxSpeedBps     float64           `json:"max_speed_bps,omitempty"` // 字节/秒
+	InboundGeo      string            `json:"inbound_geo,omitempty"`
+	OutboundIP      string            `json:"outbound_ip,omitempty"`
+	OutboundGeo     string            `json:"outbound_geo,omitempty"`
+	Hijack          string            `json:"hijack,omitempty"`
+	MediaUnlock     map[string]string `json:"media_unlock,omitempty"`
+	DurationMs      int64             `json:"duration_ms"`
+	RawResults      []slaveEntrySlot  `json:"raw_results,omitempty"`
 }
 
 // Format 格式化排版文本，供 Telegram 机器人展示。
@@ -165,6 +166,15 @@ func (r MiaospeedReport) Format() string {
 		}
 	}
 
+	if len(r.MediaUnlock) > 0 {
+		b.WriteString("流媒体解锁:\n")
+		for _, name := range []string{"YouTube", "Netflix", "Disney+", "OpenAI", "Spotify"} {
+			if status, ok := r.MediaUnlock[name]; ok && status != "" {
+				b.WriteString(fmt.Sprintf("  - %s: %s\n", name, status))
+			}
+		}
+	}
+
 	if r.DurationMs > 0 {
 		b.WriteString(fmt.Sprintf("耗时: %.2f 秒\n", float64(r.DurationMs)/1000.0))
 	}
@@ -227,9 +237,10 @@ type slaveRequestNode struct {
 }
 
 type slaveScript struct {
-	ScriptType string
-	ScriptName string
-	ScriptData string
+	ID            string
+	Type          string
+	Content       string
+	TimeoutMillis uint64
 }
 
 type slaveRequestConfigs struct {
@@ -836,6 +847,7 @@ func applyGHProxy(rawURL, ghProxy string) string {
 type miaospeedTestPlan struct {
 	ModeDescription   string
 	Matrices          []slaveRequestMatrixEntry
+	Scripts           []slaveScript
 	DownloadThreading uint
 	DownloadDuration  int64
 	UploadThreading   uint
@@ -898,7 +910,13 @@ func buildMiaospeedTestPlan(job Job) miaospeedTestPlan {
 				{Type: matrixUDPType},
 				{Type: matrixAverageSpeed},
 				{Type: matrixMaxSpeed},
+				{Type: "TEST_SCRIPT", Params: "youtube"},
+				{Type: "TEST_SCRIPT", Params: "netflix"},
+				{Type: "TEST_SCRIPT", Params: "disney"},
+				{Type: "TEST_SCRIPT", Params: "openai"},
+				{Type: "TEST_SCRIPT", Params: "spotify"},
 			},
+			Scripts:           buildDefaultMediaScripts(),
 			DownloadThreading: 4,
 			DownloadDuration:  5,
 			STUNURL:           defaultSTUNServer,
@@ -1035,6 +1053,11 @@ func executeMiaospeedTask(ctx context.Context, wsURL, origin, token string, node
 		stunURL = defaultSTUNServer
 	}
 
+	scripts := plan.Scripts
+	if scripts == nil {
+		scripts = make([]slaveScript, 0)
+	}
+
 	req := slaveRequest{
 		Basics: slaveRequestBasics{
 			ID:        job.ID,
@@ -1056,7 +1079,7 @@ func executeMiaospeedTask(ctx context.Context, wsURL, origin, token string, node
 			TaskRetry:         2,
 			TaskTimeout:       5000,
 			DNSServers:        make([]string, 0),
-			Scripts:           make([]slaveScript, 0),
+			Scripts:           scripts,
 		},
 		Vendor:         "Clash",
 		Nodes:          reqNodes,
@@ -1156,6 +1179,14 @@ func parseSlaveTaskResult(task *slaveTask, nodes []MiaospeedNode, plan miaospeed
 			report.AvgSpeedBps = parseMatrixFloat(m.Payload)
 		case matrixMaxSpeed:
 			report.MaxSpeedBps = parseMatrixFloat(m.Payload)
+		case "TEST_SCRIPT":
+			if report.MediaUnlock == nil {
+				report.MediaUnlock = make(map[string]string)
+			}
+			mediaName, status := parseMatrixScript(m.Payload)
+			if mediaName != "" && status != "" {
+				report.MediaUnlock[mediaName] = status
+			}
 		}
 	}
 
@@ -1333,6 +1364,108 @@ func generateRandomHex(n int) string {
 	b := make([]byte, n)
 	_, _ = rand.Read(b)
 	return hex.EncodeToString(b)
+}
+
+// buildDefaultMediaScripts 返回主流流媒体检测的轻量 JavaScript 脚本集。
+func buildDefaultMediaScripts() []slaveScript {
+	return []slaveScript{
+		{
+			ID:   "youtube",
+			Type: "media",
+			Content: `function handler() {
+    var res = fetch("https://www.youtube.com/premium", { headers: {'User-Agent':'Mozilla/5.0'}, timeout: 3000 });
+    if (!res || !res.body) return { text: "超时", color: "#f87171" };
+    if (res.body.indexOf("Premium is not available in your country") > 0) return { text: "不支持", color: "#f87171" };
+    var m = res.body.match(/"countryCode":"([A-Z]{2})"/);
+    if (m && m[1]) return { text: "支持 (" + m[1] + ")", color: "#34d399" };
+    return { text: "支持", color: "#34d399" };
+}`,
+			TimeoutMillis: 5000,
+		},
+		{
+			ID:   "netflix",
+			Type: "media",
+			Content: `function handler() {
+    var res1 = fetch("https://www.netflix.com/title/80018499", { headers: {'User-Agent':'Mozilla/5.0'}, noRedir: true, timeout: 3000 });
+    if (!res1) return { text: "超时", color: "#f87171" };
+    if (res1.statusCode === 200) return { text: "原生解锁", color: "#34d399" };
+    var res2 = fetch("https://www.netflix.com/title/70143836", { headers: {'User-Agent':'Mozilla/5.0'}, noRedir: true, timeout: 3000 });
+    if (res2 && res2.statusCode === 200) return { text: "仅自制剧", color: "#fbbf24" };
+    return { text: "不可用", color: "#f87171" };
+}`,
+			TimeoutMillis: 5000,
+		},
+		{
+			ID:   "disney",
+			Type: "media",
+			Content: `function handler() {
+    var res = fetch("https://www.disneyplus.com/", { headers: {'User-Agent':'Mozilla/5.0'}, noRedir: true, timeout: 3000 });
+    if (!res) return { text: "超时", color: "#f87171" };
+    var loc = get(res, "headers.Location", "");
+    if (loc.indexOf("preview") > 0 || loc.indexOf("unavailable") > 0) return { text: "不可用", color: "#f87171" };
+    if (res.statusCode === 200 || res.statusCode === 301 || res.statusCode === 302) return { text: "解锁", color: "#34d399" };
+    return { text: "不可用", color: "#f87171" };
+}`,
+			TimeoutMillis: 5000,
+		},
+		{
+			ID:   "openai",
+			Type: "media",
+			Content: `function handler() {
+    var res = fetch("https://ios.chat.openai.com/public-api/mobile/server_status/v1", { timeout: 3000 });
+    if (!res) return { text: "超时", color: "#f87171" };
+    if (res.statusCode === 200) return { text: "支持", color: "#34d399" };
+    if (res.statusCode === 403) return { text: "封锁", color: "#f87171" };
+    if (res.body && res.body.indexOf("unsupported_country") > 0) return { text: "地区受限", color: "#f87171" };
+    return { text: "支持", color: "#34d399" };
+}`,
+			TimeoutMillis: 5000,
+		},
+		{
+			ID:   "spotify",
+			Type: "media",
+			Content: `function handler() {
+    var res = fetch("https://spclient.wg.spotify.com/signup/public/v1/account", { headers: {'User-Agent':'Mozilla/5.0'}, timeout: 3000 });
+    if (!res) return { text: "超时", color: "#f87171" };
+    if (res.statusCode === 200 || res.statusCode === 400) return { text: "支持", color: "#34d399" };
+    return { text: "不可用", color: "#f87171" };
+}`,
+			TimeoutMillis: 5000,
+		},
+	}
+}
+
+func parseMatrixScript(payload string) (name, status string) {
+	payload = strings.TrimSpace(payload)
+	if payload == "" {
+		return "", ""
+	}
+	var obj struct {
+		Key  string `json:"Key"`
+		Text string `json:"Text"`
+	}
+	if err := json.Unmarshal([]byte(payload), &obj); err == nil {
+		display := mapScriptKey(obj.Key)
+		return display, obj.Text
+	}
+	return "", ""
+}
+
+func mapScriptKey(key string) string {
+	switch strings.ToLower(strings.TrimSpace(key)) {
+	case "youtube":
+		return "YouTube"
+	case "netflix":
+		return "Netflix"
+	case "disney":
+		return "Disney+"
+	case "openai":
+		return "OpenAI"
+	case "spotify":
+		return "Spotify"
+	default:
+		return key
+	}
 }
 
 // readNextSlaveJSON 从 ws 连接中读取下一条完整的 JSON 响应并反序列化。
