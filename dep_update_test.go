@@ -2,6 +2,7 @@ package main
 
 import (
 	"archive/tar"
+	"archive/zip"
 	"bytes"
 	"compress/gzip"
 	"context"
@@ -9,6 +10,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 )
@@ -311,5 +313,121 @@ func TestHandleUpdateCLICheckOnly(t *testing.T) {
 	}
 	if !handled {
 		t.Fatal("期望 handled 为 true")
+	}
+}
+
+// TestUpdateMiaospeedWindowsZip 验证 Windows 平台下从 .zip 压缩包提取并更新 miaospeed.exe 的完整流程。
+func TestUpdateMiaospeedWindowsZip(t *testing.T) {
+	tmpDir := t.TempDir()
+	targetPath := filepath.Join(tmpDir, "bin", "miaospeed.exe")
+
+	var buf bytes.Buffer
+	zw := zip.NewWriter(&buf)
+
+	// 写入 LICENSE 文件
+	licHeader := &zip.FileHeader{Name: "LICENSE"}
+	licWriter, err := zw.CreateHeader(licHeader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, _ = licWriter.Write([]byte("MIT License"))
+
+	// 写入可执行文件
+	miaoContent := []byte("fake-windows-miaospeed-binary-content")
+	binHeader := &zip.FileHeader{Name: "miaospeed-windows-amd64.exe"}
+	binWriter, err := zw.CreateHeader(binHeader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, _ = binWriter.Write(miaoContent)
+	_ = zw.Close()
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if strings.Contains(r.URL.Path, ".zip") {
+			w.Header().Set("Content-Type", "application/zip")
+			w.Write(buf.Bytes())
+			return
+		}
+		http.NotFound(w, r)
+	}))
+	defer srv.Close()
+
+	dm := newDependencyManager(srv.URL)
+	dm.goos = "windows"
+	dm.goarch = "amd64"
+
+	dest, err := dm.UpdateMiaospeed(context.Background(), targetPath, "4.7.7", nil)
+	if err != nil {
+		t.Fatalf("UpdateMiaospeed 失败: %v", err)
+	}
+	if dest != targetPath {
+		t.Fatalf("dest 不匹配: got=%s want=%s", dest, targetPath)
+	}
+
+	content, err := os.ReadFile(dest)
+	if err != nil {
+		t.Fatalf("读取安装结果失败: %v", err)
+	}
+	if string(content) != string(miaoContent) {
+		t.Fatalf("文件内容不匹配: got=%s want=%s", string(content), string(miaoContent))
+	}
+}
+
+// TestReplaceExecutableAndCleanup 验证二进制替换与遗留 .old 清理机制。
+func TestReplaceExecutableAndCleanup(t *testing.T) {
+	tmpDir := t.TempDir()
+	targetPath := filepath.Join(tmpDir, "testapp.exe")
+
+	// 1. 目标尚不存在时的替换
+	new1 := filepath.Join(tmpDir, "new1.tmp")
+	_ = os.WriteFile(new1, []byte("v1"), 0755)
+	if err := replaceExecutable(new1, targetPath); err != nil {
+		t.Fatalf("首次 replaceExecutable 失败: %v", err)
+	}
+	got, _ := os.ReadFile(targetPath)
+	if string(got) != "v1" {
+		t.Fatalf("内容不匹配: got=%s want=v1", string(got))
+	}
+
+	// 2. 目标已存在时的覆盖替换
+	new2 := filepath.Join(tmpDir, "new2.tmp")
+	_ = os.WriteFile(new2, []byte("v2"), 0755)
+	if err := replaceExecutable(new2, targetPath); err != nil {
+		t.Fatalf("第二次 replaceExecutable 失败: %v", err)
+	}
+	got, _ = os.ReadFile(targetPath)
+	if string(got) != "v2" {
+		t.Fatalf("内容不匹配: got=%s want=v2", string(got))
+	}
+
+	// 3. 测试 cleanupOldExecutables
+	oldFile := targetPath + ".old"
+	_ = os.WriteFile(oldFile, []byte("old-data"), 0644)
+	cleanupOldExecutables(targetPath)
+	// 在 Linux 上 cleanupOldExecutables 是 no-op，直接验证函数不崩溃
+}
+
+// TestResolveBinaryPathWindows 验证 Windows 扩展名智能匹配。
+func TestResolveBinaryPathWindows(t *testing.T) {
+	tmpDir := t.TempDir()
+	exePath := filepath.Join(tmpDir, "mytool.exe")
+	_ = os.WriteFile(exePath, []byte("binary"), 0755)
+
+	// 如果传入带 .exe
+	if p, ok := resolveBinaryPath(exePath); !ok || p != exePath {
+		t.Fatalf("resolveBinaryPath 完整路径失败: p=%s, ok=%v", p, ok)
+	}
+
+	noExt := filepath.Join(tmpDir, "mytool")
+	p, ok := resolveBinaryPath(noExt)
+	// 在 Linux 上无 .exe 文件不存在返回 false；若在 Windows 下应能匹配到 mytool.exe
+	if runtime.GOOS == "windows" {
+		if !ok || p != exePath {
+			t.Fatalf("Windows 下未匹配到带 .exe 的文件: p=%s, ok=%v", p, ok)
+		}
+	} else {
+		if ok {
+			t.Fatalf("非 Windows 环境不应误匹配不存在的无后缀文件")
+		}
 	}
 }

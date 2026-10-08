@@ -93,7 +93,11 @@ type updater struct {
 
 // assetName 返回当前平台的 Release 资产名（与安装脚本的命名一致）。
 func (u *updater) assetName() string {
-	return "mnagent_" + u.platform + "_" + u.arch
+	name := "mnagent_" + u.platform + "_" + u.arch
+	if u.platform == "windows" {
+		name += ".exe"
+	}
+	return name
 }
 
 // proxyURL 将 GitHub 目标地址应用 ghProxy 代理前缀（如果已配置）。
@@ -279,8 +283,8 @@ func (u *updater) Apply(version string) error {
 		return err
 	}
 	// 覆盖正在运行的二进制：Linux 下进程持有的是已打开的文件描述符，
-	// 覆盖路径本身是安全的（旧文件描述符继续指向旧 inode）。
-	if err := os.Rename(tmpName, u.executable); err != nil {
+	// Windows 下正在运行的 exe 无法直接覆盖，但允许重命名为 .old 后写入新文件。
+	if err := replaceExecutable(tmpName, u.executable); err != nil {
 		return err
 	}
 	// 校验新二进制能启动（-version 由 systemd/procd 重启后的新进程打印）。
@@ -386,4 +390,54 @@ func detectPlatformArch() (platform, arch string) {
 		arch = runtime.GOARCH
 	}
 	return platform, arch
+}
+
+// replaceExecutable 将 newFile 原子替换（或 Windows 兼容替换）到 targetPath。
+// 在 Unix 上直接调用 os.Rename；
+// 在 Windows 上，若目标文件存在，先将其重命名为 .old 临时备份，再将 newFile 移动到 targetPath。
+func replaceExecutable(newFile, targetPath string) error {
+	if runtime.GOOS != "windows" {
+		return os.Rename(newFile, targetPath)
+	}
+
+	if _, err := os.Stat(targetPath); errors.Is(err, os.ErrNotExist) {
+		return os.Rename(newFile, targetPath)
+	}
+
+	oldPath := targetPath + ".old"
+	_ = os.Remove(oldPath)
+
+	if err := os.Rename(targetPath, oldPath); err != nil {
+		oldPath = fmt.Sprintf("%s.old.%d", targetPath, time.Now().UnixNano())
+		if err := os.Rename(targetPath, oldPath); err != nil {
+			return fmt.Errorf("重命名原可执行文件失败: %w", err)
+		}
+	}
+
+	if err := os.Rename(newFile, targetPath); err != nil {
+		_ = os.Rename(oldPath, targetPath)
+		return fmt.Errorf("移动新可执行文件失败: %w", err)
+	}
+
+	_ = os.Remove(oldPath)
+	return nil
+}
+
+// cleanupOldExecutables 清理可执行文件周边的 .old 遗留备份文件（主要针对 Windows）。
+func cleanupOldExecutables(targetPath string) {
+	if runtime.GOOS != "windows" || targetPath == "" {
+		return
+	}
+	dir := filepath.Dir(targetPath)
+	base := filepath.Base(targetPath)
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		return
+	}
+	prefix := base + ".old"
+	for _, entry := range entries {
+		if !entry.IsDir() && strings.HasPrefix(entry.Name(), prefix) {
+			_ = os.Remove(filepath.Join(dir, entry.Name()))
+		}
+	}
 }

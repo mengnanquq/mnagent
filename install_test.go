@@ -157,7 +157,43 @@ func TestInstallScriptKeepsKeySafeguards(t *testing.T) {
 		{"systemd 默认以 root 运行", `[ -n "$RUN_USER" ] || RUN_USER="root"`},
 	} {
 		if !strings.Contains(script, want.needle) {
-			t.Errorf("install.sh 缺少“%s”（应包含 %q）", want.name, want.needle)
+			t.Errorf("install.sh 缺少 %s（应包含 %q）", want.name, want.needle)
+		}
+	}
+}
+
+// TestWindowsInstallScript 校验 Windows 一键安装脚本 install.ps1 的完整性与关键安全逻辑。
+func TestWindowsInstallScript(t *testing.T) {
+	content, err := os.ReadFile("install.ps1")
+	if err != nil {
+		t.Fatalf("读取 install.ps1 失败: %v", err)
+	}
+	script := string(content)
+
+	checks := []struct {
+		name   string
+		needle string
+	}{
+		{"管理员权限检查", "WindowsBuiltInRole]::Administrator"},
+		{"UAC 自动提权", "Start-Process powershell.exe -Verb RunAs"},
+		{"服务安装与命令", "sc.exe create mnagent"},
+		{"服务崩溃自动重启策略", "sc.exe failure mnagent"},
+		{"服务启动", "sc.exe start mnagent"},
+		{"卸载参数支持", "sc.exe delete mnagent"},
+		{"安全通信协议设定", "SecurityProtocolType]::Tls12"},
+		{"架构检测 ARM64 与 x64", `PROCESSOR_ARCHITECTURE -eq "ARM64"`},
+		{"下载路径代理支持", "Get-ProxiedUrl"},
+		{"NextTrace 安装", "nexttrace_windows_"},
+		{"MiaoSpeed zip 提取", "Expand-Archive"},
+		{"参数定义 -Bot", "[string]$Bot"},
+		{"参数定义 -Token", "[string]$Token"},
+		{"参数定义 -TokenFile", "[string]$TokenFile"},
+		{"参数定义 -Uninstall", "[switch]$Uninstall"},
+	}
+
+	for _, c := range checks {
+		if !strings.Contains(script, c.needle) {
+			t.Errorf("install.ps1 缺少关键逻辑 [%s]，应包含 %q", c.name, c.needle)
 		}
 	}
 }

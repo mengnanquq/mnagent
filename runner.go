@@ -12,6 +12,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"regexp"
+	"runtime"
 	"strconv"
 	"strings"
 	"sync"
@@ -459,8 +460,22 @@ func handleUpdateCLI(cfg *config, log logger) (handled bool, err error) {
 	return false, nil
 }
 
-// restartService 重启 mnagent 服务（systemd 或 OpenWrt procd）。
+// restartService 重启 mnagent 服务（systemd、OpenWrt procd 或 Windows 服务）。
 func restartService() error {
+	if runtime.GOOS == "windows" {
+		if _, err := exec.LookPath("sc.exe"); err == nil {
+			out, err := exec.Command("sc.exe", "query", "mnagent").CombinedOutput()
+			if err == nil && (strings.Contains(string(out), "RUNNING") || strings.Contains(string(out), "STOPPED")) {
+				_ = exec.Command("net.exe", "stop", "mnagent").Run()
+				startOut, startErr := exec.Command("net.exe", "start", "mnagent").CombinedOutput()
+				if startErr != nil {
+					return fmt.Errorf("重启 Windows 服务 mnagent 失败: %w (%s)", startErr, strings.TrimSpace(string(startOut)))
+				}
+				return nil
+			}
+		}
+		return errors.New("Windows 环境下未检测到运行中的 mnagent 服务，请手动重启程序")
+	}
 	if _, err := exec.LookPath("systemctl"); err == nil {
 		out, err := exec.Command("systemctl", "restart", "mnagent").CombinedOutput()
 		if err != nil {

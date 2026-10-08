@@ -380,3 +380,23 @@ func TestUpdaterCheckWithAPIFallback(t *testing.T) {
 		t.Fatalf("Check = (%q, %v)，期望 (v0.3.6, true)", latest, ok)
 	}
 }
+
+// TestUpdaterAssetNameWindows 验证 Windows 平台资产名带 .exe 后缀。
+func TestUpdaterAssetNameWindows(t *testing.T) {
+	u := &updater{platform: "windows", arch: "amd64"}
+	if got := u.assetName(); got != "mnagent_windows_amd64.exe" {
+		t.Fatalf("assetName = %q, want mnagent_windows_amd64.exe", got)
+	}
+	u.arch = "arm64"
+	if got := u.assetName(); got != "mnagent_windows_arm64.exe" {
+		t.Fatalf("assetName = %q, want mnagent_windows_arm64.exe", got)
+	}
+}
+
+// TestDefaultTokenFile 验证不同平台默认令牌路径。
+func TestDefaultTokenFile(t *testing.T) {
+	tok := defaultTokenFile()
+	if tok == "" {
+		t.Fatal("defaultTokenFile 不应为空")
+	}
+}

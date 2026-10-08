@@ -2,6 +2,7 @@ package main
 
 import (
 	"archive/tar"
+	"archive/zip"
 	"compress/gzip"
 	"context"
 	"encoding/json"
@@ -94,10 +95,20 @@ func resolveBinaryPath(bin string) (string, bool) {
 		if _, err := os.Stat(trimmed); err == nil {
 			return trimmed, true
 		}
+		if runtime.GOOS == "windows" && !strings.HasSuffix(strings.ToLower(trimmed), ".exe") {
+			if _, err := os.Stat(trimmed + ".exe"); err == nil {
+				return trimmed + ".exe", true
+			}
+		}
 		return trimmed, false
 	}
 	if p, err := exec.LookPath(trimmed); err == nil {
 		return p, true
+	}
+	if runtime.GOOS == "windows" && !strings.HasSuffix(strings.ToLower(trimmed), ".exe") {
+		if p, err := exec.LookPath(trimmed + ".exe"); err == nil {
+			return p, true
+		}
 	}
 	return trimmed, false
 }
@@ -324,7 +335,13 @@ func nexttraceAsset(goos, goarch string) (string, error) {
 
 // resolveInstallTarget 确定依赖落地文件的路径，并在无写权限时降级到 TempDir。
 func resolveInstallTarget(configuredPath, defaultName string) string {
+	if runtime.GOOS == "windows" && !strings.HasSuffix(strings.ToLower(defaultName), ".exe") {
+		defaultName += ".exe"
+	}
 	dest := configuredPath
+	if runtime.GOOS == "windows" && dest != "" && !strings.HasSuffix(strings.ToLower(dest), ".exe") {
+		dest += ".exe"
+	}
 	if dest == "" || dest == defaultName || !filepath.IsAbs(dest) {
 		if p, err := exec.LookPath(defaultName); err == nil && filepath.IsAbs(p) {
 			dest = p
@@ -333,7 +350,16 @@ func resolveInstallTarget(configuredPath, defaultName string) string {
 			if err == nil {
 				dest = filepath.Join(filepath.Dir(exe), defaultName)
 			} else {
-				dest = filepath.Join("/usr/local/bin", defaultName)
+				if runtime.GOOS == "windows" {
+					pd := os.Getenv("ProgramData")
+					if pd != "" {
+						dest = filepath.Join(pd, "mnagent", "bin", defaultName)
+					} else {
+						dest = filepath.Join(os.TempDir(), defaultName)
+					}
+				} else {
+					dest = filepath.Join("/usr/local/bin", defaultName)
+				}
 			}
 		}
 	}
@@ -422,7 +448,7 @@ func (dm *DependencyManager) UpdateNextTrace(ctx context.Context, targetPath, ve
 		return "", fmt.Errorf("下载的 nexttrace 二进制体积异常 (%d bytes)", written)
 	}
 
-	if err := os.Rename(tmpFile, destPath); err != nil {
+	if err := replaceExecutable(tmpFile, destPath); err != nil {
 		return "", fmt.Errorf("替换 nexttrace 失败：%w", err)
 	}
 	if log != nil {
@@ -445,7 +471,12 @@ func (dm *DependencyManager) UpdateMiaospeed(ctx context.Context, targetPath, ve
 	}
 
 	archMapped := mapMiaospeedArch(dm.goarch)
-	archiveName := fmt.Sprintf("miaospeed-%s-%s-%s.tar.gz", dm.goos, archMapped, tag)
+	var archiveName string
+	if dm.goos == "windows" {
+		archiveName = fmt.Sprintf("miaospeed-%s-%s-%s.zip", dm.goos, archMapped, tag)
+	} else {
+		archiveName = fmt.Sprintf("miaospeed-%s-%s-%s.tar.gz", dm.goos, archMapped, tag)
+	}
 	rawURL := fmt.Sprintf("https://github.com/AirportR/miaospeed/releases/download/%s/%s", tag, archiveName)
 	downloadURL := applyGHProxy(rawURL, dm.ghProxy)
 
@@ -480,21 +511,76 @@ func (dm *DependencyManager) UpdateMiaospeed(ctx context.Context, targetPath, ve
 	tmpFile := filepath.Join(filepath.Dir(destPath), fmt.Sprintf(".miaospeed-update-%d", time.Now().UnixNano()))
 	defer os.Remove(tmpFile)
 
-	if err := extractTarGzFile(resp.Body, tmpFile); err != nil {
-		return "", fmt.Errorf("解压 miaospeed 失败：%w", err)
+	if strings.HasSuffix(archiveName, ".zip") {
+		dlFile, err := os.CreateTemp(filepath.Dir(destPath), ".miaospeed-dl-*")
+		if err != nil {
+			return "", fmt.Errorf("创建下载临时文件失败：%w", err)
+		}
+		dlPath := dlFile.Name()
+		defer os.Remove(dlPath)
+
+		if _, err := io.Copy(dlFile, resp.Body); err != nil {
+			_ = dlFile.Close()
+			return "", fmt.Errorf("下载 miaospeed zip 失败：%w", err)
+		}
+		_ = dlFile.Close()
+
+		if err := extractZipFile(dlPath, tmpFile); err != nil {
+			return "", fmt.Errorf("解压 miaospeed zip 失败：%w", err)
+		}
+	} else {
+		if err := extractTarGzFile(resp.Body, tmpFile); err != nil {
+			return "", fmt.Errorf("解压 miaospeed 失败：%w", err)
+		}
 	}
 
 	if err := os.Chmod(tmpFile, 0755); err != nil {
 		return "", fmt.Errorf("设置权限失败：%w", err)
 	}
 
-	if err := os.Rename(tmpFile, destPath); err != nil {
+	if err := replaceExecutable(tmpFile, destPath); err != nil {
 		return "", fmt.Errorf("替换 miaospeed 失败：%w", err)
 	}
 	if log != nil {
 		log.Info("miaospeed 更新成功", "version", tag, "path", destPath)
 	}
 	return destPath, nil
+}
+
+// extractZipFile 从 zip 压缩包中解压出可执行文件并写入 destFile。
+func extractZipFile(zipPath, destFile string) error {
+	zr, err := zip.OpenReader(zipPath)
+	if err != nil {
+		return err
+	}
+	defer zr.Close()
+
+	for _, f := range zr.File {
+		name := filepath.Base(f.Name)
+		if f.FileInfo().IsDir() {
+			continue
+		}
+		lower := strings.ToLower(name)
+		if strings.HasSuffix(lower, ".zip") || strings.EqualFold(name, "license") || strings.HasPrefix(lower, "readme") {
+			continue
+		}
+		if strings.HasSuffix(lower, ".exe") || strings.Contains(lower, "miaospeed") {
+			rc, err := f.Open()
+			if err != nil {
+				return err
+			}
+			out, err := os.OpenFile(destFile, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0755)
+			if err != nil {
+				_ = rc.Close()
+				return err
+			}
+			_, cpErr := io.Copy(out, rc)
+			_ = rc.Close()
+			_ = out.Close()
+			return cpErr
+		}
+	}
+	return errors.New("zip 压缩包内未找到可执行文件")
 }
 
 // extractTarGzFile 从 gzip 压缩的 tar 流中解压出 miaospeed 可执行文件并保存到 destFile。

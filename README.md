@@ -139,6 +139,39 @@ printf '%s\n' '<令牌>' > /etc/mnagent/token && chmod 0600 /etc/mnagent/token
 setcap cap_net_raw,cap_net_admin+eip "$(command -v nexttrace)"
 ```
 
+### Windows
+
+mnagent 原生支持 Windows（x86_64 及 ARM64），并内置 Windows 服务控制管理器（SCM）协议，无需任何第三方包装器即可作为原生系统服务后台运行。
+
+在 PowerShell 中执行以下**一键安装命令**（自动提权并注册开机自启系统服务）：
+
+```powershell
+irm https://github.com/mengnanquq/mnagent/releases/latest/download/install.ps1 | iex -args -Bot "https://<机器人地址>/agent" -Token "<令牌>"
+```
+
+若网络访问 GitHub 受限，可附加 `-GhProxy` 参数使用加速代理：
+
+```powershell
+irm https://gh-proxy.com/https://github.com/mengnanquq/mnagent/releases/latest/download/install.ps1 | iex -args -Bot "https://<机器人地址>/agent" -Token "<令牌>" -GhProxy "https://gh-proxy.com/"
+```
+
+脚本将自动执行以下操作：
+1. 检测操作系统架构（amd64 或 arm64），从 Release 下载对应版本的 `mnagent_windows_<arch>.exe`；
+2. 自动检测并下载配置 `nexttrace.exe` 与 `miaospeed.exe`（自动解压 Windows zip 包）；
+3. 写入接入令牌至安装目录（默认 `C:\Program Files\mnagent`）；
+4. 注册名为 `mnagent` 的原生 Windows 系统服务，配置崩溃后自动重启与开机自启，并立即启动服务。
+
+常用管理命令：
+- **查看服务状态**：`Get-Service mnagent`
+- **停止服务**：`Stop-Service mnagent` （或 `net stop mnagent`）
+- **启动服务**：`Start-Service mnagent` （或 `net start mnagent`）
+- **一键卸载服务**：`powershell .\install.ps1 -Uninstall`
+
+若需在前台控制台直接调试运行：
+```powershell
+.\mnagent.exe -bot https://mnbot.example.org/agent -token "<令牌>" -auto-update
+```
+
 ## 机器人侧配置
 
 主机与令牌都由机器人管理（存放在状态数据库里，不再使用配置文件）：

@@ -15,6 +15,8 @@ import (
 	"os"
 	"os/exec"
 	"os/signal"
+	"path/filepath"
+	"runtime"
 	"strings"
 	"syscall"
 	"time"
@@ -23,9 +25,20 @@ import (
 // version 由构建时注入（-ldflags "-X main.version=..."），默认 dev。
 var version = "dev"
 
+// defaultTokenFile 根据操作系统平台返回默认的令牌文件路径。
+func defaultTokenFile() string {
+	if runtime.GOOS == "windows" {
+		pd := os.Getenv("ProgramData")
+		if pd != "" {
+			return filepath.Join(pd, "mnagent", "token")
+		}
+		return "token"
+	}
+	return "/etc/mnagent/token"
+}
+
 // 默认参数。
 const (
-	defaultTokenFile  = "/etc/mnagent/token"
 	defaultMinBackoff = time.Second
 	defaultMaxBackoff = time.Minute
 	defaultPollWait   = 40 * time.Second // 机器人侧长轮询最多保持 20 秒。
@@ -51,6 +64,13 @@ type config struct {
 }
 
 func main() {
+	if isService, err := runService(os.Args[1:]); isService {
+		if err != nil {
+			fmt.Fprintln(os.Stderr, "mnagent service:", err)
+			os.Exit(1)
+		}
+		return
+	}
 	if err := run(os.Args[1:]); err != nil {
 		fmt.Fprintln(os.Stderr, "mnagent:", err)
 		os.Exit(1)
@@ -59,14 +79,22 @@ func main() {
 
 // run 解析参数并进入主循环，直到收到退出信号或发生不可恢复的错误。
 func run(args []string) error {
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+	return runWithContext(ctx, args)
+}
+
+// runWithContext 解析参数并在给定的 context 下运行 agent 主体。
+func runWithContext(ctx context.Context, args []string) error {
+	if exe, err := os.Executable(); err == nil {
+		cleanupOldExecutables(exe)
+	}
+
 	cfg, err := parseConfig(args)
 	if err != nil {
 		return err
 	}
 	log := slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: cfg.logLevel}))
-
-	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
-	defer stop()
 
 	// CLI 模式：检查/应用/跳过更新（不进入常驻循环）。
 	if handled, err := handleUpdateCLI(cfg, log); handled {
@@ -94,7 +122,7 @@ func parseConfig(args []string) (*config, error) {
 	var (
 		botURL     = fs.String("bot", "", "机器人 agent 端点基地址，例如 https://mnbot.example.org/agent")
 		tokenValue = fs.String("token", "", "接入令牌（不推荐：优先用 -token-file 或 MNAGENT_TOKEN）")
-		tokenFile  = fs.String("token-file", "", "存放接入令牌的文件路径（默认 "+defaultTokenFile+"）")
+		tokenFile  = fs.String("token-file", "", "存放接入令牌的文件路径（默认 "+defaultTokenFile()+"）")
 		binary     = fs.String("nexttrace", "nexttrace", "nexttrace 可执行文件路径或在 PATH 中的名称")
 		miaospeed  = fs.String("miaospeed", "miaospeed", "miaospeed 可执行文件路径或在 PATH 中的名称")
 		minBackoff = fs.Duration("min-backoff", defaultMinBackoff, "轮询失败后的最小重试间隔")
@@ -222,7 +250,14 @@ func newTokenSource(value, file string) (*tokenSource, error) {
 	}
 	path := strings.TrimSpace(file)
 	if path == "" {
-		path = defaultTokenFile
+		path = defaultTokenFile()
+		if runtime.GOOS == "windows" {
+			if _, err := os.Stat(path); err != nil {
+				if _, err2 := os.Stat("token"); err2 == nil {
+					path = "token"
+				}
+			}
+		}
 	}
 	if _, err := os.Stat(path); err != nil {
 		return nil, fmt.Errorf("读取令牌失败：%w（请确认服务用户对 %s 及其所在目录有访问权限——目录需要执行/进入权限；也可用 -token-file 或 MNAGENT_TOKEN 指定）",

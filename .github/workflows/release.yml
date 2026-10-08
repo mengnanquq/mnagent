@@ -74,6 +74,8 @@ jobs:
           - { goos: linux, goarch: riscv64 }
           - { goos: darwin, goarch: amd64 }
           - { goos: darwin, goarch: arm64 }
+          - { goos: windows, goarch: amd64 }
+          - { goos: windows, goarch: arm64 }
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-go@v5
@@ -89,16 +91,20 @@ jobs:
           GOARM: ${{ matrix.goarm || '7' }}
           CGO_ENABLED: '0'
         run: |
+          ext=""
+          if [ "${GOOS}" = "windows" ]; then
+            ext=".exe"
+          fi
+          output="mnagent_${GOOS}_${GOARCH}${ext}"
           go build -trimpath -ldflags "-s -w -X main.version=${VERSION}" \
-            -o mnagent_${GOOS}_${GOARCH} .
-          sha256sum mnagent_${GOOS}_${GOARCH} > mnagent_${GOOS}_${GOARCH}.sha256
+            -o "${output}" .
+          sha256sum "${output}" > "${output}.sha256"
       - name: Upload artifacts
         uses: actions/upload-artifact@v4
         with:
           name: binaries-${{ matrix.goos }}-${{ matrix.goarch }}
           path: |
-            mnagent_${{ matrix.goos }}_${{ matrix.goarch }}
-            mnagent_${{ matrix.goos }}_${{ matrix.goarch }}.sha256
+            mnagent_${{ matrix.goos }}_${{ matrix.goarch }}*
           if-no-files-found: error
 
   publish:
@@ -116,9 +122,9 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           TAG: ${{ needs.prepare.outputs.version }}
         run: |
-          # 同一标签重跑时 Release 已存在：只补传/覆盖资产，避免任务失败。
-          if gh release view "$TAG" >/dev/null 2>&1; then
-            gh release upload "$TAG" dist/* install.sh --clobber
-          else
-            gh release create "$TAG" dist/* install.sh --title "$TAG" --generate-notes
-          fi
+	          # 同一标签重跑时 Release 已存在：只补传/覆盖资产，避免任务失败。
+	          if gh release view "$TAG" >/dev/null 2>&1; then
+	            gh release upload "$TAG" dist/* install.sh install.ps1 --clobber
+	          else
+	            gh release create "$TAG" dist/* install.sh install.ps1 --title "$TAG" --generate-notes
+	          fi
