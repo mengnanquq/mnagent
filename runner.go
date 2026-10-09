@@ -64,8 +64,14 @@ type runner struct {
 	jsonOutput      atomic.Bool // 是否附加 -j（旧版本 nexttrace 不支持时自动关闭）。
 	// waitDelay 限制“进程已被杀掉、但仍有子进程占着输出管道”时的额外等待，
 	// 避免超时任务因为派生的孙进程而把 agent 卡死。
-	waitDelay time.Duration
-	logger    logger // 可选：记录实际执行的 argv，便于与主机上手跑结果对照。
+	waitDelay  time.Duration
+	logger     logger // 可选：记录实际执行的 argv，便于与主机上手跑结果对照。
+	onProgress func(Progress)
+}
+
+// setProgressReporter 注入实时进度回调。
+func (r *runner) setProgressReporter(fn func(Progress)) {
+	r.onProgress = fn
 }
 
 // newRunner 构建执行器，默认请求 JSON 输出。
@@ -131,7 +137,7 @@ func (r *runner) runMiaospeed(ctx context.Context, job Job) runResult {
 	runCtx, cancel := context.WithTimeout(ctx, job.Timeout())
 	defer cancel()
 
-	output, data, err := runMiaospeedJob(runCtx, r.miaospeedBinary, r.ghProxy, job, r.logger)
+	output, data, err := runMiaospeedJob(runCtx, r.miaospeedBinary, r.ghProxy, job, r.logger, r.onProgress)
 	if err != nil {
 		return runResult{
 			Output:   output,

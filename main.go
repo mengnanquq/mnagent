@@ -115,11 +115,17 @@ func runWithContext(ctx context.Context, args []string) error {
 		return nil
 	}
 
+	cli := newClient(cfg)
+	rnr := newRunnerFull(cfg.binary, cfg.miaospeedBinary, cfg.ghProxy, log)
+	rnr.setProgressReporter(func(p Progress) {
+		_ = cli.sendProgress(context.Background(), p)
+	})
+
 	agent := &agent{
 		cfg:    cfg,
 		logger: log,
-		client: newClient(cfg),
-		runner: newRunnerFull(cfg.binary, cfg.miaospeedBinary, cfg.ghProxy, log),
+		client: cli,
+		runner: rnr,
 		update: newUpdater(cfg, log),
 	}
 	log.Info("mnagent 已启动",

@@ -877,7 +877,7 @@ func getInt(m map[string]any, k string) int {
 // --- MiaoSpeed 临时进程与单次任务执行引擎 ---
 
 // runMiaospeedJob 执行一次 MiaoSpeed 测速任务：按需拉起进程 -> WebSocket 交互 -> 收集结果 -> 退出清理。
-func runMiaospeedJob(ctx context.Context, binary, ghProxy string, job Job, log logger) (string, json.RawMessage, error) {
+func runMiaospeedJob(ctx context.Context, binary, ghProxy string, job Job, log logger, onProgress func(Progress)) (string, json.RawMessage, error) {
 	if binary == "" {
 		binary = "miaospeed"
 	}
@@ -952,7 +952,7 @@ func runMiaospeedJob(ctx context.Context, binary, ghProxy string, job Job, log l
 	wsURL := fmt.Sprintf("ws://%s/", addr)
 	origin := fmt.Sprintf("http://%s/", addr)
 
-	report, err := executeMiaospeedTask(ctx, wsURL, origin, token, nodes, job, log)
+	report, err := executeMiaospeedTask(ctx, wsURL, origin, token, nodes, job, log, onProgress)
 	if err != nil {
 		return "", nil, err
 	}
@@ -1174,7 +1174,7 @@ func buildMiaospeedTestPlan(job Job) miaospeedTestPlan {
 }
 
 // executeMiaospeedTask 连接 WebSocket、发送任务并读取结果。
-func executeMiaospeedTask(ctx context.Context, wsURL, origin, token string, nodes []MiaospeedNode, job Job, log logger) (*MiaospeedReport, error) {
+func executeMiaospeedTask(ctx context.Context, wsURL, origin, token string, nodes []MiaospeedNode, job Job, log logger, onProgress func(Progress)) (*MiaospeedReport, error) {
 	wsCfg, err := websocket.NewConfig(wsURL, origin)
 	if err != nil {
 		return nil, fmt.Errorf("配置 websocket 失败: %w", err)
@@ -1295,6 +1295,20 @@ func executeMiaospeedTask(ctx context.Context, wsURL, origin, token string, node
 
 		if resp.Progress != nil && resp.Progress.Record != nil {
 			progressSlots = append(progressSlots, *resp.Progress.Record)
+			if onProgress != nil {
+				curIdx := resp.Progress.Index + 1
+				curName := ""
+				if resp.Progress.Index < len(nodes) {
+					curName = nodes[resp.Progress.Index].Name
+				}
+				onProgress(Progress{
+					ID:       job.ID,
+					Current:  curIdx,
+					Total:    len(nodes),
+					NodeName: curName,
+					Stage:    "全量测速中",
+				})
+			}
 		}
 
 		if resp.Result != nil {

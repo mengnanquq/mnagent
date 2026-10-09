@@ -168,6 +168,29 @@ func (c *client) sendResult(ctx context.Context, res Result) error {
 	return lastErr
 }
 
+// Progress 是任务执行中的实时进度。
+type Progress struct {
+	ID       string `json:"id"`
+	Current  int    `json:"current"`
+	Total    int    `json:"total"`
+	NodeName string `json:"node_name,omitempty"`
+	Stage    string `json:"stage,omitempty"`
+}
+
+// sendProgress 上报实时进度，单次失败不阻塞主流程。
+func (c *client) sendProgress(ctx context.Context, p Progress) error {
+	payload, err := json.Marshal(p)
+	if err != nil {
+		return err
+	}
+	resp, err := c.do(ctx, http.MethodPost, "/progress", payload)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+	return nil
+}
+
 // do 发送一次带鉴权头的请求。
 func (c *client) do(ctx context.Context, method, path string, body []byte) (*http.Response, error) {
 	token, err := c.tokens.get()

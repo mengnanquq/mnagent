@@ -237,7 +237,7 @@ func TestExecuteMiaospeedTask(t *testing.T) {
 	}
 	job := Job{ID: "task-001"}
 
-	report, err := executeMiaospeedTask(context.Background(), wsURL, origin, token, nodes, job, nil)
+	report, err := executeMiaospeedTask(context.Background(), wsURL, origin, token, nodes, job, nil, nil)
 	if err != nil {
 		t.Fatalf("任务执行失败: %v", err)
 	}
