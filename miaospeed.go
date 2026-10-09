@@ -1402,6 +1402,7 @@ func parseSlaveTaskResult(task *slaveTask, nodes []MiaospeedNode, plan miaospeed
 				nodePtr = &nodes[i]
 			}
 			sub := parseSingleSlot(slot, nodePtr, plan)
+			sub.DurationMs = duration.Milliseconds()
 			mainRep.SubReports = append(mainRep.SubReports, sub)
 		}
 	}
