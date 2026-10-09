@@ -61,6 +61,7 @@ type config struct {
 	applyUpdate     string
 	skipUpdate      string
 	ghProxy         string
+	diagJob         string
 }
 
 func main() {
@@ -101,6 +102,19 @@ func runWithContext(ctx context.Context, args []string) error {
 		return err
 	}
 
+	if cfg.diagJob != "" {
+		runner := newRunnerFull(cfg.binary, cfg.miaospeedBinary, cfg.ghProxy, log)
+		res := runner.run(ctx, Job{
+			ID:        "diag",
+			Kind:      "miaospeed",
+			Target:    cfg.diagJob,
+			Query:     "full",
+			TimeoutMS: 180000,
+		})
+		fmt.Printf("=== DIAG RESULT ===\nExitCode: %d\nErr: %q\nOut: %s\n", res.ExitCode, res.ErrText, res.Output)
+		return nil
+	}
+
 	agent := &agent{
 		cfg:    cfg,
 		logger: log,
@@ -136,6 +150,7 @@ func parseConfig(args []string) (*config, error) {
 		ghProxy    = fs.String("gh-proxy", "", "GitHub 代理加速前缀，例如 https://gh-proxy.com/")
 		logLevel   = fs.String("log-level", "info", "日志级别：debug / info / warn / error")
 		showVer    = fs.Bool("version", false, "输出版本后退出")
+		diagJob    = fs.String("diag-job", "", "本地直接执行一次测速任务并输出调试信息后退出")
 	)
 	if err := fs.Parse(args); err != nil {
 		return nil, err
@@ -145,7 +160,7 @@ func parseConfig(args []string) (*config, error) {
 		os.Exit(0)
 	}
 
-	isUpdateCLI := *checkUpd || strings.TrimSpace(*applyUpd) != "" || strings.TrimSpace(*skipUpd) != ""
+	isUpdateCLI := *checkUpd || strings.TrimSpace(*applyUpd) != "" || strings.TrimSpace(*skipUpd) != "" || strings.TrimSpace(*diagJob) != ""
 
 	endpoint := strings.TrimRight(strings.TrimSpace(*botURL), "/")
 	if endpoint == "" && !isUpdateCLI {
@@ -216,6 +231,7 @@ func parseConfig(args []string) (*config, error) {
 		applyUpdate:     strings.TrimSpace(*applyUpd),
 		skipUpdate:      strings.TrimSpace(*skipUpd),
 		ghProxy:         proxyVal,
+		diagJob:         strings.TrimSpace(*diagJob),
 	}, nil
 }
 

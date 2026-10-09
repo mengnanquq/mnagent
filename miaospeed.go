@@ -93,6 +93,7 @@ type MiaospeedReport struct {
 	OutboundGeo     string            `json:"outbound_geo,omitempty"`
 	Hijack          string            `json:"hijack,omitempty"`
 	MediaUnlock     map[string]string `json:"media_unlock,omitempty"`
+	SubReports      []MiaospeedReport `json:"sub_reports,omitempty"`
 	DurationMs      int64             `json:"duration_ms"`
 	RawResults      []slaveEntrySlot  `json:"raw_results,omitempty"`
 }
@@ -285,7 +286,8 @@ type slaveTask struct {
 }
 
 type slaveProgress struct {
-	Index int `json:"Index"`
+	Index  int             `json:"Index"`
+	Record *slaveEntrySlot `json:"Record"`
 }
 
 type slaveResponse struct {
@@ -1263,6 +1265,7 @@ func executeMiaospeedTask(ctx context.Context, wsURL, origin, token string, node
 
 	// 接收结果
 	startTime := time.Now()
+	var progressSlots []slaveEntrySlot
 	for {
 		select {
 		case <-ctx.Done():
@@ -1283,11 +1286,15 @@ func executeMiaospeedTask(ctx context.Context, wsURL, origin, token string, node
 			return nil, fmt.Errorf("读取 miaospeed 响应失败: %w", err)
 		}
 		if log != nil {
-			log.Debug("收到 miaospeed 响应", "has_result", resp.Result != nil, "error", resp.Error)
+			log.Debug("收到 miaospeed 响应", "has_result", resp.Result != nil, "has_progress", resp.Progress != nil, "error", resp.Error)
 		}
 
 		if resp.Error != "" {
 			return nil, fmt.Errorf("miaospeed 任务执行报错: %s", resp.Error)
+		}
+
+		if resp.Progress != nil && resp.Progress.Record != nil {
+			progressSlots = append(progressSlots, *resp.Progress.Record)
 		}
 
 		if resp.Result != nil {
@@ -1296,64 +1303,96 @@ func executeMiaospeedTask(ctx context.Context, wsURL, origin, token string, node
 		}
 	}
 
+	if len(progressSlots) > 0 {
+		resTask := &slaveTask{Results: progressSlots}
+		report := parseSlaveTaskResult(resTask, nodes, plan, time.Since(startTime))
+		return report, nil
+	}
+
 	return nil, errors.New("miaospeed 连接已关闭，但未收到结果数据")
+}
+
+// parseSingleSlot 提取单个节点的 slot 数据为 MiaospeedReport。
+func parseSingleSlot(slot slaveEntrySlot, node *MiaospeedNode, plan miaospeedTestPlan) MiaospeedReport {
+	rep := MiaospeedReport{
+		TestMode:        plan.ModeDescription,
+		DownloadThreads: int(plan.DownloadThreading),
+		MediaUnlock:     make(map[string]string),
+	}
+	if node != nil {
+		rep.NodeName = node.Name
+		rep.Protocol = node.Protocol
+		rep.Server = node.Server
+	}
+	for _, m := range slot.Matrices {
+		switch m.Type {
+		case matrixRTTPing:
+			rep.PingRTTMs = parseMatrixFloat(m.Payload)
+		case matrixHTTPPing:
+			rep.PingConnMs = parseMatrixFloat(m.Payload)
+		case matrixPacketLoss:
+			rep.PacketLoss = parseMatrixFloat(m.Payload)
+		case matrixMaxRTTPing:
+			rep.MaxRTTMs = parseMatrixFloat(m.Payload)
+		case matrixHTTPCode:
+			rep.HTTPCode = parseMatrixHTTPCode(m.Payload)
+		case matrixUDPType:
+			rep.UDPType = parseMatrixString(m.Payload)
+		case matrixInboundGeoIP:
+			_, rep.InboundGeo = parseMatrixGeo(m.Payload)
+		case matrixOutboundGeoIP:
+			rep.OutboundIP, rep.OutboundGeo = parseMatrixGeo(m.Payload)
+		case matrixHijack:
+			rep.Hijack = parseMatrixHijack(m.Payload)
+		case matrixAverageSpeed:
+			rep.AvgSpeedBps = parseMatrixFloat(m.Payload)
+		case matrixMaxSpeed:
+			rep.MaxSpeedBps = parseMatrixFloat(m.Payload)
+		case "TEST_SCRIPT":
+			mediaName, status := parseMatrixScript(m.Payload)
+			if mediaName != "" && status != "" {
+				rep.MediaUnlock[mediaName] = status
+			}
+		}
+	}
+	return rep
 }
 
 // parseSlaveTaskResult 将 miaospeed 任务返回结果整理为 MiaospeedReport。
 func parseSlaveTaskResult(task *slaveTask, nodes []MiaospeedNode, plan miaospeedTestPlan, duration time.Duration) *MiaospeedReport {
-	report := &MiaospeedReport{
-		TestMode:        plan.ModeDescription,
-		DownloadThreads: int(plan.DownloadThreading),
-		DurationMs:      duration.Milliseconds(),
-		RawResults:      task.Results,
-	}
-	if len(nodes) > 0 {
-		report.NodeName = nodes[0].Name
-		report.Protocol = nodes[0].Protocol
-		report.Server = nodes[0].Server
-	}
-
 	if len(task.Results) == 0 {
-		return report
+		var n *MiaospeedNode
+		if len(nodes) > 0 {
+			n = &nodes[0]
+		}
+		rep := parseSingleSlot(slaveEntrySlot{}, n, plan)
+		rep.DurationMs = duration.Milliseconds()
+		rep.RawResults = task.Results
+		return &rep
 	}
 
-	slot := task.Results[0]
-	for _, m := range slot.Matrices {
-		switch m.Type {
-		case matrixRTTPing:
-			report.PingRTTMs = parseMatrixFloat(m.Payload)
-		case matrixHTTPPing:
-			report.PingConnMs = parseMatrixFloat(m.Payload)
-		case matrixPacketLoss:
-			report.PacketLoss = parseMatrixFloat(m.Payload)
-		case matrixMaxRTTPing:
-			report.MaxRTTMs = parseMatrixFloat(m.Payload)
-		case matrixHTTPCode:
-			report.HTTPCode = parseMatrixHTTPCode(m.Payload)
-		case matrixUDPType:
-			report.UDPType = parseMatrixString(m.Payload)
-		case matrixInboundGeoIP:
-			_, report.InboundGeo = parseMatrixGeo(m.Payload)
-		case matrixOutboundGeoIP:
-			report.OutboundIP, report.OutboundGeo = parseMatrixGeo(m.Payload)
-		case matrixHijack:
-			report.Hijack = parseMatrixHijack(m.Payload)
-		case matrixAverageSpeed:
-			report.AvgSpeedBps = parseMatrixFloat(m.Payload)
-		case matrixMaxSpeed:
-			report.MaxSpeedBps = parseMatrixFloat(m.Payload)
-		case "TEST_SCRIPT":
-			if report.MediaUnlock == nil {
-				report.MediaUnlock = make(map[string]string)
+	var firstNode *MiaospeedNode
+	if len(nodes) > 0 {
+		firstNode = &nodes[0]
+	}
+	mainRep := parseSingleSlot(task.Results[0], firstNode, plan)
+	mainRep.DurationMs = duration.Milliseconds()
+	mainRep.RawResults = task.Results
+
+	// 多节点结果同步封装为 SubReports
+	if len(task.Results) > 1 {
+		mainRep.SubReports = make([]MiaospeedReport, 0, len(task.Results))
+		for i, slot := range task.Results {
+			var nodePtr *MiaospeedNode
+			if i < len(nodes) {
+				nodePtr = &nodes[i]
 			}
-			mediaName, status := parseMatrixScript(m.Payload)
-			if mediaName != "" && status != "" {
-				report.MediaUnlock[mediaName] = status
-			}
+			sub := parseSingleSlot(slot, nodePtr, plan)
+			mainRep.SubReports = append(mainRep.SubReports, sub)
 		}
 	}
 
-	return report
+	return &mainRep
 }
 
 // parseMatrixFloat 提取形如 `{"Value":12.3}` 或裸数值 `12.3` 的浮点数。
