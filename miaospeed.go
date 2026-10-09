@@ -168,7 +168,7 @@ func (r MiaospeedReport) Format() string {
 
 	if len(r.MediaUnlock) > 0 {
 		b.WriteString("流媒体解锁:\n")
-		for _, name := range []string{"YouTube", "Netflix", "Disney+", "OpenAI", "Spotify"} {
+		for _, name := range []string{"YouTube", "Netflix", "Disney+", "OpenAI", "Claude", "Spotify", "TikTok", "Bilibili", "维基百科"} {
 			if status, ok := r.MediaUnlock[name]; ok && status != "" {
 				b.WriteString(fmt.Sprintf("  - %s: %s\n", name, status))
 			}
@@ -914,7 +914,11 @@ func buildMiaospeedTestPlan(job Job) miaospeedTestPlan {
 				{Type: "TEST_SCRIPT", Params: "netflix"},
 				{Type: "TEST_SCRIPT", Params: "disney"},
 				{Type: "TEST_SCRIPT", Params: "openai"},
+				{Type: "TEST_SCRIPT", Params: "claude"},
 				{Type: "TEST_SCRIPT", Params: "spotify"},
+				{Type: "TEST_SCRIPT", Params: "tiktok"},
+				{Type: "TEST_SCRIPT", Params: "bilibili"},
+				{Type: "TEST_SCRIPT", Params: "wikipedia"},
 			},
 			Scripts:           buildDefaultMediaScripts(),
 			DownloadThreading: 4,
@@ -1432,6 +1436,66 @@ func buildDefaultMediaScripts() []slaveScript {
 }`,
 			TimeoutMillis: 5000,
 		},
+		{
+			ID:   "claude",
+			Type: "media",
+			Content: `function handler() {
+    var res = fetch("https://claude.ai/login", { headers: {'User-Agent':'Mozilla/5.0'}, noRedir: true, timeout: 3000 });
+    if (!res) return { text: "超时", color: "#f87171" };
+    var loc = get(res, "headers.Location", "");
+    if (loc.indexOf("unavailable") > 0) return { text: "不可用", color: "#f87171" };
+    if (res.statusCode === 200) return { text: "支持", color: "#34d399" };
+    return { text: "不可用", color: "#f87171" };
+}`,
+			TimeoutMillis: 5000,
+		},
+		{
+			ID:   "tiktok",
+			Type: "media",
+			Content: `function handler() {
+    var res = fetch("https://www.tiktok.com", { headers: {'User-Agent':'Mozilla/5.0'}, timeout: 3000 });
+    if (!res || !res.body) return { text: "超时", color: "#f87171" };
+    if (res.statusCode === 200) {
+        var idx = res.body.indexOf('"region":');
+        if (idx > 0) {
+            var r = res.body.substring(idx).split('"')[3];
+            if (r) return { text: "解锁 (" + r + ")", color: "#34d399" };
+        }
+        return { text: "解锁", color: "#34d399" };
+    }
+    return { text: "失败", color: "#f87171" };
+}`,
+			TimeoutMillis: 5000,
+		},
+		{
+			ID:   "bilibili",
+			Type: "media",
+			Content: `function handler() {
+    var res = fetch("https://api.bilibili.com/pgc/player/web/playurl?avid=50762638&cid=100279344&qn=0&type=&otype=json&ep_id=268176", { headers: {'User-Agent':'Mozilla/5.0'}, timeout: 3000 });
+    if (!res || !res.body) return { text: "超时", color: "#f87171" };
+    var d = safeParse(res.body);
+    if (d.code === 0 || d.message === "success") return { text: "解锁 (台湾)", color: "#34d399" };
+    var res2 = fetch("https://api.bilibili.com/pgc/player/web/playurl?avid=18281381&cid=29892777&qn=0&type=&otype=json&ep_id=183799", { headers: {'User-Agent':'Mozilla/5.0'}, timeout: 3000 });
+    if (res2 && res2.body) {
+        var d2 = safeParse(res2.body);
+        if (d2.code === 0 || d2.message === "success") return { text: "解锁 (港澳台)", color: "#34d399" };
+    }
+    return { text: "大陆受限", color: "#fbbf24" };
+}`,
+			TimeoutMillis: 5000,
+		},
+		{
+			ID:   "wikipedia",
+			Type: "media",
+			Content: `function handler() {
+    var res = fetch("https://en.wikipedia.org/w/index.php?title=Wikipedia:WikiProject_on_open_proxies&action=edit", { headers: {'User-Agent':'Mozilla/5.0'}, timeout: 3000 });
+    if (!res || !res.body) return { text: "超时", color: "#f87171" };
+    if (res.body.indexOf("This IP address has been") > 0) return { text: "禁止编辑", color: "#f87171" };
+    if (res.statusCode === 200) return { text: "允许编辑", color: "#34d399" };
+    return { text: "不可用", color: "#f87171" };
+}`,
+			TimeoutMillis: 5000,
+		},
 	}
 }
 
@@ -1461,8 +1525,16 @@ func mapScriptKey(key string) string {
 		return "Disney+"
 	case "openai":
 		return "OpenAI"
+	case "claude":
+		return "Claude"
 	case "spotify":
 		return "Spotify"
+	case "tiktok":
+		return "TikTok"
+	case "bilibili":
+		return "Bilibili"
+	case "wikipedia":
+		return "维基百科"
 	default:
 		return key
 	}

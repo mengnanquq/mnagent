@@ -313,7 +313,7 @@ func TestBuildMiaospeedTestPlan(t *testing.T) {
 			name:              "默认全量测试",
 			job:               Job{ID: "t0"},
 			wantDesc:          "全量测试",
-			wantMatrices:      []string{matrixRTTPing, matrixHTTPPing, matrixPacketLoss, matrixHTTPCode, matrixInboundGeoIP, matrixOutboundGeoIP, matrixHijack, matrixUDPType, matrixAverageSpeed, matrixMaxSpeed, "TEST_SCRIPT", "TEST_SCRIPT", "TEST_SCRIPT", "TEST_SCRIPT", "TEST_SCRIPT"},
+			wantMatrices:      []string{matrixRTTPing, matrixHTTPPing, matrixPacketLoss, matrixHTTPCode, matrixInboundGeoIP, matrixOutboundGeoIP, matrixHijack, matrixUDPType, matrixAverageSpeed, matrixMaxSpeed, "TEST_SCRIPT", "TEST_SCRIPT", "TEST_SCRIPT", "TEST_SCRIPT", "TEST_SCRIPT", "TEST_SCRIPT", "TEST_SCRIPT", "TEST_SCRIPT", "TEST_SCRIPT"},
 			wantDownThreading: 4,
 		},
 		{
