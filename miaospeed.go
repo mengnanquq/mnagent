@@ -353,55 +353,180 @@ func parseProxyTarget(ctx context.Context, target string) ([]MiaospeedNode, erro
 	return []MiaospeedNode{*node}, nil
 }
 
-// fetchAndParseSubscription 拉取订阅并提取节点。
+// fetchAndParseSubscription 拉取订阅并提取节点，支持 Base64 URI 列表与原生 Clash YAML。
 func fetchAndParseSubscription(ctx context.Context, subURL string) ([]MiaospeedNode, error) {
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, subURL, nil)
-	if err != nil {
-		return nil, fmt.Errorf("构建订阅请求失败: %w", err)
-	}
-	req.Header.Set("User-Agent", "ClashMeta/v1.19.23 mnagent")
+	// 依次尝试主流订阅客户端 User-Agent，避免被特定机场的 UA 检查拦截
+	userAgents := []string{"v2rayng", "ClashMeta", "clash.meta"}
+	client := &http.Client{Timeout: 15 * time.Second}
 
-	client := &http.Client{Timeout: 10 * time.Second}
-	resp, err := client.Do(req)
-	if err != nil {
-		return nil, fmt.Errorf("拉取订阅失败: %w", err)
-	}
-	defer resp.Body.Close()
+	var lastErr error
+	for _, ua := range userAgents {
+		req, err := http.NewRequestWithContext(ctx, http.MethodGet, subURL, nil)
+		if err != nil {
+			return nil, fmt.Errorf("构建订阅请求失败: %w", err)
+		}
+		req.Header.Set("User-Agent", ua)
 
-	if resp.StatusCode != http.StatusOK {
-		return nil, fmt.Errorf("拉取订阅返回 HTTP %d", resp.StatusCode)
-	}
-
-	body, err := io.ReadAll(io.LimitReader(resp.Body, 4<<20)) // 限制 4MB
-	if err != nil {
-		return nil, fmt.Errorf("读取订阅失败: %w", err)
-	}
-
-	content := strings.TrimSpace(string(body))
-	// 尝试 Base64 解码
-	decoded, err := base64.StdEncoding.DecodeString(content)
-	if err == nil && len(decoded) > 0 {
-		content = string(decoded)
-	} else if rawDecoded, err2 := base64.RawStdEncoding.DecodeString(content); err2 == nil && len(rawDecoded) > 0 {
-		content = string(rawDecoded)
-	}
-
-	lines := strings.Split(content, "\n")
-	var nodes []MiaospeedNode
-	for _, line := range lines {
-		line = strings.TrimSpace(line)
-		if line == "" || strings.HasPrefix(line, "#") {
+		resp, err := client.Do(req)
+		if err != nil {
+			lastErr = err
 			continue
 		}
-		if n, err := parseProxyURI(line); err == nil && n != nil {
-			nodes = append(nodes, *n)
+
+		if resp.StatusCode != http.StatusOK {
+			resp.Body.Close()
+			lastErr = fmt.Errorf("拉取订阅返回 HTTP %d", resp.StatusCode)
+			continue
+		}
+
+		body, err := io.ReadAll(io.LimitReader(resp.Body, 8<<20)) // 限制 8MB
+		resp.Body.Close()
+		if err != nil {
+			lastErr = err
+			continue
+		}
+
+		content := strings.TrimSpace(string(body))
+		// 1. 如果是 Clash YAML 配置（包含 proxies:），直接解析 YAML 节点
+		if strings.Contains(content, "proxies:") {
+			nodes := parseClashYAMLProxies(content)
+			if len(nodes) > 0 {
+				return nodes, nil
+			}
+		}
+
+		// 2. 尝试 Base64 解码并按行解析 URI
+		decoded, err := base64.StdEncoding.DecodeString(content)
+		if err != nil {
+			decoded, err = base64.RawStdEncoding.DecodeString(content)
+		}
+		if err == nil && len(decoded) > 0 {
+			content = string(decoded)
+		}
+
+		lines := strings.Split(content, "\n")
+		var nodes []MiaospeedNode
+		for _, line := range lines {
+			line = strings.TrimSpace(line)
+			if line == "" || strings.HasPrefix(line, "#") {
+				continue
+			}
+			if n, err := parseProxyURI(line); err == nil && n != nil {
+				nodes = append(nodes, *n)
+			}
+		}
+
+		if len(nodes) > 0 {
+			return nodes, nil
+		}
+		lastErr = errors.New("订阅中未找到有效代理节点")
+	}
+
+	if lastErr != nil {
+		return nil, lastErr
+	}
+	return nil, errors.New("订阅中未找到有效代理节点")
+}
+
+// parseClashYAMLProxies 从原生 Clash/Meta 配置文件中提取 proxies 节点。
+func parseClashYAMLProxies(content string) []MiaospeedNode {
+	lines := strings.Split(content, "\n")
+	var nodes []MiaospeedNode
+	inProxies := false
+
+	var currentItem strings.Builder
+	currentName := ""
+	currentType := ""
+	currentServer := ""
+
+	flushItem := func() {
+		if currentItem.Len() > 0 {
+			payload := strings.TrimSpace(currentItem.String())
+			if currentName != "" && payload != "" {
+				nodes = append(nodes, MiaospeedNode{
+					Name:     currentName,
+					Protocol: currentType,
+					Server:   currentServer,
+					Payload:  payload,
+				})
+			}
+			currentItem.Reset()
+			currentName = ""
+			currentType = ""
+			currentServer = ""
 		}
 	}
 
-	if len(nodes) == 0 {
-		return nil, errors.New("订阅中未找到有效代理节点")
+	for _, line := range lines {
+		trimmed := strings.TrimSpace(line)
+		if trimmed == "proxies:" {
+			inProxies = true
+			continue
+		}
+		if inProxies {
+			// 退出 proxies 块
+			if len(line) > 0 && !strings.HasPrefix(line, " ") && !strings.HasPrefix(line, "\t") && !strings.HasPrefix(line, "-") {
+				flushItem()
+				break
+			}
+			// 单行格式: - {name: ..., server: ..., ...}
+			if strings.HasPrefix(trimmed, "- {") && strings.HasSuffix(trimmed, "}") {
+				flushItem()
+				rawItem := strings.TrimPrefix(trimmed, "- ")
+				name := extractField(rawItem, "name:")
+				pType := extractField(rawItem, "type:")
+				server := extractField(rawItem, "server:")
+				port := extractField(rawItem, "port:")
+				if name != "" {
+					srv := server
+					if port != "" {
+						srv += ":" + port
+					}
+					nodes = append(nodes, MiaospeedNode{
+						Name:     name,
+						Protocol: pType,
+						Server:   srv,
+						Payload:  rawItem,
+					})
+				}
+				continue
+			}
+
+			// 多行缩进格式
+			if strings.HasPrefix(trimmed, "- name:") || strings.HasPrefix(trimmed, "- type:") {
+				flushItem()
+				currentItem.WriteString(strings.TrimPrefix(trimmed, "- ") + "\n")
+				if strings.HasPrefix(trimmed, "- name:") {
+					currentName = strings.TrimSpace(strings.TrimPrefix(trimmed, "- name:"))
+					currentName = strings.Trim(currentName, "\"'")
+				}
+			} else if currentItem.Len() > 0 {
+				currentItem.WriteString(trimmed + "\n")
+				if strings.HasPrefix(trimmed, "type:") {
+					currentType = strings.TrimSpace(strings.TrimPrefix(trimmed, "type:"))
+					currentType = strings.Trim(currentType, "\"'")
+				} else if strings.HasPrefix(trimmed, "server:") {
+					currentServer = strings.TrimSpace(strings.TrimPrefix(trimmed, "server:"))
+					currentServer = strings.Trim(currentServer, "\"'")
+				}
+			}
+		}
 	}
-	return nodes, nil
+	flushItem()
+	return nodes
+}
+
+func extractField(raw, prefix string) string {
+	idx := strings.Index(raw, prefix)
+	if idx == -1 {
+		return ""
+	}
+	sub := strings.TrimSpace(raw[idx+len(prefix):])
+	end := strings.IndexAny(sub, ",}")
+	if end != -1 {
+		sub = sub[:end]
+	}
+	return strings.Trim(strings.TrimSpace(sub), "\"'")
 }
 
 // parseProxyURI 解析主流代理协议 URI 为 MiaospeedNode。
@@ -650,6 +775,32 @@ func parseVlessURI(u *url.URL) (*MiaospeedNode, error) {
 		if sni != "" {
 			sb.WriteString(fmt.Sprintf("servername: %s\n", quoteYAML(sni)))
 		}
+		if security == "reality" {
+			pbk := u.Query().Get("pbk")
+			sid := u.Query().Get("sid")
+			if pbk != "" || sid != "" {
+				sb.WriteString("reality-opts:\n")
+				if pbk != "" {
+					sb.WriteString(fmt.Sprintf("  public-key: %s\n", quoteYAML(pbk)))
+				}
+				if sid != "" {
+					sb.WriteString(fmt.Sprintf("  short-id: %s\n", quoteYAML(sid)))
+				}
+			}
+		}
+	}
+	if netType == "ws" {
+		path := u.Query().Get("path")
+		host := u.Query().Get("host")
+		if path != "" || host != "" {
+			sb.WriteString("ws-opts:\n")
+			if path != "" {
+				sb.WriteString(fmt.Sprintf("  path: %s\n", quoteYAML(path)))
+			}
+			if host != "" {
+				sb.WriteString(fmt.Sprintf("  headers:\n    Host: %s\n", quoteYAML(host)))
+			}
+		}
 	}
 
 	return &MiaospeedNode{
@@ -743,6 +894,14 @@ func runMiaospeedJob(ctx context.Context, binary, ghProxy string, job Job, log l
 	nodes, err := parseProxyTarget(ctx, job.Target)
 	if err != nil {
 		return "", nil, fmt.Errorf("解析测速目标失败: %w", err)
+	}
+
+	maxNodes := 25
+	if job.Count > 0 && job.Count < len(nodes) {
+		maxNodes = job.Count
+	}
+	if len(nodes) > maxNodes {
+		nodes = nodes[:maxNodes]
 	}
 
 	// 2. 分配随机本地端口与 Token
