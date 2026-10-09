@@ -13,7 +13,9 @@
 
 ## 安装
 
-推荐用机器人生成的**一键命令**（管理员在 Telegram 里执行 `/host add 香港节点`，机器人会直接回复下面这条命令）：
+推荐用机器人生成的**一键命令**（管理员在 Telegram 里执行 `/host add 香港节点`，机器人会根据平台需要提供接入命令）：
+
+### Linux / OpenWrt / macOS
 
 ```sh
 (curl -fsSL https://raw.githubusercontent.com/mengnanquq/mnagent/main/install.sh \
@@ -21,15 +23,19 @@
   | sh -s -- --bot https://<机器人地址>/agent --token <令牌>
 ```
 
+### Windows (PowerShell 管理员)
+
+```powershell
+irm https://raw.githubusercontent.com/mengnanquq/mnagent/main/install.ps1 | iex -args -Bot "https://<机器人地址>/agent" -Token "<令牌>"
+```
+
 命令里只有令牌：**令牌即身份**，机器人按令牌识别是哪台主机，主机上不需要（也不接受）名称参数。
 
-命令用 `sh` 并带 `wget` 回退，因此 VPS 与 OpenWrt 路由器可以粘同一条；非 root 用户由脚本自己通过 `sudo` 提权重跑。
-
-脚本会自动：从本仓库的 Release 下载预编译二进制（`mnagent_<os>_<arch>`，没有 Release 或网络受限时回退到源码编译）、创建专用用户、写入令牌（0600）、写入 systemd 单元并**重启服务**（因此重复执行即为升级，会真正换上并运行新版本）。原始套接字能力由单元的 `AmbientCapabilities` 提供，并给服务准备了可写的主目录（`StateDirectory=mnagent`）供 `nexttrace` 存放配置与 IP 库。
+Linux 下脚本会自动：从本仓库的 Release 下载预编译二进制（`mnagent_<os>_<arch>`，没有 Release 或网络受限时回退到源码编译）、创建专用用户、写入令牌（0600）、写入 systemd 单元并**重启服务**（因此重复执行即为升级，会真正换上并运行新版本）。原始套接字能力由单元的 `AmbientCapabilities` 提供，并给服务准备了可写的主目录（`StateDirectory=mnagent`）供 `nexttrace` 存放配置与 IP 库。
 
 > 如果主机访问 GitHub 受限：
-> 1. 可以使用 GitHub 加速代理（如 `https://gh-proxy.com/`），在安装命令中添加 `--gh-proxy https://gh-proxy.com/`（或设置环境变量 `GH_PROXY=https://gh-proxy.com/`）。安装脚本以及后续 agent 后台自更新都会自动通过代理下载 Release 资产与源码包。
-> 2. 或者把 `install.sh` 与对应架构的二进制放到内网镜像，用 `--binary https://内网镜像/mnagent_linux_amd64` 指定二进制即可；机器人侧也可用 `MNAGENT_INSTALL_URL` 把生成的脚本地址指向你的镜像。
+> 1. 可以使用 GitHub 加速代理（如 `https://gh-proxy.com/`），在安装命令中添加 `--gh-proxy https://gh-proxy.com/`（Windows 为 `-GhProxy "https://gh-proxy.com/"`，或设置环境变量 `GH_PROXY=https://gh-proxy.com/`）。安装脚本以及后续 agent 后台自更新都会自动通过代理下载 Release 资产与源码包。
+> 2. 或者把安装脚本与对应架构的二进制放到内网镜像，用 `--binary https://内网镜像/mnagent_linux_amd64` 指定二进制即可；机器人侧也可用 `MNAGENT_INSTALL_URL` 把生成的脚本地址指向你的镜像。
 
 ### 发布
 
@@ -37,7 +43,7 @@
 - **推送 `main` 分支**：自动根据最新版本计算并递增生成语义化版本号（如 `v0.3.5-main.<时间戳>.<sha>`），自动编译全平台二进制并发布 Release。
 - **打 `v*` 标签**：推送指定 Tag（例如 `git tag v0.4.0 && git push origin v0.4.0`）会自动发布正式 Release。
 
-构建产物涵盖 linux/darwin 各主流系统及 amd64/arm64/arm/mips/mipsle/riscv64 等架构。
+构建产物涵盖 Linux、Windows（amd64/arm64）、macOS (darwin) 各主流系统及 amd64/arm64/arm/mips/mipsle/riscv64 等架构。
 
 ### OpenWrt
 
@@ -61,8 +67,8 @@ opkg install nexttrace           # 若未安装 nexttrace（或使用 --nexttrac
 
 | `kind` | 说明 | 依赖 |
 | --- | --- | --- |
-| `trace`（默认） | 执行 `nexttrace -j` 路由追踪 | 需要 nexttrace 可执行文件 |
-| `miaospeed` / `speed` | 调用 [AirportR/miaospeed](https://github.com/AirportR/miaospeed) 执行代理节点或订阅测速（支持 8 种测试类型） | 需要 miaospeed 可执行文件（install.sh 自动下载安装） |
+| `trace`（默认） | 执行 `nexttrace -j` 路由追踪 | 需要 nexttrace 可执行文件（自动检测与更新） |
+| `miaospeed` / `speed` | 调用 [AirportR/miaospeed](https://github.com/AirportR/miaospeed) 执行代理节点或订阅测速（支持 7 种测试模式与 9 大流媒体/AI原生解锁检测） | 需要 miaospeed 可执行文件（自动检测与更新） |
 | `ping` | ICMP echo，输出丢包与延迟（min/avg/max/抖动） | 无（进程内实现；非特权 ping socket 或 CAP_NET_RAW） |
 | `tcping` | TCP 握手延迟 | 无 |
 | `http` | HTTP(S) 请求：状态码、服务端 IP、证书到期、DNS/连接/TLS/首字节分段耗时 | 无 |
@@ -74,27 +80,45 @@ opkg install nexttrace           # 若未安装 nexttrace（或使用 --nexttrac
 
 1. **代理连通性测试**（`connectivity` / `conn` / `连通性`）：测试代理可用性、HTTP 响应状态码及 RTT 延迟；
 2. **拓扑测试**（`topology` / `topo` / `拓扑`）：测试链路入站/出站国家地区、落地 IP 及 DNS 劫持检测；
-3. **多线程测速**（`multithread` / `multi` / `多线程`）：多连接并行下行带宽测速（可通过 `count` 自定义线程数，默认 4）；
+3. **多线程测速**（`multithread` / `multi` / `多线程` / `下载`）：多连接并行下行带宽测速（可通过 `count` 自定义线程数，默认 4）；
 4. **单线程测速**（`singlethread` / `single` / `单线程`）：单连接下行带宽测速；
-5. **上行速度测试**（`upload` / `uspeed` / `上行`）：多连接节点上行带宽测速；
-6. **延迟测试**（`latency` / `ping` / `延迟`）：精确测量 TCP RTT 延迟、HTTP Ping 延迟、丢包率与抖动；
-7. **UDP 类型测试**（`udp` / `nat` / `stun` / `udp类型`）：通过 STUN 服务器探测代理节点的 UDP 支持与 NAT 类型（FullCone / Symmetric / RestrictedCone 等）；
-8. **全量测试**（`full` / `all` / `全量`）：综合执行上述全部专项测试并输出完整报告。
+5. **延迟测试**（`latency` / `ping` / `延迟`）：精确测量 TCP RTT 延迟、HTTP Ping 延迟、丢包率与抖动；
+6. **UDP 类型测试**（`udp` / `nat` / `stun` / `udp类型`）：通过 STUN 服务器探测代理节点的 UDP 支持与 NAT 类型（FullCone / Symmetric / RestrictedCone 等）；
+7. **全量测试**（`full` / `all` / `全量`）：综合执行连通性、拓扑、延迟、UDP 类型、下行测速，并默认包含九大主流流媒体与 AI 服务原生解锁检测。
 
-参数上限由 agent 强制：次数 1-20、端口 1-65535、URL 仅 http(s)、记录类型白名单；
-未知 `kind` 直接失败，不会退化成执行其它命令。
+#### 九大主流流媒体与 AI 服务原生解锁检测
 
-### 自动更新
+全量模式或解锁测试中，agent 内置了对 9 大主流流媒体与 AI 服务的原生解锁检测脚本：
 
-mnagent **默认开启自动更新**：每 6 小时（带随机抖动，避免所有主机同时请求）检查一次
-GitHub Releases，发现比当前版本新的正式版就下载、原子替换自身并重启服务。
+- **流媒体服务**：
+  - **YouTube**：检测 YouTube 区域解锁及 YouTube Premium 支持；
+  - **Netflix**：精确识别是原生完整解锁、仅支持自制剧（Originals Only）还是不可用；
+  - **Disney+**：检测 Disney+ 区域可用性；
+  - **Spotify**：检测落地节点区域注册及音源播放限制；
+  - **TikTok**：检测 TikTok 落地国家/区域访问支持；
+  - **Bilibili**：检测港澳台及东南亚限定影视番剧的解锁情况；
+- **AI 与知识服务**：
+  - **OpenAI (ChatGPT)**：检测 ChatGPT 网页端/API 访问权限与国家封锁状态；
+  - **Claude**：检测 Anthropic Claude 的区域支持与可用性；
+  - **Wikipedia**：检测维基百科访问连通性与重定向状态。
 
-- 关闭：安装脚本加 `--no-auto-update`，或改服务命令去掉 `-auto-update`；
-- 手动操作：`mnagent -check-update`（只看有没有新版）、`mnagent -apply-update latest`（立即升级）、
-  `mnagent -skip-update v0.1.8`（跳过某个版本 24 小时，避免坏版本反复拉起）；
-- 版本号是 `-ldflags "-X main.version=..."` 注入的 tag 名；本地 `go build` 出来的 `dev` 版本
-  不参与自动更新（避免开发构建被替换）；
-- 更新只在 Release（`releases/latest`）里挑版本，因此发版请打 tag（见下）。
+探测结果在回传后将以结构化格式直接呈现在 Telegram 机器人测速报告中。
+
+### 自动更新与多依赖管理
+
+mnagent **默认开启自动更新与多依赖协同管理**：每 6 小时（带随机抖动，避免所有主机同时请求）检查一次版本，发现新版本即无缝静默升级并重启服务。
+
+除了 mnagent 自身外，agent 还内置了统一的外部依赖生命周期管理器（`DependencyManager`），全面支持外部依赖 **nexttrace** 与 **miaospeed** 的版本检测与自动更新：
+
+1. **版本自动探测**：自动识别本地已安装的 `nexttrace` 与 `miaospeed` 实际版本，精准剔除 ANSI 终端彩色转义字符；
+2. **多依赖远程比对**：定期请求 GitHub Releases 检索官方最新稳定版本；
+3. **静默并行升级**：
+   - 当检测到新版依赖时，后台会自动下载对应系统与架构的发布资产、解压并安全替换二进制；
+   - 通过配置 `--gh-proxy` 加速代理后，agent 自身及所有外部依赖的更新下载均会自动走加速代理；
+4. **手动运维管理**：
+   - 检查状态：`mnagent -check-update` 会同时输出 mnagent 自身及 `nexttrace`、`miaospeed` 的当前版本与最新版本状态；
+   - 立即升级：`mnagent -apply-update latest` 会先并行拉取更新过期的外部依赖，再更新 mnagent 自身并平滑重启服务；
+   - 跳过版本：`mnagent -skip-update v0.1.8`（跳过某个版本 24 小时，避免问题版本反复触发更新）。
 
 ### 脚本参数
 
@@ -154,10 +178,28 @@ irm https://gh-proxy.com/https://raw.githubusercontent.com/mengnanquq/mnagent/ma
 3. 写入接入令牌至安装目录（默认 `C:\Program Files\mnagent`）；
 4. 注册名为 `mnagent` 的原生 Windows 系统服务，配置崩溃后自动重启与开机自启，并立即启动服务。
 
+#### `install.ps1` 脚本参数
+
+| 参数 | 默认值 | 说明 |
+| --- | --- | --- |
+| `-Bot` | 必填 | 机器人 agent 接口地址（如 `https://mnbot.example.org/agent`） |
+| `-Token` | 必填（或 `-TokenFile`） | 接入令牌 |
+| `-TokenFile` | — | 现存令牌文件路径 |
+| `-InstallDir` | `C:\Program Files\mnagent` | agent 及依赖的安装目录 |
+| `-Version` | `latest` | mnagent 安装版本（默认最新 Release） |
+| `-GhProxy` | — | GitHub 代理加速前缀（如 `https://gh-proxy.com/`） |
+| `-AutoUpdate` / `-NoAutoUpdate` | 开启 | 是否开启后台定时自动更新（默认开启） |
+| `-UpdateInterval` | `6h` | 自动检查更新的周期（默认 6 小时） |
+| `-InstallNextTrace` / `-NoInstallNextTrace` | 开启 | 是否自动下载并安装 Windows 版 `nexttrace.exe` |
+| `-InstallMiaoSpeed` / `-NoInstallMiaoSpeed` | 开启 | 是否自动下载并安装 Windows 版 `miaospeed.exe` |
+| `-MiaoSpeedVersion` | `latest` | 指定 miaospeed 版本（默认最新 Release） |
+| `-Uninstall` | — | 停止并卸载 Windows 服务，清理服务注册 |
+
 常用管理命令：
 - **查看服务状态**：`Get-Service mnagent`
 - **停止服务**：`Stop-Service mnagent` （或 `net stop mnagent`）
 - **启动服务**：`Start-Service mnagent` （或 `net start mnagent`）
+- **重启服务**：`Restart-Service mnagent`
 - **一键卸载服务**：`powershell .\install.ps1 -Uninstall`
 
 若需在前台控制台直接调试运行：
@@ -183,16 +225,16 @@ irm https://gh-proxy.com/https://raw.githubusercontent.com/mengnanquq/mnagent/ma
 | --- | --- | --- |
 | `-bot` | 必填 | 机器人 agent 端点基地址，如 `https://mnbot.example.org/agent` |
 | `-token` | — | 直接给出令牌（不推荐：会出现在进程列表里） |
-| `-token-file` | `/etc/mnagent/token` | 令牌文件路径；每次请求都重新读取，**轮换令牌无需重启** |
+| `-token-file` | Linux 默认为 `/etc/mnagent/token`<br>Windows 默认为 `%ProgramData%\mnagent\token` | 令牌文件路径；每次请求都重新读取，**轮换令牌无需重启** |
 | `-nexttrace` | `nexttrace` | nexttrace 可执行文件路径或 PATH 中的名称 |
 | `-miaospeed` | `miaospeed` | miaospeed 可执行文件路径或 PATH 中的名称 |
 | `-min-backoff` / `-max-backoff` | `1s` / `1m` | 轮询失败后的重试退避区间（带抖动） |
 | `-poll-timeout` | `40s` | 单次长轮询的客户端超时（机器人侧最多保持 20 秒） |
-| `-auto-update` | `false` | 是否开启后台定期自动更新（通过 `install.sh` 安装时默认开启） |
+| `-auto-update` | `false` | 是否开启后台定期自动更新（通过 `install.sh` / `install.ps1` 安装时默认开启，协同更新依赖） |
 | `-update-interval` | `6h` | 自动更新检查间隔 |
 | `-gh-proxy` | — | GitHub 代理前缀（如 `https://gh-proxy.com/`，环境变量 `GH_PROXY` / `MNAGENT_GH_PROXY` 同效） |
-| `-check-update` | — | 单次检查是否有新版本并输出，不下载 |
-| `-apply-update <tag\|latest>` | — | 手动下载并安装指定版本或最新版后退出并重启服务 |
+| `-check-update` | — | 单次检查 mnagent 及核心依赖（nexttrace、miaospeed）是否有新版本并输出状态矩阵，不执行下载 |
+| `-apply-update <tag\|latest>` | — | 手动下载并安装指定版本或最新版（自动并行更新过期依赖），安装完成后退出并重启服务 |
 | `-skip-update <tag>` | — | 跳过指定版本 24 小时（自动更新不再提示或应用） |
 | `-log-level` | `info` | `debug` / `info` / `warn` / `error` |
 | `-version` | — | 输出版本后退出 |
@@ -236,11 +278,13 @@ POST /agent/results                 {"id":"…","output":"…","exit_code":0,"er
 
 | 现象 | 排查方向 |
 | --- | --- |
-| 日志反复 `鉴权失败` | 令牌与机器人不一致或已被轮换：用 `/host rotate <名称>` 生成新命令重跑安装（或对比 `/etc/mnagent/token`） |
+| 日志反复 `鉴权失败` | 令牌与机器人不一致或已被轮换：用 `/host rotate <名称>` 生成新命令重跑安装（或对比 `/etc/mnagent/token` / Windows 下 `%ProgramData%\mnagent\token`） |
 | 机器人显示 ⚪️ 离线 | agent 未运行、`-bot` 地址不可达（出站 443 被拦？）、或机器人的 `/agent/jobs` 未对外暴露 |
 | 任务报 `执行超时` | 主机到目标网络不通，或需要更长超时；也可在命令里减少跳数 |
-| 任务报 `执行失败（退出码 N）` | 手动在该主机执行同参数 `nexttrace` 复现；注意 `nexttrace -j` 需要 v1.7+，旧版本 agent 会自动去掉 `-j` 重试 |
-| 任务报 `无法启动 nexttrace（…）` | 二进制本身有问题：确认路径存在、可执行、架构匹配（`file $(command -v nexttrace)`），必要时在主机上直接运行一次 |
+| 任务报 `执行失败（退出码 N）` | 手动在该主机执行同参数命令复现；注意 `nexttrace -j` 需要 v1.7+，旧版本 agent 会自动去掉 `-j` 重试 |
+| 任务报 `无法启动 nexttrace/miaospeed（…）` | 检查二进制路径与架构匹配；执行 `mnagent -check-update` 查看依赖状态，或使用 `mnagent -apply-update latest` 自动补全/更新依赖 |
+| Windows 下管理服务报拒绝访问 | Windows 服务注册与启停需要系统管理员权限，请右键选择“以管理员身份运行”PowerShell 窗口 |
+| Windows 下缺少依赖或报防病毒拦截 | 检查安装目录（默认 `C:\Program Files\mnagent`）下是否存在对应可执行文件；排查 Windows Defender 或杀毒软件拦截隔离日志并添加排除项 |
 | 任务报 `进程被信号终止（…）` | 二进制启动后被信号杀死，按提示的信号名排查（内存不足、平台不兼容等） |
 | 任务报权限/原始套接字错误 | 用 systemd 运行时应由单元的 `AmbientCapabilities` 提供 `CAP_NET_RAW`；检查单元是否被旧版本覆盖（重跑安装脚本会重新生成） |
 | 输出为空且无报错 | 检查 `nexttrace` 能否直接运行：`sudo -u mnagent $(command -v nexttrace) -j 1.1.1.1 \| head -3` |
