@@ -15,6 +15,7 @@ import (
 	"testing"
 
 	"golang.org/x/net/websocket"
+	"time"
 )
 
 // TestSignMiaoSpeedRequest 验证 MiaoSpeed 的 SHA-512 Challenge 计算。
@@ -748,5 +749,134 @@ proxies:
 
 	if len(nodes) != 2 || nodes[0].Name != "原生Meta节点1" || nodes[1].Name != "原生Meta节点2" {
 		t.Fatalf("解析出的节点不符合预期: %+v", nodes)
+	}
+}
+
+// TestParseTuicURI 验证 parseTuicURI 解析 TUIC URI 规范及参数构造。
+func TestParseTuicURI(t *testing.T) {
+	rawURI := "tuic://my-uuid-123:my-password-456@tuic.example.com:8444/?sni=tuic.example.com&alpn=h3&congestion_control=bbr&udp_relay_mode=native&allow_insecure=1#%F0%9F%87%AF%F0%9F%87%B5%E6%97%A5%E6%9C%AC-TUIC"
+	node, err := parseProxyURI(rawURI)
+	if err != nil {
+		t.Fatalf("解析 TUIC URI 失败: %v", err)
+	}
+
+	if node.Protocol != "tuic" || node.Server != "tuic.example.com:8444" || node.Name != "🇯🇵日本-TUIC" {
+		t.Fatalf("基础信息不符合预期: %+v", node)
+	}
+
+	p := node.Payload
+	if !strings.Contains(p, "type: tuic") {
+		t.Fatalf("Payload 缺少 type: tuic: %s", p)
+	}
+	if !strings.Contains(p, `uuid: "my-uuid-123"`) || !strings.Contains(p, `password: "my-password-456"`) {
+		t.Fatalf("Payload 缺少 uuid 或 password: %s", p)
+	}
+	if !strings.Contains(p, `sni: "tuic.example.com"`) {
+		t.Fatalf("Payload 缺少 sni: %s", p)
+	}
+	if !strings.Contains(p, "alpn:") || !strings.Contains(p, `"h3"`) {
+		t.Fatalf("Payload 缺少 alpn: %s", p)
+	}
+	if !strings.Contains(p, `congestion-controller: "bbr"`) || !strings.Contains(p, `udp-relay-mode: "native"`) {
+		t.Fatalf("Payload 缺少拥塞控制或 UDP 中继参数: %s", p)
+	}
+	if !strings.Contains(p, "skip-cert-verify: true") {
+		t.Fatalf("Payload 缺少 skip-cert-verify: %s", p)
+	}
+	if !strings.Contains(p, "udp: true") {
+		t.Fatalf("Payload 缺少 udp: true: %s", p)
+	}
+}
+
+// TestParseClashYAMLStandaloneDashAndSubarray 验证独立破折号与子数组缩进情况下的节点切分。
+func TestParseClashYAMLStandaloneDashAndSubarray(t *testing.T) {
+	sampleYAML := `
+mixed-port: 7890
+proxies:
+  -
+    name: '节点1-TUIC'
+    type: tuic
+    server: jp1.node.com
+    port: 8444
+    uuid: u-123
+    password: p-123
+    alpn:
+      - h3
+    congestion-controller: bbr
+  -
+    name: '节点2-HY2'
+    server: jp2.node.com
+    port: 443
+    type: hysteria2
+    password: p-456
+    ports: 20000-25000
+proxy-groups:
+`
+	nodes := parseClashYAMLProxies(sampleYAML)
+	if len(nodes) != 2 {
+		t.Fatalf("期望解析出 2 个节点，实际解析出 %d 个", len(nodes))
+	}
+
+	if nodes[0].Name != "节点1-TUIC" || nodes[0].Protocol != "tuic" || nodes[0].Server != "jp1.node.com:8444" {
+		t.Fatalf("节点 1 解析不符合预期: %+v", nodes[0])
+	}
+	if !strings.Contains(nodes[0].Payload, "alpn:\n  - h3") {
+		t.Fatalf("节点 1 子数组缩进被破坏: %s", nodes[0].Payload)
+	}
+
+	if nodes[1].Name != "节点2-HY2" || nodes[1].Protocol != "hysteria2" || nodes[1].Server != "jp2.node.com:443" {
+		t.Fatalf("节点 2 解析不符合预期: %+v", nodes[1])
+	}
+	if !strings.Contains(nodes[1].Payload, "ports: 20000-25000") {
+		t.Fatalf("节点 2 Payload 缺少 ports: %s", nodes[1].Payload)
+	}
+}
+
+// TestRunMiaospeedTuicLive 实测真实 TUIC 节点的 MiaoSpeed 连通性。
+func TestRunMiaospeedTuicLive(t *testing.T) {
+	if _, err := os.Stat("/tmp/miaospeed"); err != nil {
+		t.Skip("本地未找到 /tmp/miaospeed，跳过实机测速")
+	}
+
+	rawPayload := "name: \"TUIC-Test\"\ntype: tuic\nserver: jp4.mtf.llc\nport: 8444\nuuid: 74503f56-4b80-4017-a062-04c6d8a25527\npassword: 74503f56-4b80-4017-a062-04c6d8a25527\nskip-cert-verify: false\nalpn:\n  - h3\ncongestion-controller: bbr\nudp-relay-mode: native\n"
+	job := Job{
+		ID:     "live-tuic-01",
+		Kind:   "miaospeed",
+		Target: rawPayload,
+		Query:  "conn",
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+	res, raw, err := runMiaospeedJob(ctx, "/tmp/miaospeed", "", job, testLogger{t}, func(p Progress) {
+		t.Logf("Progress: %d/%d (%s)", p.Current, p.Total, p.NodeName)
+	})
+	if err != nil {
+		t.Fatalf("TUIC 测速失败: %v", err)
+	}
+	t.Logf("TUIC 测速结果: %s", res)
+	if !strings.Contains(string(raw), `"http_code":204`) {
+		t.Fatalf("期望 HTTP 204，实际: %s", string(raw))
+	}
+}
+
+// TestFetchMtfSubscriptionAllNodes 验证从真实的 mtf.llc 订阅中完整拉取全部 52 个节点（含 VLESS, HY2, TUIC）。
+func TestFetchMtfSubscriptionAllNodes(t *testing.T) {
+	subURL := "https://mtf.llc/s/87d9ad4e06304a12638ccfc9552274b5"
+	nodes, err := fetchAndParseSubscription(context.Background(), subURL)
+	if err != nil {
+		t.Fatalf("拉取 mtf 订阅失败: %v", err)
+	}
+
+	if len(nodes) != 52 {
+		t.Fatalf("期望拉取 52 个节点，实际拉取 %d 个节点", len(nodes))
+	}
+
+	protoCounts := make(map[string]int)
+	for _, n := range nodes {
+		protoCounts[n.Protocol]++
+	}
+	t.Logf("52 个节点协议分布: %+v", protoCounts)
+	if protoCounts["tuic"] != 13 || protoCounts["vless"] != 13 || protoCounts["hysteria2"] != 26 {
+		t.Fatalf("协议分布不符合预期: %+v", protoCounts)
 	}
 }

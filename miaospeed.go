@@ -436,15 +436,17 @@ func parseClashYAMLProxies(content string) []MiaospeedNode {
 	lines := strings.Split(content, "\n")
 	var nodes []MiaospeedNode
 	inProxies := false
+	baseIndent := -1
 
 	var currentItem strings.Builder
 	currentName := ""
 	currentType := ""
 	currentServer := ""
 	currentPort := ""
+	inItem := false
 
 	flushItem := func() {
-		if currentItem.Len() > 0 {
+		if inItem && currentItem.Len() > 0 {
 			payload := strings.TrimSpace(currentItem.String())
 			if currentName != "" && payload != "" {
 				srv := currentServer
@@ -458,12 +460,13 @@ func parseClashYAMLProxies(content string) []MiaospeedNode {
 					Payload:  payload,
 				})
 			}
-			currentItem.Reset()
-			currentName = ""
-			currentType = ""
-			currentServer = ""
-			currentPort = ""
 		}
+		currentItem.Reset()
+		currentName = ""
+		currentType = ""
+		currentServer = ""
+		currentPort = ""
+		inItem = false
 	}
 
 	for _, line := range lines {
@@ -478,9 +481,17 @@ func parseClashYAMLProxies(content string) []MiaospeedNode {
 				flushItem()
 				break
 			}
+			if trimmed == "" || strings.HasPrefix(trimmed, "#") {
+				continue
+			}
+
+			// 计算当前行前置空白缩进
+			indent := len(line) - len(strings.TrimLeft(line, " \t"))
+
 			// 单行格式: - {name: ..., server: ..., ...}
 			if strings.HasPrefix(trimmed, "- {") && strings.HasSuffix(trimmed, "}") {
 				flushItem()
+				baseIndent = indent
 				rawItem := strings.TrimSpace(strings.TrimPrefix(trimmed, "-"))
 				name := extractField(rawItem, "name")
 				pType := extractField(rawItem, "type")
@@ -501,46 +512,55 @@ func parseClashYAMLProxies(content string) []MiaospeedNode {
 				continue
 			}
 
-			// 多行缩进格式：新节点以 "- " 开头
-			if strings.HasPrefix(trimmed, "- ") {
+			// 判断是否是列表新项：前缀为 "-"，且其缩进等于 baseIndent（或初次确定 baseIndent）
+			isNewItem := false
+			if strings.HasPrefix(trimmed, "-") {
+				if baseIndent == -1 {
+					baseIndent = indent
+					isNewItem = true
+				} else if indent == baseIndent {
+					isNewItem = true
+				}
+			}
+
+			if isNewItem {
 				flushItem()
+				inItem = true
 				contentAfterDash := strings.TrimSpace(strings.TrimPrefix(trimmed, "-"))
-				currentItem.WriteString(contentAfterDash + "\n")
-				if idx := strings.Index(contentAfterDash, ":"); idx != -1 {
-					k := strings.ToLower(strings.TrimSpace(contentAfterDash[:idx]))
-					v := strings.Trim(strings.TrimSpace(contentAfterDash[idx+1:]), "\"'")
-					switch k {
-					case "name":
-						currentName = v
-					case "type":
-						currentType = v
-					case "server":
-						currentServer = v
-					case "port":
-						currentPort = v
-					}
+				if contentAfterDash != "" {
+					currentItem.WriteString(contentAfterDash + "\n")
+					parseLineKeyValue(contentAfterDash, &currentName, &currentType, &currentServer, &currentPort)
 				}
-			} else if currentItem.Len() > 0 && (strings.HasPrefix(line, " ") || strings.HasPrefix(line, "\t")) {
-				currentItem.WriteString(trimmed + "\n")
-				if idx := strings.Index(trimmed, ":"); idx != -1 {
-					k := strings.ToLower(strings.TrimSpace(trimmed[:idx]))
-					v := strings.Trim(strings.TrimSpace(trimmed[idx+1:]), "\"'")
-					switch k {
-					case "name":
-						currentName = v
-					case "type":
-						currentType = v
-					case "server":
-						currentServer = v
-					case "port":
-						currentPort = v
-					}
+			} else if inItem {
+				// 保持子项的相对缩进
+				relIndent := indent - (baseIndent + 2)
+				if relIndent < 0 {
+					relIndent = 0
 				}
+				currentItem.WriteString(strings.Repeat(" ", relIndent) + trimmed + "\n")
+				parseLineKeyValue(trimmed, &currentName, &currentType, &currentServer, &currentPort)
 			}
 		}
 	}
 	flushItem()
 	return nodes
+}
+
+func parseLineKeyValue(line string, name, pType, server, port *string) {
+	if idx := strings.Index(line, ":"); idx != -1 {
+		k := strings.ToLower(strings.TrimSpace(line[:idx]))
+		v := strings.Trim(strings.TrimSpace(line[idx+1:]), "\"'")
+		switch k {
+		case "name":
+			*name = v
+		case "type":
+			*pType = v
+		case "server":
+			*server = v
+		case "port":
+			*port = v
+		}
+	}
 }
 
 // extractField 从单行 YAML 项（如 {name: '...', type: hysteria2}）中安全提取指定键对应的值。
@@ -662,11 +682,13 @@ func parseProxyURI(rawURI string) (*MiaospeedNode, error) {
 		return parseVmessURI(rawURI)
 	case "trojan":
 		return parseTrojanURI(u)
-	case "vless":
-		return parseVlessURI(u)
-	case "hysteria2", "hy2":
-		return parseHysteria2URI(u)
-	default:
+		case "vless":
+			return parseVlessURI(u)
+		case "hysteria2", "hy2":
+			return parseHysteria2URI(u)
+		case "tuic":
+			return parseTuicURI(u)
+		default:
 		return nil, fmt.Errorf("不支持的代理协议：%s", u.Scheme)
 	}
 }
@@ -1062,9 +1084,85 @@ func parseHysteria2URI(u *url.URL) (*MiaospeedNode, error) {
 		sb.WriteString(fmt.Sprintf("alpn:\n  - %s\n", quoteYAML(alpn)))
 	}
 
+		return &MiaospeedNode{
+			Name:     name,
+			Protocol: "hysteria2",
+			Server:   fmt.Sprintf("%s:%d", server, port),
+			Port:     port,
+			Payload:  sb.String(),
+		}, nil
+	}
+
+func parseTuicURI(u *url.URL) (*MiaospeedNode, error) {
+	name := u.Fragment
+	if name == "" {
+		name = "TUIC-Node"
+	}
+	name, _ = url.QueryUnescape(name)
+	uuid := ""
+	password := ""
+	if u.User != nil {
+		uuid = u.User.Username()
+		if p, ok := u.User.Password(); ok {
+			password = p
+		}
+	}
+	server := u.Hostname()
+	port, _ := strconv.Atoi(u.Port())
+	if port == 0 {
+		port = 8443
+	}
+	q := u.Query()
+	if password == "" {
+		password = q.Get("password")
+	}
+	sni := q.Get("sni")
+	if sni == "" {
+		sni = q.Get("peer")
+	}
+	alpn := q.Get("alpn")
+	insecure := q.Get("insecure")
+	if insecure == "" {
+		insecure = q.Get("allow_insecure")
+	}
+	if insecure == "" {
+		insecure = q.Get("allowInsecure")
+	}
+	congestion := q.Get("congestion_control")
+	if congestion == "" {
+		congestion = q.Get("congestion")
+	}
+	if congestion == "" {
+		congestion = "bbr"
+	}
+	udpRelay := q.Get("udp_relay_mode")
+	if udpRelay == "" {
+		udpRelay = q.Get("udp_relay")
+	}
+	if udpRelay == "" {
+		udpRelay = "native"
+	}
+
+	var sb strings.Builder
+	sb.WriteString(fmt.Sprintf("name: %s\ntype: tuic\nserver: %s\nport: %d\nuuid: %s\npassword: %s\nudp: true\n",
+		quoteYAML(name), server, port, quoteYAML(uuid), quoteYAML(password)))
+	if sni != "" {
+		sb.WriteString(fmt.Sprintf("sni: %s\n", quoteYAML(sni)))
+	}
+	if alpn != "" {
+		sb.WriteString(fmt.Sprintf("alpn:\n  - %s\n", quoteYAML(alpn)))
+	} else {
+		sb.WriteString("alpn:\n  - h3\n")
+	}
+	if insecure == "1" || strings.EqualFold(insecure, "true") {
+		sb.WriteString("skip-cert-verify: true\n")
+	}
+	sb.WriteString(fmt.Sprintf("congestion-controller: %s\n", quoteYAML(congestion)))
+	sb.WriteString(fmt.Sprintf("udp-relay-mode: %s\n", quoteYAML(udpRelay)))
+
 	return &MiaospeedNode{
 		Name:     name,
-		Protocol: "hysteria2",
+		Protocol: "tuic",
 		Server:   fmt.Sprintf("%s:%d", server, port),
 		Port:     port,
 		Payload:  sb.String(),
