@@ -1354,8 +1354,14 @@ func parseSingleSlot(slot slaveEntrySlot, node *MiaospeedNode, plan miaospeedTes
 			rep.UDPType = parseMatrixString(m.Payload)
 		case matrixInboundGeoIP:
 			_, rep.InboundGeo = parseMatrixGeo(m.Payload)
+			if rep.InboundGeo == rep.NodeName || rep.InboundGeo == rep.Server {
+				rep.InboundGeo = ""
+			}
 		case matrixOutboundGeoIP:
 			rep.OutboundIP, rep.OutboundGeo = parseMatrixGeo(m.Payload)
+			if rep.OutboundGeo == rep.NodeName || rep.OutboundGeo == rep.Server {
+				rep.OutboundGeo = ""
+			}
 		case matrixHijack:
 			rep.Hijack = parseMatrixHijack(m.Payload)
 		case matrixAverageSpeed:
@@ -1475,57 +1481,55 @@ func parseMatrixGeo(payload string) (ip, geo string) {
 	if payload == "" {
 		return "", ""
 	}
-	var stacks struct {
-		Domain    string `json:"Domain"`
-		MainStack *struct {
-			Country string `json:"country"`
-			ISP     string `json:"isp"`
-			IP      string `json:"ip"`
-		} `json:"MainStack"`
-		IPv4Stack []*struct {
-			Country string `json:"country"`
-			ISP     string `json:"isp"`
-			IP      string `json:"ip"`
-		} `json:"IPv4Stack"`
-		IPv6Stack []*struct {
-			Country string `json:"country"`
-			ISP     string `json:"isp"`
-			IP      string `json:"ip"`
-		} `json:"IPv6Stack"`
-	}
-	if err := json.Unmarshal([]byte(payload), &stacks); err == nil {
-		var targetGeo *struct {
-			Country string `json:"country"`
-			ISP     string `json:"isp"`
-			IP      string `json:"ip"`
+	if strings.HasPrefix(payload, "{") {
+		var stacks struct {
+			Domain    string `json:"Domain"`
+			MainStack *struct {
+				Country string `json:"country"`
+				ISP     string `json:"isp"`
+				IP      string `json:"ip"`
+			} `json:"MainStack"`
+			IPv4Stack []*struct {
+				Country string `json:"country"`
+				ISP     string `json:"isp"`
+				IP      string `json:"ip"`
+			} `json:"IPv4Stack"`
+			IPv6Stack []*struct {
+				Country string `json:"country"`
+				ISP     string `json:"isp"`
+				IP      string `json:"ip"`
+			} `json:"IPv6Stack"`
 		}
-		if len(stacks.IPv4Stack) > 0 && stacks.IPv4Stack[0] != nil {
-			targetGeo = stacks.IPv4Stack[0]
-		} else if len(stacks.IPv6Stack) > 0 && stacks.IPv6Stack[0] != nil {
-			targetGeo = stacks.IPv6Stack[0]
-		} else if stacks.MainStack != nil {
-			targetGeo = stacks.MainStack
-		}
+		if err := json.Unmarshal([]byte(payload), &stacks); err == nil {
+			var targetGeo *struct {
+				Country string `json:"country"`
+				ISP     string `json:"isp"`
+				IP      string `json:"ip"`
+			}
+			if len(stacks.IPv4Stack) > 0 && stacks.IPv4Stack[0] != nil {
+				targetGeo = stacks.IPv4Stack[0]
+			} else if len(stacks.IPv6Stack) > 0 && stacks.IPv6Stack[0] != nil {
+				targetGeo = stacks.IPv6Stack[0]
+			} else if stacks.MainStack != nil {
+				targetGeo = stacks.MainStack
+			}
 
-		if targetGeo != nil {
-			ip = targetGeo.IP
-			parts := make([]string, 0, 2)
-			if targetGeo.Country != "" {
-				parts = append(parts, targetGeo.Country)
+			if targetGeo != nil {
+				ip = targetGeo.IP
+				parts := make([]string, 0, 2)
+				if targetGeo.Country != "" {
+					parts = append(parts, targetGeo.Country)
+				}
+				if targetGeo.ISP != "" && targetGeo.ISP != targetGeo.Country {
+					parts = append(parts, targetGeo.ISP)
+				}
+				if len(parts) > 0 {
+					geo = strings.Join(parts, " ")
+				}
 			}
-			if targetGeo.ISP != "" && targetGeo.ISP != targetGeo.Country {
-				parts = append(parts, targetGeo.ISP)
-			}
-			if len(parts) > 0 {
-				geo = strings.Join(parts, " ")
-			}
-		}
-		if geo == "" && stacks.Domain != "" {
-			geo = stacks.Domain
-		}
-		if ip != "" || geo != "" {
 			return ip, geo
 		}
+		return "", ""
 	}
 	return "", payload
 }

@@ -486,3 +486,36 @@ func TestAutoInstallMiaospeedWithProxy(t *testing.T) {
 		t.Fatalf("代理请求的不是 release 资源包: %s", requestedURLs[0])
 	}
 }
+
+// TestParseMatrixGeoWithoutGeoIP 验证当节点不可用且仅包含 Domain 时不应错误识别为 Geo。
+func TestParseMatrixGeoWithoutGeoIP(t *testing.T) {
+	dummyPayload := `{"Domain":"🚫 账号已被删除或不存在"}`
+	ip, geo := parseMatrixGeo(dummyPayload)
+	if ip != "" || geo != "" {
+		t.Fatalf("无有效 GeoIP 栈时期望空值，实际 ip=%q geo=%q", ip, geo)
+	}
+
+	validPayload := `{"MainStack":{"country":"Japan","isp":"SoftBank","ip":"1.2.3.4"}}`
+	ip, geo = parseMatrixGeo(validPayload)
+	if ip != "1.2.3.4" || geo != "Japan SoftBank" {
+		t.Fatalf("有效 GeoIP 解析异常，实际 ip=%q geo=%q", ip, geo)
+	}
+}
+
+// TestParseSingleSlotFiltersDummyGeo 验证当出口与节点名称相同时自动清理。
+func TestParseSingleSlotFiltersDummyGeo(t *testing.T) {
+	node := &MiaospeedNode{
+		Name:     "🚫 账号已被删除或不存在",
+		Protocol: "vless",
+		Server:   "jz.ov0.kdns.fr",
+	}
+	slot := slaveEntrySlot{
+		Matrices: []matrixResponse{
+			{Type: matrixOutboundGeoIP, Payload: `{"Domain":"🚫 账号已被删除或不存在"}`},
+		},
+	}
+	rep := parseSingleSlot(slot, node, miaospeedTestPlan{})
+	if rep.OutboundGeo != "" {
+		t.Fatalf("同名出口信息期望被过滤为空，实际: %q", rep.OutboundGeo)
+	}
+}
