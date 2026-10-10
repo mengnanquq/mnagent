@@ -678,6 +678,8 @@ func parseProxyURI(rawURI string) (*MiaospeedNode, error) {
 	switch strings.ToLower(u.Scheme) {
 	case "ss":
 		return parseShadowsocksURI(rawURI, u)
+	case "ssr":
+		return parseSSRURI(rawURI)
 	case "vmess":
 		return parseVmessURI(rawURI)
 	case "trojan":
@@ -686,8 +688,14 @@ func parseProxyURI(rawURI string) (*MiaospeedNode, error) {
 		return parseVlessURI(u)
 	case "hysteria2", "hy2":
 		return parseHysteria2URI(u)
+	case "hysteria", "hy":
+		return parseHysteria1URI(u)
 	case "tuic":
 		return parseTuicURI(u)
+	case "socks5", "socks":
+		return parseSocks5URI(u)
+	case "snell":
+		return parseSnellURI(u)
 	default:
 		return nil, fmt.Errorf("不支持的代理协议：%s", u.Scheme)
 	}
@@ -767,20 +775,29 @@ func parseShadowsocksURI(rawURI string, u *url.URL) (*MiaospeedNode, error) {
 		return nil, errors.New("无效的 Shadowsocks 节点配置")
 	}
 
-	payload := fmt.Sprintf("name: %s\ntype: ss\nserver: %s\nport: %d\ncipher: %s\npassword: %s\n",
-		quoteYAML(name), host, port, method, quoteYAML(password))
+	var sb strings.Builder
+	sb.WriteString(fmt.Sprintf("name: %s\ntype: ss\nserver: %s\nport: %d\ncipher: %s\npassword: %s\nudp: true\n",
+		quoteYAML(name), host, port, method, quoteYAML(password)))
+	if plugin := u.Query().Get("plugin"); plugin != "" {
+		parts := strings.SplitN(plugin, ";", 2)
+		sb.WriteString(fmt.Sprintf("plugin: %s\n", quoteYAML(parts[0])))
+		if len(parts) > 1 && parts[1] != "" {
+			sb.WriteString(fmt.Sprintf("plugin-opts:\n  opts: %s\n", quoteYAML(parts[1])))
+		}
+	}
 
 	return &MiaospeedNode{
 		Name:     name,
 		Protocol: "ss",
 		Server:   fmt.Sprintf("%s:%d", host, port),
 		Port:     port,
-		Payload:  payload,
+		Payload:  sb.String(),
 	}, nil
 }
 
 func decodeBase64Safe(s string) ([]byte, error) {
 	s = strings.TrimSpace(s)
+	s = strings.TrimRight(s, "/")
 	if d, err := base64.StdEncoding.DecodeString(s); err == nil {
 		return d, nil
 	}
@@ -818,31 +835,56 @@ func parseVmessURI(rawURI string) (*MiaospeedNode, error) {
 	if cipher == "" {
 		cipher = "auto"
 	}
-	netType := getString(v, "net")
+	netType := strings.ToLower(getString(v, "net"))
 	if netType == "" {
 		netType = "tcp"
 	}
-	tls := getString(v, "tls") == "tls"
+	tls := strings.EqualFold(getString(v, "tls"), "tls")
 	host := getString(v, "host")
 	path := getString(v, "path")
 	sni := getString(v, "sni")
+	fp := getString(v, "fp")
+	alpn := getString(v, "alpn")
 
 	var sb strings.Builder
-	sb.WriteString(fmt.Sprintf("name: %s\ntype: vmess\nserver: %s\nport: %d\nuuid: %s\nalterId: %d\ncipher: %s\nnetwork: %s\n",
+	sb.WriteString(fmt.Sprintf("name: %s\ntype: vmess\nserver: %s\nport: %d\nuuid: %s\nalterId: %d\ncipher: %s\nnetwork: %s\nudp: true\n",
 		quoteYAML(name), server, port, uuid, alterID, cipher, netType))
 	if tls {
 		sb.WriteString("tls: true\n")
 		if sni != "" {
 			sb.WriteString(fmt.Sprintf("servername: %s\n", quoteYAML(sni)))
 		}
+		if fp != "" {
+			sb.WriteString(fmt.Sprintf("client-fingerprint: %s\n", quoteYAML(fp)))
+		}
+		if alpn != "" {
+			sb.WriteString(fmt.Sprintf("alpn:\n  - %s\n", quoteYAML(alpn)))
+		}
 	}
-	if netType == "ws" {
+	switch netType {
+	case "ws":
 		sb.WriteString("ws-opts:\n")
 		if path != "" {
 			sb.WriteString(fmt.Sprintf("  path: %s\n", quoteYAML(path)))
 		}
 		if host != "" {
 			sb.WriteString(fmt.Sprintf("  headers:\n    Host: %s\n", quoteYAML(host)))
+		}
+	case "grpc":
+		svcName := path
+		if svcName == "" {
+			svcName = host
+		}
+		if svcName != "" {
+			sb.WriteString(fmt.Sprintf("grpc-opts:\n  grpc-service-name: %s\n", quoteYAML(svcName)))
+		}
+	case "h2", "http":
+		sb.WriteString("h2-opts:\n")
+		if path != "" {
+			sb.WriteString(fmt.Sprintf("  path: %s\n", quoteYAML(path)))
+		}
+		if host != "" {
+			sb.WriteString(fmt.Sprintf("  host:\n    - %s\n", quoteYAML(host)))
 		}
 	}
 
@@ -1163,6 +1205,230 @@ func parseTuicURI(u *url.URL) (*MiaospeedNode, error) {
 	return &MiaospeedNode{
 		Name:     name,
 		Protocol: "tuic",
+		Server:   fmt.Sprintf("%s:%d", server, port),
+		Port:     port,
+		Payload:  sb.String(),
+	}, nil
+}
+
+func parseSSRURI(rawURI string) (*MiaospeedNode, error) {
+	b64 := strings.TrimPrefix(rawURI, "ssr://")
+	b64 = strings.TrimPrefix(b64, "SSR://")
+	data, err := decodeBase64Safe(b64)
+	if err != nil {
+		return nil, fmt.Errorf("解码 SSR 配置失败: %w", err)
+	}
+	str := string(data)
+
+	// 格式: host:port:protocol:method:obfs:base64(password)/?params
+	var paramPart string
+	if idx := strings.Index(str, "/?"); idx != -1 {
+		paramPart = str[idx+2:]
+		str = str[:idx]
+	}
+	parts := strings.Split(str, ":")
+	if len(parts) < 6 {
+		return nil, fmt.Errorf("无效的 SSR 配置格式: %s", str)
+	}
+	host := parts[0]
+	port, _ := strconv.Atoi(parts[1])
+	protocol := parts[2]
+	method := parts[3]
+	obfs := parts[4]
+	password := parts[5]
+	if passBytes, err := decodeBase64Safe(parts[5]); err == nil && len(passBytes) > 0 {
+		password = string(passBytes)
+	}
+
+	name := "SSR-Node"
+	obfsParam := ""
+	protoParam := ""
+	if paramPart != "" {
+		if q, err := url.ParseQuery(paramPart); err == nil {
+			if r := q.Get("remarks"); r != "" {
+				if rDec, err := decodeBase64Safe(r); err == nil && len(rDec) > 0 {
+					name = string(rDec)
+				}
+			}
+			if op := q.Get("obfsparam"); op != "" {
+				if opDec, err := decodeBase64Safe(op); err == nil && len(opDec) > 0 {
+					obfsParam = string(opDec)
+				}
+			}
+			if pp := q.Get("protoparam"); pp != "" {
+				if ppDec, err := decodeBase64Safe(pp); err == nil && len(ppDec) > 0 {
+					protoParam = string(ppDec)
+				}
+			}
+		}
+	}
+
+	var sb strings.Builder
+	sb.WriteString(fmt.Sprintf("name: %s\ntype: ssr\nserver: %s\nport: %d\ncipher: %s\npassword: %s\nprotocol: %s\nobfs: %s\nudp: true\n",
+		quoteYAML(name), host, port, method, quoteYAML(password), protocol, obfs))
+	if obfsParam != "" {
+		sb.WriteString(fmt.Sprintf("obfs-param: %s\n", quoteYAML(obfsParam)))
+	}
+	if protoParam != "" {
+		sb.WriteString(fmt.Sprintf("protocol-param: %s\n", quoteYAML(protoParam)))
+	}
+
+	return &MiaospeedNode{
+		Name:     name,
+		Protocol: "ssr",
+		Server:   fmt.Sprintf("%s:%d", host, port),
+		Port:     port,
+		Payload:  sb.String(),
+	}, nil
+}
+
+func parseHysteria1URI(u *url.URL) (*MiaospeedNode, error) {
+	name := u.Fragment
+	if name == "" {
+		name = "Hysteria-Node"
+	}
+	name, _ = url.QueryUnescape(name)
+	server := u.Hostname()
+	port, _ := strconv.Atoi(u.Port())
+	if port == 0 {
+		port = 443
+	}
+	q := u.Query()
+	auth := q.Get("auth")
+	if auth == "" && u.User != nil {
+		auth = u.User.Username()
+	}
+	protocol := q.Get("protocol")
+	if protocol == "" {
+		protocol = "udp"
+	}
+	up := q.Get("up")
+	if up == "" {
+		up = q.Get("upmbps")
+	}
+	down := q.Get("down")
+	if down == "" {
+		down = q.Get("downmbps")
+	}
+	alpn := q.Get("alpn")
+	sni := q.Get("sni")
+	if sni == "" {
+		sni = q.Get("peer")
+	}
+	insecure := q.Get("insecure")
+	if insecure == "" {
+		insecure = q.Get("allow_insecure")
+	}
+	if insecure == "" {
+		insecure = q.Get("allowInsecure")
+	}
+
+	var sb strings.Builder
+	sb.WriteString(fmt.Sprintf("name: %s\ntype: hysteria\nserver: %s\nport: %d\nprotocol: %s\n",
+		quoteYAML(name), server, port, protocol))
+	if auth != "" {
+		sb.WriteString(fmt.Sprintf("auth-str: %s\n", quoteYAML(auth)))
+	}
+	if up != "" {
+		sb.WriteString(fmt.Sprintf("up: %s\n", quoteYAML(up)))
+	}
+	if down != "" {
+		sb.WriteString(fmt.Sprintf("down: %s\n", quoteYAML(down)))
+	}
+	if sni != "" {
+		sb.WriteString(fmt.Sprintf("sni: %s\n", quoteYAML(sni)))
+	}
+	if alpn != "" {
+		sb.WriteString(fmt.Sprintf("alpn:\n  - %s\n", quoteYAML(alpn)))
+	}
+	if insecure == "1" || strings.EqualFold(insecure, "true") {
+		sb.WriteString("skip-cert-verify: true\n")
+	}
+
+	return &MiaospeedNode{
+		Name:     name,
+		Protocol: "hysteria",
+		Server:   fmt.Sprintf("%s:%d", server, port),
+		Port:     port,
+		Payload:  sb.String(),
+	}, nil
+}
+
+func parseSocks5URI(u *url.URL) (*MiaospeedNode, error) {
+	name := u.Fragment
+	if name == "" {
+		name = "Socks5-Node"
+	}
+	name, _ = url.QueryUnescape(name)
+	server := u.Hostname()
+	port, _ := strconv.Atoi(u.Port())
+	if port == 0 {
+		port = 1080
+	}
+	var username, password string
+	if u.User != nil {
+		username = u.User.Username()
+		password, _ = u.User.Password()
+	}
+
+	var sb strings.Builder
+	sb.WriteString(fmt.Sprintf("name: %s\ntype: socks5\nserver: %s\nport: %d\nudp: true\n",
+		quoteYAML(name), server, port))
+	if username != "" {
+		sb.WriteString(fmt.Sprintf("username: %s\n", quoteYAML(username)))
+	}
+	if password != "" {
+		sb.WriteString(fmt.Sprintf("password: %s\n", quoteYAML(password)))
+	}
+
+	return &MiaospeedNode{
+		Name:     name,
+		Protocol: "socks5",
+		Server:   fmt.Sprintf("%s:%d", server, port),
+		Port:     port,
+		Payload:  sb.String(),
+	}, nil
+}
+
+func parseSnellURI(u *url.URL) (*MiaospeedNode, error) {
+	name := u.Fragment
+	if name == "" {
+		name = "Snell-Node"
+	}
+	name, _ = url.QueryUnescape(name)
+	server := u.Hostname()
+	port, _ := strconv.Atoi(u.Port())
+	if port == 0 {
+		port = 443
+	}
+	q := u.Query()
+	psk := q.Get("psk")
+	if psk == "" && u.User != nil {
+		psk = u.User.Username()
+	}
+	version := q.Get("version")
+	if version == "" {
+		version = "4"
+	}
+	obfs := q.Get("obfs")
+	obfsHost := q.Get("host")
+
+	var sb strings.Builder
+	sb.WriteString(fmt.Sprintf("name: %s\ntype: snell\nserver: %s\nport: %d\npsk: %s\nversion: %s\nudp: true\n",
+		quoteYAML(name), server, port, quoteYAML(psk), version))
+	if obfs != "" || obfsHost != "" {
+		sb.WriteString("obfs-opts:\n")
+		if obfs != "" {
+			sb.WriteString(fmt.Sprintf("  mode: %s\n", quoteYAML(obfs)))
+		}
+		if obfsHost != "" {
+			sb.WriteString(fmt.Sprintf("  host: %s\n", quoteYAML(obfsHost)))
+		}
+	}
+
+	return &MiaospeedNode{
+		Name:     name,
+		Protocol: "snell",
 		Server:   fmt.Sprintf("%s:%d", server, port),
 		Port:     port,
 		Payload:  sb.String(),

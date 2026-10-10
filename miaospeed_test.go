@@ -859,7 +859,7 @@ func TestRunMiaospeedTuicLive(t *testing.T) {
 	}
 }
 
-// TestFetchMtfSubscriptionAllNodes 验证从真实的 mtf.llc 订阅中完整拉取全部 52 个节点（含 VLESS, HY2, TUIC）。
+// TestFetchMtfSubscriptionAllNodes 验证从真实的 mtf.llc 订阅中完整拉取全部节点（含 VLESS, HY2, TUIC）。
 func TestFetchMtfSubscriptionAllNodes(t *testing.T) {
 	subURL := "https://mtf.llc/s/87d9ad4e06304a12638ccfc9552274b5"
 	nodes, err := fetchAndParseSubscription(context.Background(), subURL)
@@ -870,16 +870,168 @@ func TestFetchMtfSubscriptionAllNodes(t *testing.T) {
 		t.Fatalf("拉取 mtf 订阅失败: %v", err)
 	}
 
-	if len(nodes) != 52 {
-		t.Fatalf("期望拉取 52 个节点，实际拉取 %d 个节点", len(nodes))
+	// 上游机场节点数量可能变动，只校验不少于 40 个且三种协议均存在
+	if len(nodes) < 40 {
+		t.Fatalf("期望至少拉取 40 个节点，实际拉取 %d 个节点", len(nodes))
 	}
 
 	protoCounts := make(map[string]int)
 	for _, n := range nodes {
 		protoCounts[n.Protocol]++
 	}
-	t.Logf("52 个节点协议分布: %+v", protoCounts)
-	if protoCounts["tuic"] != 13 || protoCounts["vless"] != 13 || protoCounts["hysteria2"] != 26 {
-		t.Fatalf("协议分布不符合预期: %+v", protoCounts)
+	t.Logf("订阅节点协议分布: %+v", protoCounts)
+	if protoCounts["tuic"] == 0 || protoCounts["vless"] == 0 || protoCounts["hysteria2"] == 0 {
+		t.Fatalf("协议分布不完整: %+v", protoCounts)
+	}
+}
+
+// TestParseSSRURI 验证 ShadowsocksR URI 解析（含 remarks/obfsparam/protoparam）。
+func TestParseSSRURI(t *testing.T) {
+	// SSR 标准格式：host:port:protocol:method:obfs:base64(password)/?remarks=base64&obfsparam=base64&protoparam=base64
+	inner := "1.2.3.4:8388:auth_aes128_md5:aes-128-cfb:tls1.2_ticket_auth:" +
+		base64.URLEncoding.EncodeToString([]byte("pass123")) +
+		"/?remarks=" + base64.URLEncoding.EncodeToString([]byte("香港SSR")) +
+		"&obfsparam=" + base64.URLEncoding.EncodeToString([]byte("bing.com")) +
+		"&protoparam=" + base64.URLEncoding.EncodeToString([]byte("123456"))
+	uri := "ssr://" + base64.URLEncoding.EncodeToString([]byte(inner))
+
+	node, err := parseProxyURI(uri)
+	if err != nil {
+		t.Fatalf("解析 SSR 失败: %v", err)
+	}
+	if node.Protocol != "ssr" || node.Server != "1.2.3.4:8388" || node.Name != "香港SSR" {
+		t.Fatalf("基础信息不符合预期: %+v", node)
+	}
+	p := node.Payload
+	if !strings.Contains(p, "type: ssr") || !strings.Contains(p, "cipher: aes-128-cfb") || !strings.Contains(p, `password: "pass123"`) {
+		t.Fatalf("Payload 缺少核心字段: %s", p)
+	}
+	if !strings.Contains(p, "protocol: auth_aes128_md5") || !strings.Contains(p, "obfs: tls1.2_ticket_auth") {
+		t.Fatalf("Payload 缺少协议或混淆: %s", p)
+	}
+	if !strings.Contains(p, `obfs-param: "bing.com"`) || !strings.Contains(p, `protocol-param: "123456"`) {
+		t.Fatalf("Payload 缺少参数: %s", p)
+	}
+	if !strings.Contains(p, "udp: true") {
+		t.Fatalf("Payload 缺少 udp: %s", p)
+	}
+}
+
+// TestParseHysteria1URI 验证 Hysteria v1 URI 解析。
+func TestParseHysteria1URI(t *testing.T) {
+	uri := "hysteria://hy1.node.com:443?auth=secret123&upmbps=100&downmbps=200&peer=hy1.node.com&insecure=1&alpn=h3#HY1-Test"
+	node, err := parseProxyURI(uri)
+	if err != nil {
+		t.Fatalf("解析 Hysteria1 失败: %v", err)
+	}
+	if node.Protocol != "hysteria" || node.Server != "hy1.node.com:443" || node.Name != "HY1-Test" {
+		t.Fatalf("基础信息不符合预期: %+v", node)
+	}
+	p := node.Payload
+	if !strings.Contains(p, "type: hysteria") || !strings.Contains(p, "protocol: udp") {
+		t.Fatalf("Payload 缺少协议信息: %s", p)
+	}
+	if !strings.Contains(p, `auth-str: "secret123"`) || !strings.Contains(p, `up: "100"`) || !strings.Contains(p, `down: "200"`) {
+		t.Fatalf("Payload 缺少 auth/up/down: %s", p)
+	}
+	if !strings.Contains(p, `sni: "hy1.node.com"`) || !strings.Contains(p, "skip-cert-verify: true") {
+		t.Fatalf("Payload 缺少 TLS 配置: %s", p)
+	}
+}
+
+// TestParseSocks5URI 验证 SOCKS5 URI 解析。
+func TestParseSocks5URI(t *testing.T) {
+	uri := "socks5://admin:123456@proxy.lan:1080#Local-Socks5"
+	node, err := parseProxyURI(uri)
+	if err != nil {
+		t.Fatalf("解析 Socks5 失败: %v", err)
+	}
+	if node.Protocol != "socks5" || node.Server != "proxy.lan:1080" || node.Name != "Local-Socks5" {
+		t.Fatalf("基础信息不符合预期: %+v", node)
+	}
+	p := node.Payload
+	if !strings.Contains(p, "type: socks5") || !strings.Contains(p, `username: "admin"`) || !strings.Contains(p, `password: "123456"`) {
+		t.Fatalf("Payload 缺少认证信息: %s", p)
+	}
+	if !strings.Contains(p, "udp: true") {
+		t.Fatalf("Payload 缺少 udp: %s", p)
+	}
+}
+
+// TestParseSnellURI 验证 Snell URI 解析。
+func TestParseSnellURI(t *testing.T) {
+	uri := "snell://snell.node.com:443?psk=mysnellsecret&version=4&obfs=http&host=bing.com#Snell-Test"
+	node, err := parseProxyURI(uri)
+	if err != nil {
+		t.Fatalf("解析 Snell 失败: %v", err)
+	}
+	if node.Protocol != "snell" || node.Server != "snell.node.com:443" || node.Name != "Snell-Test" {
+		t.Fatalf("基础信息不符合预期: %+v", node)
+	}
+	p := node.Payload
+	if !strings.Contains(p, "type: snell") || !strings.Contains(p, `psk: "mysnellsecret"`) || !strings.Contains(p, "version: 4") {
+		t.Fatalf("Payload 缺少核心字段: %s", p)
+	}
+	if !strings.Contains(p, "obfs-opts:") || !strings.Contains(p, `mode: "http"`) || !strings.Contains(p, `host: "bing.com"`) {
+		t.Fatalf("Payload 缺少 obfs-opts: %s", p)
+	}
+}
+
+// TestParseVMessEnhanced 验证 VMess 解析增强（gRPC、指纹、UDP）。
+func TestParseVMessEnhanced(t *testing.T) {
+	v := map[string]any{
+		"v":    "2",
+		"ps":   "JP-VMess-gRPC",
+		"add":  "grpc.jp.example",
+		"port": 443,
+		"id":   "b831381d-6324-4d53-ad4f-8cda48b30811",
+		"aid":  0,
+		"scy":  "auto",
+		"net":  "grpc",
+		"tls":  "tls",
+		"path": "my-grpc-svc",
+		"host": "grpc.jp.example",
+		"sni":  "grpc.jp.example",
+		"fp":   "chrome",
+	}
+	b, _ := json.Marshal(v)
+	uri := "vmess://" + base64.StdEncoding.EncodeToString(b)
+	node, err := parseProxyURI(uri)
+	if err != nil {
+		t.Fatalf("解析 VMess 失败: %v", err)
+	}
+	if node.Protocol != "vmess" || node.Name != "JP-VMess-gRPC" {
+		t.Fatalf("基础信息不符合预期: %+v", node)
+	}
+	p := node.Payload
+	if !strings.Contains(p, "grpc-opts:") || !strings.Contains(p, `grpc-service-name: "my-grpc-svc"`) {
+		t.Fatalf("Payload 缺少 grpc-opts: %s", p)
+	}
+	if !strings.Contains(p, `client-fingerprint: "chrome"`) {
+		t.Fatalf("Payload 缺少 client-fingerprint: %s", p)
+	}
+	if !strings.Contains(p, "udp: true") {
+		t.Fatalf("Payload 缺少 udp: %s", p)
+	}
+}
+
+// TestParseSSEnhanced 验证 Shadowsocks 解析增强（plugin、UDP）。
+func TestParseSSEnhanced(t *testing.T) {
+	// SIP002 带 plugin
+	userInfo := base64.URLEncoding.EncodeToString([]byte("aes-128-gcm:pass123"))
+	uri := "ss://" + userInfo + "@1.2.3.4:8388?plugin=obfs-local%3Bobfs%3Dhttp%3Bobfs-host%3Dbing.com#HK-SS"
+	node, err := parseProxyURI(uri)
+	if err != nil {
+		t.Fatalf("解析 SS 失败: %v", err)
+	}
+	if node.Protocol != "ss" || node.Server != "1.2.3.4:8388" || node.Name != "HK-SS" {
+		t.Fatalf("基础信息不符合预期: %+v", node)
+	}
+	p := node.Payload
+	if !strings.Contains(p, "type: ss") || !strings.Contains(p, "udp: true") {
+		t.Fatalf("Payload 缺少 udp: %s", p)
+	}
+	if !strings.Contains(p, `plugin: "obfs-local"`) {
+		t.Fatalf("Payload 缺少 plugin: %s", p)
 	}
 }
