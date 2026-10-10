@@ -519,3 +519,234 @@ func TestParseSingleSlotFiltersDummyGeo(t *testing.T) {
 		t.Fatalf("同名出口信息期望被过滤为空，实际: %q", rep.OutboundGeo)
 	}
 }
+
+// TestExtractFieldRobustness 验证加固后的 extractField 对各种复杂 YAML 边界格式的处理能力。
+func TestExtractFieldRobustness(t *testing.T) {
+	cases := []struct {
+		name string
+		raw  string
+		key  string
+		want string
+	}{
+		{
+			name: "单引号包裹且内含逗号与冒号",
+			raw:  `{ name: '剩余流量：975.52 GB, 有效期：长期', server: 1.2.3.4, port: 443 }`,
+			key:  "name",
+			want: "剩余流量：975.52 GB, 有效期：长期",
+		},
+		{
+			name: "双引号包裹且内含逗号",
+			raw:  `{ name: "HK, 01 PCCW - VIP", server: hk.node.com, port: 443 }`,
+			key:  "name",
+			want: "HK, 01 PCCW - VIP",
+		},
+		{
+			name: "防子串误匹配：存在 client-type 时精确匹配 type",
+			raw:  `{ client-type: clash, type: vless, server: 1.1.1.1 }`,
+			key:  "type",
+			want: "vless",
+		},
+		{
+			name: "提取嵌套花括号对象",
+			raw:  `{ name: Node1, reality-opts: { public-key: abcdef, short-id: 123456 }, type: vless }`,
+			key:  "reality-opts",
+			want: "{ public-key: abcdef, short-id: 123456 }",
+		},
+		{
+			name: "嵌套对象之后的普通字段提取",
+			raw:  `{ reality-opts: { public-key: abcdef, short-id: 123456 }, type: vless, server: 2.2.2.2 }`,
+			key:  "server",
+			want: "2.2.2.2",
+		},
+		{
+			name: "键与冒号之间包含多余空白",
+			raw:  `{ name  :  "MyNode" , port : 8443 }`,
+			key:  "name",
+			want: "MyNode",
+		},
+		{
+			name: "无引号标量值后紧跟闭合花括号",
+			raw:  `{ server: 1.2.3.4, port: 443 }`,
+			key:  "port",
+			want: "443",
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got := extractField(tc.raw, tc.key)
+			if got != tc.want {
+				t.Fatalf("extractField(%q, %q) = %q, 期望: %q", tc.raw, tc.key, got, tc.want)
+			}
+		})
+	}
+}
+
+// TestParseClashYAMLProxiesRobustness 验证单行和多行 YAML 配置解析。
+func TestParseClashYAMLProxiesRobustness(t *testing.T) {
+	yamlContent := `
+mixed-port: 7890
+proxies:
+  - { name: '剩余流量：975.52 GB', server: 203.10.98.189, port: 443, udp: true, type: hysteria2, password: pass1, fingerprint: fp1 }
+  - { name: 🇯🇵AWS日本1号, type: vless, server: aws.jp.node, port: 443, uuid: u-123, reality-opts: { public-key: pbk1, short-id: sid1 } }
+  - name: "多行节点-HY2"
+    type: hysteria2
+    server: 203.10.99.51
+    port: 50000
+    ports: 50000-55000
+    password: pass2
+proxy-groups:
+`
+	nodes := parseClashYAMLProxies(yamlContent)
+	if len(nodes) != 3 {
+		t.Fatalf("期望解析出 3 个节点，实际解析出: %d", len(nodes))
+	}
+
+	if nodes[0].Name != "剩余流量：975.52 GB" || nodes[0].Protocol != "hysteria2" || nodes[0].Server != "203.10.98.189:443" {
+		t.Fatalf("节点 1 解析不符合预期: %+v", nodes[0])
+	}
+
+	if nodes[1].Name != "🇯🇵AWS日本1号" || nodes[1].Protocol != "vless" || nodes[1].Server != "aws.jp.node:443" {
+		t.Fatalf("节点 2 解析不符合预期: %+v", nodes[1])
+	}
+	if !strings.Contains(nodes[1].Payload, "reality-opts:") {
+		t.Fatalf("节点 2 Payload 应保留 reality-opts，实际: %s", nodes[1].Payload)
+	}
+
+	if nodes[2].Name != "多行节点-HY2" || nodes[2].Protocol != "hysteria2" || nodes[2].Server != "203.10.99.51:50000" {
+		t.Fatalf("节点 3 解析不符合预期: %+v", nodes[2])
+	}
+}
+
+// TestParseHysteria2URIComprehensive 验证 parseHysteria2URI 提取指纹、多端口、混淆等参数。
+func TestParseHysteria2URIComprehensive(t *testing.T) {
+	rawURI := "hysteria2://my-password@203.10.99.51:50000/?sni=www.bing.com&pinSHA256=1d7995901a93bada6d17f10289441793e8ec54ee314d9f04f3a9d05daa622331&mport=50000-55000&obfs=salamander&obfs-password=obfspass123&alpn=h3#%F0%9F%87%AF%F0%9F%87%B5%E6%97%A5%E6%9C%AC%E4%B8%93%E7%BA%BF"
+	node, err := parseProxyURI(rawURI)
+	if err != nil {
+		t.Fatalf("解析 Hysteria2 URI 失败: %v", err)
+	}
+
+	if node.Protocol != "hysteria2" || node.Server != "203.10.99.51:50000" || node.Name != "🇯🇵日本专线" {
+		t.Fatalf("基础信息不符合预期: %+v", node)
+	}
+
+	payload := node.Payload
+	if !strings.Contains(payload, `password: "my-password"`) {
+		t.Fatalf("Payload 缺少 password: %s", payload)
+	}
+	if !strings.Contains(payload, `sni: "www.bing.com"`) {
+		t.Fatalf("Payload 缺少 sni: %s", payload)
+	}
+	if !strings.Contains(payload, `fingerprint: "1d7995901a93bada6d17f10289441793e8ec54ee314d9f04f3a9d05daa622331"`) {
+		t.Fatalf("Payload 缺少 fingerprint 证书指纹: %s", payload)
+	}
+	if !strings.Contains(payload, "skip-cert-verify: true") {
+		t.Fatalf("Payload 缺少 skip-cert-verify: %s", payload)
+	}
+	if !strings.Contains(payload, `ports: "50000-55000"`) {
+		t.Fatalf("Payload 缺少 ports 多端口跳变: %s", payload)
+	}
+	if !strings.Contains(payload, `obfs: "salamander"`) || !strings.Contains(payload, `obfs-password: "obfspass123"`) {
+		t.Fatalf("Payload 缺少混淆参数: %s", payload)
+	}
+	if !strings.Contains(payload, `alpn:`) || !strings.Contains(payload, `"h3"`) {
+		t.Fatalf("Payload 缺少 alpn 参数: %s", payload)
+	}
+	if !strings.Contains(payload, "udp: true") {
+		t.Fatalf("Payload 缺少 udp: true: %s", payload)
+	}
+}
+
+// TestParseVlessURIComprehensive 验证 parseVlessURI 提取 Reality、WS、gRPC 等参数。
+func TestParseVlessURIComprehensive(t *testing.T) {
+	t.Run("Reality 节点", func(t *testing.T) {
+		rawURI := "vless://3725dcb7-5767-472d-93be-872cdd4a7e0f@aws.jp:443?type=tcp&security=reality&flow=xtls-rprx-vision&fp=chrome&sni=osxapps.itunes.apple.com&pbk=egq3FRi4oqkJ-iJ40r-pk10g7tawGg6o9c4UDGOPDU4&sid=9824e11ad3a632f8&spx=%2Ftest#AWS-Reality"
+		node, err := parseProxyURI(rawURI)
+		if err != nil {
+			t.Fatalf("解析 VLESS Reality 失败: %v", err)
+		}
+		if node.Protocol != "vless" || node.Server != "aws.jp:443" || node.Name != "AWS-Reality" {
+			t.Fatalf("基础信息不符合预期: %+v", node)
+		}
+		p := node.Payload
+		if !strings.Contains(p, `uuid: 3725dcb7-5767-472d-93be-872cdd4a7e0f`) {
+			t.Fatalf("缺少 uuid: %s", p)
+		}
+		if !strings.Contains(p, `flow: "xtls-rprx-vision"`) {
+			t.Fatalf("缺少 flow: %s", p)
+		}
+		if !strings.Contains(p, `client-fingerprint: "chrome"`) {
+			t.Fatalf("缺少 client-fingerprint: %s", p)
+		}
+		if !strings.Contains(p, `servername: "osxapps.itunes.apple.com"`) {
+			t.Fatalf("缺少 servername: %s", p)
+		}
+		if !strings.Contains(p, "reality-opts:") || !strings.Contains(p, `public-key: "egq3FRi4oqkJ-iJ40r-pk10g7tawGg6o9c4UDGOPDU4"`) || !strings.Contains(p, `short-id: "9824e11ad3a632f8"`) {
+			t.Fatalf("缺少 reality-opts: %s", p)
+		}
+		if !strings.Contains(p, `spider-x: "/test"`) {
+			t.Fatalf("缺少 spider-x: %s", p)
+		}
+	})
+
+	t.Run("WebSocket 节点", func(t *testing.T) {
+		rawURI := "vless://my-uuid@cf.node.com:443?type=ws&security=tls&sni=cf.node.com&fp=safari&path=%2Fws-path&host=custom.host.com#CF-WS"
+		node, err := parseProxyURI(rawURI)
+		if err != nil {
+			t.Fatalf("解析 VLESS WS 失败: %v", err)
+		}
+		p := node.Payload
+		if !strings.Contains(p, "ws-opts:") || !strings.Contains(p, `path: "/ws-path"`) || !strings.Contains(p, `Host: "custom.host.com"`) {
+			t.Fatalf("缺少 ws-opts: %s", p)
+		}
+	})
+
+	t.Run("gRPC 节点", func(t *testing.T) {
+		rawURI := "vless://my-uuid@grpc.node.com:443?type=grpc&security=tls&sni=grpc.node.com&serviceName=my-grpc-service#GRPC-Node"
+		node, err := parseProxyURI(rawURI)
+		if err != nil {
+			t.Fatalf("解析 VLESS gRPC 失败: %v", err)
+		}
+		p := node.Payload
+		if !strings.Contains(p, "grpc-opts:") || !strings.Contains(p, `grpc-service-name: "my-grpc-service"`) {
+			t.Fatalf("缺少 grpc-opts: %s", p)
+		}
+	})
+}
+
+// TestFetchAndParseSubscriptionClashMetaPriority 验证优先使用 ClashMeta UA 并拉取原生配置。
+func TestFetchAndParseSubscriptionClashMetaPriority(t *testing.T) {
+	var requestedUAs []string
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		ua := r.Header.Get("User-Agent")
+		requestedUAs = append(requestedUAs, ua)
+
+		if ua == "ClashMeta" {
+			w.WriteHeader(http.StatusOK)
+			_, _ = w.Write([]byte(`
+mixed-port: 7890
+proxies:
+  - { name: '原生Meta节点1', type: hysteria2, server: 1.2.3.4, port: 443 }
+  - { name: '原生Meta节点2', type: vless, server: 5.6.7.8, port: 443 }
+`))
+			return
+		}
+
+		// 其他 UA 返回空或错误
+		w.WriteHeader(http.StatusBadRequest)
+	}))
+	defer server.Close()
+
+	nodes, err := fetchAndParseSubscription(context.Background(), server.URL)
+	if err != nil {
+		t.Fatalf("拉取订阅失败: %v", err)
+	}
+
+	if len(requestedUAs) != 1 || requestedUAs[0] != "ClashMeta" {
+		t.Fatalf("期望首选 ClashMeta UA 且一次成功，实际请求 UA: %v", requestedUAs)
+	}
+
+	if len(nodes) != 2 || nodes[0].Name != "原生Meta节点1" || nodes[1].Name != "原生Meta节点2" {
+		t.Fatalf("解析出的节点不符合预期: %+v", nodes)
+	}
+}

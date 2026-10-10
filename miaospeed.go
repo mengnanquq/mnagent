@@ -19,6 +19,7 @@ import (
 	"strconv"
 	"strings"
 	"time"
+	"unicode"
 
 	"golang.org/x/net/websocket"
 )
@@ -357,8 +358,8 @@ func parseProxyTarget(ctx context.Context, target string) ([]MiaospeedNode, erro
 
 // fetchAndParseSubscription 拉取订阅并提取节点，支持 Base64 URI 列表与原生 Clash YAML。
 func fetchAndParseSubscription(ctx context.Context, subURL string) ([]MiaospeedNode, error) {
-	// 依次尝试主流订阅客户端 User-Agent，避免被特定机场的 UA 检查拦截
-	userAgents := []string{"v2rayng", "ClashMeta", "clash.meta"}
+	// 依次尝试主流订阅客户端 User-Agent，优先获取原生 Clash-Meta 配置（miaospeed 基于 Clash-Meta 核心），避免手动逆向协议丢失 TLS/证书指纹与高级参数
+	userAgents := []string{"ClashMeta", "clash.meta", "Clash.Meta; mihomo", "mihomo", "v2rayng", "clash"}
 	client := &http.Client{Timeout: 15 * time.Second}
 
 	var lastErr error
@@ -440,15 +441,20 @@ func parseClashYAMLProxies(content string) []MiaospeedNode {
 	currentName := ""
 	currentType := ""
 	currentServer := ""
+	currentPort := ""
 
 	flushItem := func() {
 		if currentItem.Len() > 0 {
 			payload := strings.TrimSpace(currentItem.String())
 			if currentName != "" && payload != "" {
+				srv := currentServer
+				if currentPort != "" && !strings.Contains(currentServer, ":") {
+					srv = fmt.Sprintf("%s:%s", currentServer, currentPort)
+				}
 				nodes = append(nodes, MiaospeedNode{
 					Name:     currentName,
 					Protocol: currentType,
-					Server:   currentServer,
+					Server:   srv,
 					Payload:  payload,
 				})
 			}
@@ -456,6 +462,7 @@ func parseClashYAMLProxies(content string) []MiaospeedNode {
 			currentName = ""
 			currentType = ""
 			currentServer = ""
+			currentPort = ""
 		}
 	}
 
@@ -466,7 +473,7 @@ func parseClashYAMLProxies(content string) []MiaospeedNode {
 			continue
 		}
 		if inProxies {
-			// 退出 proxies 块
+			// 退出 proxies 块（遇到未缩进的下一个顶级配置段）
 			if len(line) > 0 && !strings.HasPrefix(line, " ") && !strings.HasPrefix(line, "\t") && !strings.HasPrefix(line, "-") {
 				flushItem()
 				break
@@ -474,14 +481,14 @@ func parseClashYAMLProxies(content string) []MiaospeedNode {
 			// 单行格式: - {name: ..., server: ..., ...}
 			if strings.HasPrefix(trimmed, "- {") && strings.HasSuffix(trimmed, "}") {
 				flushItem()
-				rawItem := strings.TrimPrefix(trimmed, "- ")
-				name := extractField(rawItem, "name:")
-				pType := extractField(rawItem, "type:")
-				server := extractField(rawItem, "server:")
-				port := extractField(rawItem, "port:")
+				rawItem := strings.TrimSpace(strings.TrimPrefix(trimmed, "-"))
+				name := extractField(rawItem, "name")
+				pType := extractField(rawItem, "type")
+				server := extractField(rawItem, "server")
+				port := extractField(rawItem, "port")
 				if name != "" {
 					srv := server
-					if port != "" {
+					if port != "" && !strings.Contains(server, ":") {
 						srv += ":" + port
 					}
 					nodes = append(nodes, MiaospeedNode{
@@ -494,22 +501,40 @@ func parseClashYAMLProxies(content string) []MiaospeedNode {
 				continue
 			}
 
-			// 多行缩进格式
-			if strings.HasPrefix(trimmed, "- name:") || strings.HasPrefix(trimmed, "- type:") {
+			// 多行缩进格式：新节点以 "- " 开头
+			if strings.HasPrefix(trimmed, "- ") {
 				flushItem()
-				currentItem.WriteString(strings.TrimPrefix(trimmed, "- ") + "\n")
-				if strings.HasPrefix(trimmed, "- name:") {
-					currentName = strings.TrimSpace(strings.TrimPrefix(trimmed, "- name:"))
-					currentName = strings.Trim(currentName, "\"'")
+				contentAfterDash := strings.TrimSpace(strings.TrimPrefix(trimmed, "-"))
+				currentItem.WriteString(contentAfterDash + "\n")
+				if idx := strings.Index(contentAfterDash, ":"); idx != -1 {
+					k := strings.ToLower(strings.TrimSpace(contentAfterDash[:idx]))
+					v := strings.Trim(strings.TrimSpace(contentAfterDash[idx+1:]), "\"'")
+					switch k {
+					case "name":
+						currentName = v
+					case "type":
+						currentType = v
+					case "server":
+						currentServer = v
+					case "port":
+						currentPort = v
+					}
 				}
-			} else if currentItem.Len() > 0 {
+			} else if currentItem.Len() > 0 && (strings.HasPrefix(line, " ") || strings.HasPrefix(line, "\t")) {
 				currentItem.WriteString(trimmed + "\n")
-				if strings.HasPrefix(trimmed, "type:") {
-					currentType = strings.TrimSpace(strings.TrimPrefix(trimmed, "type:"))
-					currentType = strings.Trim(currentType, "\"'")
-				} else if strings.HasPrefix(trimmed, "server:") {
-					currentServer = strings.TrimSpace(strings.TrimPrefix(trimmed, "server:"))
-					currentServer = strings.Trim(currentServer, "\"'")
+				if idx := strings.Index(trimmed, ":"); idx != -1 {
+					k := strings.ToLower(strings.TrimSpace(trimmed[:idx]))
+					v := strings.Trim(strings.TrimSpace(trimmed[idx+1:]), "\"'")
+					switch k {
+					case "name":
+						currentName = v
+					case "type":
+						currentType = v
+					case "server":
+						currentServer = v
+					case "port":
+						currentPort = v
+					}
 				}
 			}
 		}
@@ -518,17 +543,108 @@ func parseClashYAMLProxies(content string) []MiaospeedNode {
 	return nodes
 }
 
-func extractField(raw, prefix string) string {
-	idx := strings.Index(raw, prefix)
-	if idx == -1 {
+// extractField 从单行 YAML 项（如 {name: '...', type: hysteria2}）中安全提取指定键对应的值。
+func extractField(raw, key string) string {
+	key = strings.TrimSuffix(strings.TrimSpace(key), ":")
+	if key == "" || len(raw) == 0 {
 		return ""
 	}
-	sub := strings.TrimSpace(raw[idx+len(prefix):])
-	end := strings.IndexAny(sub, ",}")
-	if end != -1 {
-		sub = sub[:end]
+
+	rawLen := len(raw)
+	start := 0
+	for {
+		idx := strings.Index(raw[start:], key)
+		if idx == -1 {
+			return ""
+		}
+		actualIdx := start + idx
+
+		// 检查 key 前置边界：必须是开头、空白、'{' 或 ','
+		validPrefix := false
+		if actualIdx == 0 {
+			validPrefix = true
+		} else {
+			prev := raw[actualIdx-1]
+			if prev == '{' || prev == ',' || unicode.IsSpace(rune(prev)) {
+				validPrefix = true
+			}
+		}
+
+		// 检查 key 后置边界：必须紧跟可选空白与冒号 ':'
+		valStart := -1
+		if validPrefix {
+			afterKey := actualIdx + len(key)
+			k := afterKey
+			for k < rawLen && unicode.IsSpace(rune(raw[k])) {
+				k++
+			}
+			if k < rawLen && raw[k] == ':' {
+				k++ // 跳过 ':'
+				for k < rawLen && unicode.IsSpace(rune(raw[k])) {
+					k++
+				}
+				valStart = k
+			}
+		}
+
+		if valStart != -1 {
+			if valStart >= rawLen {
+				return ""
+			}
+
+			firstChar := raw[valStart]
+			// 1. 引号包裹情况
+			if firstChar == '\'' || firstChar == '"' {
+				quote := firstChar
+				escaped := false
+				for i := valStart + 1; i < rawLen; i++ {
+					c := raw[i]
+					if escaped {
+						escaped = false
+						continue
+					}
+					if c == '\\' {
+						escaped = true
+						continue
+					}
+					if c == quote {
+						// 支持单引号双写转义 ''
+						if quote == '\'' && i+1 < rawLen && raw[i+1] == '\'' {
+							i++
+							continue
+						}
+						return raw[valStart+1 : i]
+					}
+				}
+				return strings.TrimSpace(raw[valStart+1:])
+			}
+
+			// 2. 嵌套花括号情况
+			if firstChar == '{' {
+				braceDepth := 0
+				for i := valStart; i < rawLen; i++ {
+					if raw[i] == '{' {
+						braceDepth++
+					} else if raw[i] == '}' {
+						braceDepth--
+						if braceDepth == 0 {
+							return strings.TrimSpace(raw[valStart : i+1])
+						}
+					}
+				}
+			}
+
+			// 3. 普通标量值：截止到下一个 ',' 或最外层 '}'
+			end := valStart
+			for end < rawLen && raw[end] != ',' && raw[end] != '}' {
+				end++
+			}
+			val := strings.TrimSpace(raw[valStart:end])
+			return strings.Trim(val, "\"'")
+		}
+
+		start = actualIdx + len(key)
 	}
-	return strings.Trim(strings.TrimSpace(sub), "\"'")
 }
 
 // parseProxyURI 解析主流代理协议 URI 为 MiaospeedNode。
@@ -729,16 +845,32 @@ func parseTrojanURI(u *url.URL) (*MiaospeedNode, error) {
 	if port == 0 {
 		port = 443
 	}
-	sni := u.Query().Get("sni")
+	q := u.Query()
+	sni := q.Get("sni")
 	if sni == "" {
-		sni = u.Query().Get("peer")
+		sni = q.Get("peer")
 	}
+	fp := q.Get("fp")
+	insecure := q.Get("allowInsecure")
+	if insecure == "" {
+		insecure = q.Get("insecure")
+	}
+	alpn := q.Get("alpn")
 
 	var sb strings.Builder
-	sb.WriteString(fmt.Sprintf("name: %s\ntype: trojan\nserver: %s\nport: %d\npassword: %s\n",
+	sb.WriteString(fmt.Sprintf("name: %s\ntype: trojan\nserver: %s\nport: %d\npassword: %s\nudp: true\n",
 		quoteYAML(name), server, port, quoteYAML(password)))
 	if sni != "" {
 		sb.WriteString(fmt.Sprintf("sni: %s\n", quoteYAML(sni)))
+	}
+	if fp != "" {
+		sb.WriteString(fmt.Sprintf("client-fingerprint: %s\n", quoteYAML(fp)))
+	}
+	if insecure == "1" || strings.EqualFold(insecure, "true") {
+		sb.WriteString("skip-cert-verify: true\n")
+	}
+	if alpn != "" {
+		sb.WriteString(fmt.Sprintf("alpn:\n  - %s\n", quoteYAML(alpn)))
 	}
 
 	return &MiaospeedNode{
@@ -756,31 +888,58 @@ func parseVlessURI(u *url.URL) (*MiaospeedNode, error) {
 		name = "VLESS-Node"
 	}
 	name, _ = url.QueryUnescape(name)
-	uuid := u.User.Username()
+	uuid := ""
+	if u.User != nil {
+		uuid = u.User.Username()
+	}
 	server := u.Hostname()
 	port, _ := strconv.Atoi(u.Port())
 	if port == 0 {
 		port = 443
 	}
-	security := u.Query().Get("security")
-	sni := u.Query().Get("sni")
-	netType := u.Query().Get("type")
+	q := u.Query()
+	security := strings.ToLower(q.Get("security"))
+	sni := q.Get("sni")
+	if sni == "" {
+		sni = q.Get("peer")
+	}
+	netType := strings.ToLower(q.Get("type"))
 	if netType == "" {
 		netType = "tcp"
 	}
+	flow := q.Get("flow")
+	fp := q.Get("fp")
+	insecure := q.Get("insecure")
+	if insecure == "" {
+		insecure = q.Get("allowInsecure")
+	}
+	alpn := q.Get("alpn")
 
 	var sb strings.Builder
-	sb.WriteString(fmt.Sprintf("name: %s\ntype: vless\nserver: %s\nport: %d\nuuid: %s\nnetwork: %s\n",
+	sb.WriteString(fmt.Sprintf("name: %s\ntype: vless\nserver: %s\nport: %d\nuuid: %s\nnetwork: %s\nudp: true\n",
 		quoteYAML(name), server, port, uuid, netType))
+	if flow != "" {
+		sb.WriteString(fmt.Sprintf("flow: %s\n", quoteYAML(flow)))
+	}
 	if security == "tls" || security == "reality" {
 		sb.WriteString("tls: true\n")
 		if sni != "" {
 			sb.WriteString(fmt.Sprintf("servername: %s\n", quoteYAML(sni)))
 		}
+		if fp != "" {
+			sb.WriteString(fmt.Sprintf("client-fingerprint: %s\n", quoteYAML(fp)))
+		}
+		if alpn != "" {
+			sb.WriteString(fmt.Sprintf("alpn:\n  - %s\n", quoteYAML(alpn)))
+		}
+		if insecure == "1" || strings.EqualFold(insecure, "true") {
+			sb.WriteString("skip-cert-verify: true\n")
+		}
 		if security == "reality" {
-			pbk := u.Query().Get("pbk")
-			sid := u.Query().Get("sid")
-			if pbk != "" || sid != "" {
+			pbk := q.Get("pbk")
+			sid := q.Get("sid")
+			spx := q.Get("spx")
+			if pbk != "" || sid != "" || spx != "" {
 				sb.WriteString("reality-opts:\n")
 				if pbk != "" {
 					sb.WriteString(fmt.Sprintf("  public-key: %s\n", quoteYAML(pbk)))
@@ -788,12 +947,16 @@ func parseVlessURI(u *url.URL) (*MiaospeedNode, error) {
 				if sid != "" {
 					sb.WriteString(fmt.Sprintf("  short-id: %s\n", quoteYAML(sid)))
 				}
+				if spx != "" {
+					sb.WriteString(fmt.Sprintf("  spider-x: %s\n", quoteYAML(spx)))
+				}
 			}
 		}
 	}
-	if netType == "ws" {
-		path := u.Query().Get("path")
-		host := u.Query().Get("host")
+	switch netType {
+	case "ws":
+		path := q.Get("path")
+		host := q.Get("host")
 		if path != "" || host != "" {
 			sb.WriteString("ws-opts:\n")
 			if path != "" {
@@ -801,6 +964,26 @@ func parseVlessURI(u *url.URL) (*MiaospeedNode, error) {
 			}
 			if host != "" {
 				sb.WriteString(fmt.Sprintf("  headers:\n    Host: %s\n", quoteYAML(host)))
+			}
+		}
+	case "grpc":
+		svcName := q.Get("serviceName")
+		if svcName == "" {
+			svcName = q.Get("servicename")
+		}
+		if svcName != "" {
+			sb.WriteString(fmt.Sprintf("grpc-opts:\n  grpc-service-name: %s\n", quoteYAML(svcName)))
+		}
+	case "h2", "http":
+		path := q.Get("path")
+		host := q.Get("host")
+		if path != "" || host != "" {
+			sb.WriteString("h2-opts:\n")
+			if path != "" {
+				sb.WriteString(fmt.Sprintf("  path: %s\n", quoteYAML(path)))
+			}
+			if host != "" {
+				sb.WriteString(fmt.Sprintf("  host:\n    - %s\n", quoteYAML(host)))
 			}
 		}
 	}
@@ -820,19 +1003,63 @@ func parseHysteria2URI(u *url.URL) (*MiaospeedNode, error) {
 		name = "Hysteria2-Node"
 	}
 	name, _ = url.QueryUnescape(name)
-	password := u.User.Username()
+	var password string
+	if u.User != nil {
+		if p, ok := u.User.Password(); ok && p != "" {
+			password = p
+		} else {
+			password = u.User.Username()
+		}
+	}
 	server := u.Hostname()
 	port, _ := strconv.Atoi(u.Port())
 	if port == 0 {
 		port = 443
 	}
-	sni := u.Query().Get("sni")
+	q := u.Query()
+	sni := q.Get("sni")
+	if sni == "" {
+		sni = q.Get("peer")
+	}
+	pinSHA256 := q.Get("pinSHA256")
+	if pinSHA256 == "" {
+		pinSHA256 = q.Get("pin-sha256")
+	}
+	insecure := q.Get("insecure")
+	if insecure == "" {
+		insecure = q.Get("allowInsecure")
+	}
+	mport := q.Get("mport")
+	if mport == "" {
+		mport = q.Get("ports")
+	}
+	obfs := q.Get("obfs")
+	obfsPassword := q.Get("obfs-password")
+	alpn := q.Get("alpn")
 
 	var sb strings.Builder
-	sb.WriteString(fmt.Sprintf("name: %s\ntype: hysteria2\nserver: %s\nport: %d\npassword: %s\n",
+	sb.WriteString(fmt.Sprintf("name: %s\ntype: hysteria2\nserver: %s\nport: %d\npassword: %s\nudp: true\n",
 		quoteYAML(name), server, port, quoteYAML(password)))
 	if sni != "" {
 		sb.WriteString(fmt.Sprintf("sni: %s\n", quoteYAML(sni)))
+	}
+	if pinSHA256 != "" {
+		sb.WriteString(fmt.Sprintf("fingerprint: %s\n", quoteYAML(pinSHA256)))
+		sb.WriteString("skip-cert-verify: true\n")
+	} else if insecure == "1" || strings.EqualFold(insecure, "true") {
+		sb.WriteString("skip-cert-verify: true\n")
+	}
+	if mport != "" {
+		sb.WriteString(fmt.Sprintf("ports: %s\n", quoteYAML(mport)))
+	}
+	if obfs != "" {
+		sb.WriteString(fmt.Sprintf("obfs: %s\n", quoteYAML(obfs)))
+		if obfsPassword != "" {
+			sb.WriteString(fmt.Sprintf("obfs-password: %s\n", quoteYAML(obfsPassword)))
+		}
+	}
+	if alpn != "" {
+		sb.WriteString(fmt.Sprintf("alpn:\n  - %s\n", quoteYAML(alpn)))
 	}
 
 	return &MiaospeedNode{
