@@ -864,6 +864,9 @@ func TestFetchMtfSubscriptionAllNodes(t *testing.T) {
 	subURL := "https://mtf.llc/s/87d9ad4e06304a12638ccfc9552274b5"
 	nodes, err := fetchAndParseSubscription(context.Background(), subURL)
 	if err != nil {
+		if strings.Contains(err.Error(), "429") || strings.Contains(err.Error(), "超时") || strings.Contains(err.Error(), "connect") {
+			t.Skipf("外部机场订阅限流或网络不可达，跳过在线测试: %v", err)
+		}
 		t.Fatalf("拉取 mtf 订阅失败: %v", err)
 	}
 
