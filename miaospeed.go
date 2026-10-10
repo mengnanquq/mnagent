@@ -682,13 +682,13 @@ func parseProxyURI(rawURI string) (*MiaospeedNode, error) {
 		return parseVmessURI(rawURI)
 	case "trojan":
 		return parseTrojanURI(u)
-		case "vless":
-			return parseVlessURI(u)
-		case "hysteria2", "hy2":
-			return parseHysteria2URI(u)
-		case "tuic":
-			return parseTuicURI(u)
-		default:
+	case "vless":
+		return parseVlessURI(u)
+	case "hysteria2", "hy2":
+		return parseHysteria2URI(u)
+	case "tuic":
+		return parseTuicURI(u)
+	default:
 		return nil, fmt.Errorf("不支持的代理协议：%s", u.Scheme)
 	}
 }
@@ -1084,14 +1084,14 @@ func parseHysteria2URI(u *url.URL) (*MiaospeedNode, error) {
 		sb.WriteString(fmt.Sprintf("alpn:\n  - %s\n", quoteYAML(alpn)))
 	}
 
-		return &MiaospeedNode{
-			Name:     name,
-			Protocol: "hysteria2",
-			Server:   fmt.Sprintf("%s:%d", server, port),
-			Port:     port,
-			Payload:  sb.String(),
-		}, nil
-	}
+	return &MiaospeedNode{
+		Name:     name,
+		Protocol: "hysteria2",
+		Server:   fmt.Sprintf("%s:%d", server, port),
+		Port:     port,
+		Payload:  sb.String(),
+	}, nil
+}
 
 func parseTuicURI(u *url.URL) (*MiaospeedNode, error) {
 	name := u.Fragment
