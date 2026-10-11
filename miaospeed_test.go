@@ -7,6 +7,7 @@ import (
 	"context"
 	"encoding/base64"
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -1070,5 +1071,35 @@ func TestMiaospeedMultiNodeBatchPlanAndTotalNodes(t *testing.T) {
 	}
 	if rep.SubReports[0].TotalNodes != 48 {
 		t.Fatalf("SubReport 期望 TotalNodes=48，实际: %d", rep.SubReports[0].TotalNodes)
+	}
+}
+
+// TestSelectJobNodesUnlimited 验证节点数量默认无上限，仅在指定 Count 时截取。
+func TestSelectJobNodesUnlimited(t *testing.T) {
+	nodes := make([]MiaospeedNode, 150)
+	for i := range nodes {
+		nodes[i] = MiaospeedNode{Name: fmt.Sprintf("Node-%d", i+1)}
+	}
+
+	// 1. 未指定 Count (0 或负数) 时，全量保留全部 150 个节点，不再受原 80 个上限限制
+	selected := selectJobNodes(nodes, 0)
+	if len(selected) != 150 {
+		t.Fatalf("默认期望无上限 (150 个节点)，实际: %d", len(selected))
+	}
+	selectedNeg := selectJobNodes(nodes, -1)
+	if len(selectedNeg) != 150 {
+		t.Fatalf("负数 Count 期望全量保留 (150 个节点)，实际: %d", len(selectedNeg))
+	}
+
+	// 2. 指定有效 Count 时按 Count 截断
+	selectedCount := selectJobNodes(nodes, 60)
+	if len(selectedCount) != 60 {
+		t.Fatalf("指定 Count=60 期望截取 60 个节点，实际: %d", len(selectedCount))
+	}
+
+	// 3. 指定 Count 超过总数时返回全部节点
+	selectedOver := selectJobNodes(nodes, 200)
+	if len(selectedOver) != 150 {
+		t.Fatalf("指定 Count 超限期望返回全部 150 个节点，实际: %d", len(selectedOver))
 	}
 }

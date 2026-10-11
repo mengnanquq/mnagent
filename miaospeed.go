@@ -1468,6 +1468,14 @@ func getInt(m map[string]any, k string) int {
 
 // --- MiaoSpeed 临时进程与单次任务执行引擎 ---
 
+// selectJobNodes 根据任务请求选取测速节点，默认无上限全量测速；仅在明确指定 Count 时截取前 Count 个节点。
+func selectJobNodes(allNodes []MiaospeedNode, count int) []MiaospeedNode {
+	if count > 0 && count < len(allNodes) {
+		return allNodes[:count]
+	}
+	return allNodes
+}
+
 // runMiaospeedJob 执行一次 MiaoSpeed 测速任务：按需拉起进程 -> WebSocket 交互 -> 收集结果 -> 退出清理。
 func runMiaospeedJob(ctx context.Context, binary, ghProxy string, job Job, log logger, onProgress func(Progress)) (string, json.RawMessage, error) {
 	if binary == "" {
@@ -1491,14 +1499,7 @@ func runMiaospeedJob(ctx context.Context, binary, ghProxy string, job Job, log l
 	}
 
 	totalNodes := len(allNodes)
-	maxNodes := 80
-	if job.Count > 0 && job.Count < len(allNodes) {
-		maxNodes = job.Count
-	}
-	nodes := allNodes
-	if len(nodes) > maxNodes {
-		nodes = nodes[:maxNodes]
-	}
+	nodes := selectJobNodes(allNodes, job.Count)
 
 	// 2. 分配随机本地端口与 Token
 	port, err := getFreeLocalPort()
