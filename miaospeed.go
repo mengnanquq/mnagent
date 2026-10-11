@@ -76,6 +76,7 @@ type MiaospeedNode struct {
 
 // MiaospeedReport 包含测速任务的结构化结果。
 type MiaospeedReport struct {
+	TotalNodes      int               `json:"total_nodes,omitempty"`
 	TestMode        string            `json:"test_mode,omitempty"`
 	NodeName        string            `json:"node_name"`
 	Protocol        string            `json:"protocol,omitempty"`
@@ -1484,15 +1485,17 @@ func runMiaospeedJob(ctx context.Context, binary, ghProxy string, job Job, log l
 	}
 
 	// 1. 解析目标节点
-	nodes, err := parseProxyTarget(ctx, job.Target)
+	allNodes, err := parseProxyTarget(ctx, job.Target)
 	if err != nil {
 		return "", nil, fmt.Errorf("解析测速目标失败: %w", err)
 	}
 
-	maxNodes := 25
-	if job.Count > 0 && job.Count < len(nodes) {
+	totalNodes := len(allNodes)
+	maxNodes := 80
+	if job.Count > 0 && job.Count < len(allNodes) {
 		maxNodes = job.Count
 	}
+	nodes := allNodes
 	if len(nodes) > maxNodes {
 		nodes = nodes[:maxNodes]
 	}
@@ -1543,7 +1546,7 @@ func runMiaospeedJob(ctx context.Context, binary, ghProxy string, job Job, log l
 	wsURL := fmt.Sprintf("ws://%s/", addr)
 	origin := fmt.Sprintf("http://%s/", addr)
 
-	report, err := executeMiaospeedTask(ctx, wsURL, origin, token, nodes, job, log, onProgress)
+	report, err := executeMiaospeedTask(ctx, wsURL, origin, token, nodes, totalNodes, job, log, onProgress)
 	if err != nil {
 		return "", nil, err
 	}
@@ -1609,7 +1612,7 @@ type miaospeedTestPlan struct {
 
 // buildMiaospeedTestPlan 根据任务参数解析期望执行的测速矩阵。
 // 支持 8 种测试类型：连通性、拓扑、多线程测速、单线程测速、上行速度、延迟、UDP类型、全量测试。
-func buildMiaospeedTestPlan(job Job) miaospeedTestPlan {
+func buildMiaospeedTestPlan(job Job, nodeCount ...int) miaospeedTestPlan {
 	raw := strings.ToLower(strings.TrimSpace(job.Query))
 	if raw == "" {
 		raw = strings.ToLower(strings.TrimSpace(job.Protocol))
@@ -1647,6 +1650,16 @@ func buildMiaospeedTestPlan(job Job) miaospeedTestPlan {
 		}
 	}
 
+	count := 1
+	if len(nodeCount) > 0 && nodeCount[0] > 0 {
+		count = nodeCount[0]
+	}
+	// 多节点测试时将单节点下行测速时长收敛为 3s，兼顾精准度与整批耗时
+	downloadDuration := int64(5)
+	if count > 1 {
+		downloadDuration = 3
+	}
+
 	// 默认或明确指定为全量测试
 	if len(modes) == 0 || modes[ModeFull] {
 		return miaospeedTestPlan{
@@ -1674,7 +1687,7 @@ func buildMiaospeedTestPlan(job Job) miaospeedTestPlan {
 			},
 			Scripts:           buildDefaultMediaScripts(),
 			DownloadThreading: 4,
-			DownloadDuration:  5,
+			DownloadDuration:  downloadDuration,
 			STUNURL:           defaultSTUNServer,
 		}
 	}
@@ -1682,7 +1695,7 @@ func buildMiaospeedTestPlan(job Job) miaospeedTestPlan {
 	matrixSet := make(map[string]bool)
 	var descriptions []string
 	plan := miaospeedTestPlan{
-		DownloadDuration: 5,
+		DownloadDuration: downloadDuration,
 	}
 
 	if modes[ModeConnectivity] {
@@ -1765,7 +1778,7 @@ func buildMiaospeedTestPlan(job Job) miaospeedTestPlan {
 }
 
 // executeMiaospeedTask 连接 WebSocket、发送任务并读取结果。
-func executeMiaospeedTask(ctx context.Context, wsURL, origin, token string, nodes []MiaospeedNode, job Job, log logger, onProgress func(Progress)) (*MiaospeedReport, error) {
+func executeMiaospeedTask(ctx context.Context, wsURL, origin, token string, nodes []MiaospeedNode, totalNodes int, job Job, log logger, onProgress func(Progress)) (*MiaospeedReport, error) {
 	wsCfg, err := websocket.NewConfig(wsURL, origin)
 	if err != nil {
 		return nil, fmt.Errorf("配置 websocket 失败: %w", err)
@@ -1793,7 +1806,7 @@ func executeMiaospeedTask(ctx context.Context, wsURL, origin, token string, node
 	}
 	defer ws.Close()
 
-	plan := buildMiaospeedTestPlan(job)
+	plan := buildMiaospeedTestPlan(job, len(nodes))
 
 	// 构造节点
 	reqNodes := make([]slaveRequestNode, 0, len(nodes))
@@ -1814,6 +1827,14 @@ func executeMiaospeedTask(ctx context.Context, wsURL, origin, token string, node
 		scripts = make([]slaveScript, 0)
 	}
 
+	// 批量测速时若节点超时或阻断，不重试（TaskRetry=0）并将单次超时收紧为 3500ms，避免死节点阻塞整批进度
+	taskRetry := uint(2)
+	taskTimeout := uint(5000)
+	if len(nodes) > 1 {
+		taskRetry = 0
+		taskTimeout = 3500
+	}
+
 	req := slaveRequest{
 		Basics: slaveRequestBasics{
 			ID:        job.ID,
@@ -1832,8 +1853,8 @@ func executeMiaospeedTask(ctx context.Context, wsURL, origin, token string, node
 			DownloadThreading: plan.DownloadThreading,
 			PingAddress:       defaultPingURL,
 			PingAverageOver:   2,
-			TaskRetry:         2,
-			TaskTimeout:       5000,
+			TaskRetry:         taskRetry,
+			TaskTimeout:       taskTimeout,
 			DNSServers:        make([]string, 0),
 			Scripts:           scripts,
 		},
@@ -1903,14 +1924,14 @@ func executeMiaospeedTask(ctx context.Context, wsURL, origin, token string, node
 		}
 
 		if resp.Result != nil {
-			report := parseSlaveTaskResult(resp.Result, nodes, plan, time.Since(startTime))
+			report := parseSlaveTaskResult(resp.Result, nodes, totalNodes, plan, time.Since(startTime))
 			return report, nil
 		}
 	}
 
 	if len(progressSlots) > 0 {
 		resTask := &slaveTask{Results: progressSlots}
-		report := parseSlaveTaskResult(resTask, nodes, plan, time.Since(startTime))
+		report := parseSlaveTaskResult(resTask, nodes, totalNodes, plan, time.Since(startTime))
 		return report, nil
 	}
 
@@ -1970,13 +1991,17 @@ func parseSingleSlot(slot slaveEntrySlot, node *MiaospeedNode, plan miaospeedTes
 }
 
 // parseSlaveTaskResult 将 miaospeed 任务返回结果整理为 MiaospeedReport。
-func parseSlaveTaskResult(task *slaveTask, nodes []MiaospeedNode, plan miaospeedTestPlan, duration time.Duration) *MiaospeedReport {
+func parseSlaveTaskResult(task *slaveTask, nodes []MiaospeedNode, totalNodes int, plan miaospeedTestPlan, duration time.Duration) *MiaospeedReport {
+	if totalNodes <= 0 {
+		totalNodes = len(nodes)
+	}
 	if len(task.Results) == 0 {
 		var n *MiaospeedNode
 		if len(nodes) > 0 {
 			n = &nodes[0]
 		}
 		rep := parseSingleSlot(slaveEntrySlot{}, n, plan)
+		rep.TotalNodes = totalNodes
 		rep.DurationMs = duration.Milliseconds()
 		rep.RawResults = task.Results
 		return &rep
@@ -1987,6 +2012,7 @@ func parseSlaveTaskResult(task *slaveTask, nodes []MiaospeedNode, plan miaospeed
 		firstNode = &nodes[0]
 	}
 	mainRep := parseSingleSlot(task.Results[0], firstNode, plan)
+	mainRep.TotalNodes = totalNodes
 	mainRep.DurationMs = duration.Milliseconds()
 	mainRep.RawResults = task.Results
 
@@ -2000,6 +2026,7 @@ func parseSlaveTaskResult(task *slaveTask, nodes []MiaospeedNode, plan miaospeed
 			}
 			sub := parseSingleSlot(slot, nodePtr, plan)
 			sub.DurationMs = duration.Milliseconds()
+			sub.TotalNodes = totalNodes
 			mainRep.SubReports = append(mainRep.SubReports, sub)
 		}
 	}
@@ -2185,83 +2212,83 @@ func buildDefaultMediaScripts() []slaveScript {
 			ID:   "youtube",
 			Type: "media",
 			Content: `function handler() {
-    var res = fetch("https://www.youtube.com/premium", { headers: {'User-Agent':'Mozilla/5.0'}, timeout: 3000 });
+    var res = fetch("https://www.youtube.com/premium", { headers: {'User-Agent':'Mozilla/5.0'}, timeout: 2500 });
     if (!res || !res.body) return { text: "超时", color: "#f87171" };
     if (res.body.indexOf("Premium is not available in your country") > 0) return { text: "不支持", color: "#f87171" };
     var m = res.body.match(/"countryCode":"([A-Z]{2})"/);
     if (m && m[1]) return { text: "支持 (" + m[1] + ")", color: "#34d399" };
     return { text: "支持", color: "#34d399" };
 }`,
-			TimeoutMillis: 5000,
+			TimeoutMillis: 3000,
 		},
 		{
 			ID:   "netflix",
 			Type: "media",
 			Content: `function handler() {
-    var res1 = fetch("https://www.netflix.com/title/80018499", { headers: {'User-Agent':'Mozilla/5.0'}, noRedir: true, timeout: 3000 });
+    var res1 = fetch("https://www.netflix.com/title/80018499", { headers: {'User-Agent':'Mozilla/5.0'}, noRedir: true, timeout: 2500 });
     if (!res1) return { text: "超时", color: "#f87171" };
     if (res1.statusCode === 200) return { text: "原生解锁", color: "#34d399" };
-    var res2 = fetch("https://www.netflix.com/title/70143836", { headers: {'User-Agent':'Mozilla/5.0'}, noRedir: true, timeout: 3000 });
+    var res2 = fetch("https://www.netflix.com/title/70143836", { headers: {'User-Agent':'Mozilla/5.0'}, noRedir: true, timeout: 2500 });
     if (res2 && res2.statusCode === 200) return { text: "仅自制剧", color: "#fbbf24" };
     return { text: "不可用", color: "#f87171" };
 }`,
-			TimeoutMillis: 5000,
+			TimeoutMillis: 3000,
 		},
 		{
 			ID:   "disney",
 			Type: "media",
 			Content: `function handler() {
-    var res = fetch("https://www.disneyplus.com/", { headers: {'User-Agent':'Mozilla/5.0'}, noRedir: true, timeout: 3000 });
+    var res = fetch("https://www.disneyplus.com/", { headers: {'User-Agent':'Mozilla/5.0'}, noRedir: true, timeout: 2500 });
     if (!res) return { text: "超时", color: "#f87171" };
     var loc = get(res, "headers.Location", "");
     if (loc.indexOf("preview") > 0 || loc.indexOf("unavailable") > 0) return { text: "不可用", color: "#f87171" };
     if (res.statusCode === 200 || res.statusCode === 301 || res.statusCode === 302) return { text: "解锁", color: "#34d399" };
     return { text: "不可用", color: "#f87171" };
 }`,
-			TimeoutMillis: 5000,
+			TimeoutMillis: 3000,
 		},
 		{
 			ID:   "openai",
 			Type: "media",
 			Content: `function handler() {
-    var res = fetch("https://ios.chat.openai.com/public-api/mobile/server_status/v1", { timeout: 3000 });
+    var res = fetch("https://ios.chat.openai.com/public-api/mobile/server_status/v1", { timeout: 2500 });
     if (!res) return { text: "超时", color: "#f87171" };
     if (res.statusCode === 200) return { text: "支持", color: "#34d399" };
     if (res.statusCode === 403) return { text: "封锁", color: "#f87171" };
     if (res.body && res.body.indexOf("unsupported_country") > 0) return { text: "地区受限", color: "#f87171" };
     return { text: "支持", color: "#34d399" };
 }`,
-			TimeoutMillis: 5000,
+			TimeoutMillis: 3000,
 		},
 		{
 			ID:   "spotify",
 			Type: "media",
 			Content: `function handler() {
-    var res = fetch("https://spclient.wg.spotify.com/signup/public/v1/account", { headers: {'User-Agent':'Mozilla/5.0'}, timeout: 3000 });
+    var res = fetch("https://spclient.wg.spotify.com/signup/public/v1/account", { headers: {'User-Agent':'Mozilla/5.0'}, timeout: 2500 });
     if (!res) return { text: "超时", color: "#f87171" };
     if (res.statusCode === 200 || res.statusCode === 400) return { text: "支持", color: "#34d399" };
     return { text: "不可用", color: "#f87171" };
 }`,
-			TimeoutMillis: 5000,
+			TimeoutMillis: 3000,
 		},
 		{
 			ID:   "claude",
 			Type: "media",
 			Content: `function handler() {
-    var res = fetch("https://claude.ai/login", { headers: {'User-Agent':'Mozilla/5.0'}, noRedir: true, timeout: 3000 });
+    var res = fetch("https://claude.ai/login", { headers: {'User-Agent':'Mozilla/5.0'}, noRedir: true, timeout: 2500 });
     if (!res) return { text: "超时", color: "#f87171" };
     var loc = get(res, "headers.Location", "");
     if (loc.indexOf("unavailable") > 0) return { text: "不可用", color: "#f87171" };
     if (res.statusCode === 200) return { text: "支持", color: "#34d399" };
     return { text: "不可用", color: "#f87171" };
 }`,
-			TimeoutMillis: 5000,
+			TimeoutMillis: 3000,
 		},
 		{
 			ID:   "tiktok",
 			Type: "media",
 			Content: `function handler() {
-    var res = fetch("https://www.tiktok.com", { headers: {'User-Agent':'Mozilla/5.0'}, timeout: 3000 });
+    var res = fetch("https://www.tiktok.com", { headers: {'User-Agent':'Mozilla/5.0'}, timeout: 2500 });
     if (!res || !res.body) return { text: "超时", color: "#f87171" };
     if (res.statusCode === 200) {
         var idx = res.body.indexOf('"region":');
@@ -2273,36 +2300,36 @@ func buildDefaultMediaScripts() []slaveScript {
     }
     return { text: "失败", color: "#f87171" };
 }`,
-			TimeoutMillis: 5000,
+			TimeoutMillis: 3000,
 		},
 		{
 			ID:   "bilibili",
 			Type: "media",
 			Content: `function handler() {
-    var res = fetch("https://api.bilibili.com/pgc/player/web/playurl?avid=50762638&cid=100279344&qn=0&type=&otype=json&ep_id=268176", { headers: {'User-Agent':'Mozilla/5.0'}, timeout: 3000 });
+    var res = fetch("https://api.bilibili.com/pgc/player/web/playurl?avid=50762638&cid=100279344&qn=0&type=&otype=json&ep_id=268176", { headers: {'User-Agent':'Mozilla/5.0'}, timeout: 2500 });
     if (!res || !res.body) return { text: "超时", color: "#f87171" };
     var d = safeParse(res.body);
     if (d.code === 0 || d.message === "success") return { text: "解锁 (台湾)", color: "#34d399" };
-    var res2 = fetch("https://api.bilibili.com/pgc/player/web/playurl?avid=18281381&cid=29892777&qn=0&type=&otype=json&ep_id=183799", { headers: {'User-Agent':'Mozilla/5.0'}, timeout: 3000 });
+    var res2 = fetch("https://api.bilibili.com/pgc/player/web/playurl?avid=18281381&cid=29892777&qn=0&type=&otype=json&ep_id=183799", { headers: {'User-Agent':'Mozilla/5.0'}, timeout: 2500 });
     if (res2 && res2.body) {
         var d2 = safeParse(res2.body);
         if (d2.code === 0 || d2.message === "success") return { text: "解锁 (港澳台)", color: "#34d399" };
     }
     return { text: "大陆受限", color: "#fbbf24" };
 }`,
-			TimeoutMillis: 5000,
+			TimeoutMillis: 3000,
 		},
 		{
 			ID:   "wikipedia",
 			Type: "media",
 			Content: `function handler() {
-    var res = fetch("https://en.wikipedia.org/w/index.php?title=Wikipedia:WikiProject_on_open_proxies&action=edit", { headers: {'User-Agent':'Mozilla/5.0'}, timeout: 3000 });
+    var res = fetch("https://en.wikipedia.org/w/index.php?title=Wikipedia:WikiProject_on_open_proxies&action=edit", { headers: {'User-Agent':'Mozilla/5.0'}, timeout: 2500 });
     if (!res || !res.body) return { text: "超时", color: "#f87171" };
     if (res.body.indexOf("This IP address has been") > 0) return { text: "禁止编辑", color: "#f87171" };
     if (res.statusCode === 200) return { text: "允许编辑", color: "#34d399" };
     return { text: "不可用", color: "#f87171" };
 }`,
-			TimeoutMillis: 5000,
+			TimeoutMillis: 3000,
 		},
 	}
 }

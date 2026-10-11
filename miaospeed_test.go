@@ -238,7 +238,7 @@ func TestExecuteMiaospeedTask(t *testing.T) {
 	}
 	job := Job{ID: "task-001"}
 
-	report, err := executeMiaospeedTask(context.Background(), wsURL, origin, token, nodes, job, nil, nil)
+	report, err := executeMiaospeedTask(context.Background(), wsURL, origin, token, nodes, len(nodes), job, nil, nil)
 	if err != nil {
 		t.Fatalf("任务执行失败: %v", err)
 	}
@@ -1033,5 +1033,42 @@ func TestParseSSEnhanced(t *testing.T) {
 	}
 	if !strings.Contains(p, `plugin: "obfs-local"`) {
 		t.Fatalf("Payload 缺少 plugin: %s", p)
+	}
+}
+
+// TestMiaospeedMultiNodeBatchPlanAndTotalNodes 验证批量测速计划时长优化与 TotalNodes 跟踪。
+func TestMiaospeedMultiNodeBatchPlanAndTotalNodes(t *testing.T) {
+	// 1. 单节点默认下载测速 5s
+	planSingle := buildMiaospeedTestPlan(Job{Query: "full"}, 1)
+	if planSingle.DownloadDuration != 5 {
+		t.Fatalf("单节点期望下载时长 5s，实际: %d", planSingle.DownloadDuration)
+	}
+
+	// 2. 多节点批量测速下载时长优化为 3s
+	planMulti := buildMiaospeedTestPlan(Job{Query: "full"}, 48)
+	if planMulti.DownloadDuration != 3 {
+		t.Fatalf("多节点期望下载时长 3s，实际: %d", planMulti.DownloadDuration)
+	}
+
+	// 3. parseSlaveTaskResult 正确记录 TotalNodes
+	task := &slaveTask{
+		Results: []slaveEntrySlot{
+			{Grouping: "g1"},
+			{Grouping: "g2"},
+		},
+	}
+	nodes := []MiaospeedNode{
+		{Name: "Node1"},
+		{Name: "Node2"},
+	}
+	rep := parseSlaveTaskResult(task, nodes, 48, planMulti, 10*time.Second)
+	if rep.TotalNodes != 48 {
+		t.Fatalf("期望 TotalNodes=48，实际: %d", rep.TotalNodes)
+	}
+	if len(rep.SubReports) != 2 {
+		t.Fatalf("期望 SubReports=2，实际: %d", len(rep.SubReports))
+	}
+	if rep.SubReports[0].TotalNodes != 48 {
+		t.Fatalf("SubReport 期望 TotalNodes=48，实际: %d", rep.SubReports[0].TotalNodes)
 	}
 }
