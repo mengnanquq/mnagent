@@ -1103,3 +1103,44 @@ func TestSelectJobNodesUnlimited(t *testing.T) {
 		t.Fatalf("指定 Count 超限期望返回全部 150 个节点，实际: %d", len(selectedOver))
 	}
 }
+
+// TestCalcMiaospeedTimeout 验证测试时间限制根据节点数量动态计算。
+func TestCalcMiaospeedTimeout(t *testing.T) {
+	// 1. 单节点保底 90s
+	if got := CalcMiaospeedTimeout(0); got != 90*time.Second {
+		t.Fatalf("0 节点期望保底 90s，实际: %v", got)
+	}
+	if got := CalcMiaospeedTimeout(1); got != 90*time.Second {
+		t.Fatalf("1 节点期望保底 90s，实际: %v", got)
+	}
+
+	// 2. 10 节点: 60s + 10*12s = 180s (3 分钟)
+	if got := CalcMiaospeedTimeout(10); got != 180*time.Second {
+		t.Fatalf("10 节点期望 180s，实际: %v", got)
+	}
+
+	// 3. 100 节点: 60s + 100*12s = 1260s (21 分钟)
+	if got := CalcMiaospeedTimeout(100); got != 1260*time.Second {
+		t.Fatalf("100 节点期望 1260s，实际: %v", got)
+	}
+
+	// 4. 200 节点: 60s + 200*12s = 2460s (41 分钟)
+	if got := CalcMiaospeedTimeout(200); got != 2460*time.Second {
+		t.Fatalf("200 节点期望 2460s，实际: %v", got)
+	}
+}
+
+// TestMiaospeedJobTimeoutAllowsLongRuns 验证 miaospeed 任务在 client 侧允许超过普通任务 10 分钟上限。
+func TestMiaospeedJobTimeoutAllowsLongRuns(t *testing.T) {
+	// 普通任务被限制在 10 分钟
+	normalJob := Job{Kind: "ping", TimeoutMS: 1800000} // 30 分钟
+	if got := normalJob.Timeout(); got != 10*time.Minute {
+		t.Fatalf("普通任务期望夹在 10 分钟，实际: %v", got)
+	}
+
+	// miaospeed 任务允许长达数十分钟甚至数小时
+	miaoJob := Job{Kind: "miaospeed", TimeoutMS: 1800000} // 30 分钟
+	if got := miaoJob.Timeout(); got != 30*time.Minute {
+		t.Fatalf("miaospeed 任务期望允许 30 分钟，实际: %v", got)
+	}
+}

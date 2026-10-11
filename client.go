@@ -38,8 +38,9 @@ type Job struct {
 
 // 任务超时的夹取区间（测试中可覆盖）。
 var (
-	jobMinTimeout = 5 * time.Second
-	jobMaxTimeout = 10 * time.Minute
+	jobMinTimeout          = 5 * time.Second
+	jobMaxTimeout          = 10 * time.Minute
+	jobMiaospeedMaxTimeout = 3 * time.Hour
 )
 
 // Timeout 返回任务执行超时，并夹在合理区间内，避免异常值让进程挂死或秒退。
@@ -48,8 +49,12 @@ func (j Job) Timeout() time.Duration {
 	if timeout < jobMinTimeout {
 		timeout = jobMinTimeout
 	}
-	if timeout > jobMaxTimeout {
-		timeout = jobMaxTimeout
+	maxTimeout := jobMaxTimeout
+	if j.Kind == "miaospeed" || j.Kind == "speed" {
+		maxTimeout = jobMiaospeedMaxTimeout
+	}
+	if timeout > maxTimeout {
+		timeout = maxTimeout
 	}
 	return timeout
 }

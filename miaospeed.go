@@ -1468,6 +1468,19 @@ func getInt(m map[string]any, k string) int {
 
 // --- MiaoSpeed 临时进程与单次任务执行引擎 ---
 
+// CalcMiaospeedTimeout 根据测速节点数量动态计算任务超时：
+// 基础准备时间 60s + 每个节点 12s 预算，单节点保底 90s。
+func CalcMiaospeedTimeout(nodeCount int) time.Duration {
+	if nodeCount <= 0 {
+		nodeCount = 1
+	}
+	timeout := 60*time.Second + time.Duration(nodeCount)*12*time.Second
+	if timeout < 90*time.Second {
+		timeout = 90 * time.Second
+	}
+	return timeout
+}
+
 // selectJobNodes 根据任务请求选取测速节点，默认无上限全量测速；仅在明确指定 Count 时截取前 Count 个节点。
 func selectJobNodes(allNodes []MiaospeedNode, count int) []MiaospeedNode {
 	if count > 0 && count < len(allNodes) {
@@ -1501,6 +1514,25 @@ func runMiaospeedJob(ctx context.Context, binary, ghProxy string, job Job, log l
 	totalNodes := len(allNodes)
 	nodes := selectJobNodes(allNodes, job.Count)
 
+	// 根据节点数量动态计算本次测速的超时时间限制
+	dynamicTimeout := CalcMiaospeedTimeout(len(nodes))
+	if reqTimeout := time.Duration(job.TimeoutMS) * time.Millisecond; reqTimeout > dynamicTimeout {
+		dynamicTimeout = reqTimeout
+	}
+
+	taskCtx, cancelTask := context.WithTimeout(ctx, dynamicTimeout)
+	defer cancelTask()
+
+	// 立即发送首包进度，告知上游总节点数与准备状态
+	if onProgress != nil {
+		onProgress(Progress{
+			ID:      job.ID,
+			Current: 0,
+			Total:   len(nodes),
+			Stage:   "准备测速",
+		})
+	}
+
 	// 2. 分配随机本地端口与 Token
 	port, err := getFreeLocalPort()
 	if err != nil {
@@ -1509,10 +1541,7 @@ func runMiaospeedJob(ctx context.Context, binary, ghProxy string, job Job, log l
 	token := generateRandomHex(16)
 
 	// 3. 启动临时 miaospeed server 进程
-	cmdCtx, cancelCmd := context.WithCancel(ctx)
-	defer cancelCmd()
-
-	cmd := exec.CommandContext(cmdCtx, binPath, "server",
+	cmd := exec.CommandContext(taskCtx, binPath, "server",
 		"-bind", fmt.Sprintf("127.0.0.1:%d", port),
 		"-token", token,
 	)
@@ -1522,7 +1551,7 @@ func runMiaospeedJob(ctx context.Context, binary, ghProxy string, job Job, log l
 	cmd.Stderr = &serverOut
 
 	if log != nil {
-		log.Debug("启动 miaospeed 服务", "binary", binPath, "port", port)
+		log.Debug("启动 miaospeed 服务", "binary", binPath, "port", port, "timeout", dynamicTimeout, "nodes", len(nodes))
 	}
 
 	if err := cmd.Start(); err != nil {
@@ -1531,7 +1560,6 @@ func runMiaospeedJob(ctx context.Context, binary, ghProxy string, job Job, log l
 
 	// 确保退出时终止进程
 	defer func() {
-		cancelCmd()
 		if cmd.Process != nil {
 			_ = cmd.Process.Kill()
 		}
@@ -1539,7 +1567,7 @@ func runMiaospeedJob(ctx context.Context, binary, ghProxy string, job Job, log l
 	}()
 
 	addr := fmt.Sprintf("127.0.0.1:%d", port)
-	if err := waitForPortReady(ctx, addr, 4*time.Second); err != nil {
+	if err := waitForPortReady(taskCtx, addr, 4*time.Second); err != nil {
 		return "", nil, fmt.Errorf("等待 miaospeed 就绪超时: %w\n%s", err, serverOut.String())
 	}
 
@@ -1547,7 +1575,7 @@ func runMiaospeedJob(ctx context.Context, binary, ghProxy string, job Job, log l
 	wsURL := fmt.Sprintf("ws://%s/", addr)
 	origin := fmt.Sprintf("http://%s/", addr)
 
-	report, err := executeMiaospeedTask(ctx, wsURL, origin, token, nodes, totalNodes, job, log, onProgress)
+	report, err := executeMiaospeedTask(taskCtx, wsURL, origin, token, nodes, totalNodes, job, log, onProgress)
 	if err != nil {
 		return "", nil, err
 	}
