@@ -677,6 +677,8 @@ func parseProxyURI(rawURI string) (*MiaospeedNode, error) {
 	}
 
 	switch strings.ToLower(u.Scheme) {
+	case "anytls":
+		return parseAnyTLSURI(u)
 	case "ss":
 		return parseShadowsocksURI(rawURI, u)
 	case "ssr":
@@ -1431,6 +1433,80 @@ func parseSnellURI(u *url.URL) (*MiaospeedNode, error) {
 		Name:     name,
 		Protocol: "snell",
 		Server:   fmt.Sprintf("%s:%d", server, port),
+		Port:     port,
+		Payload:  sb.String(),
+	}, nil
+}
+
+func parseAnyTLSURI(u *url.URL) (*MiaospeedNode, error) {
+	name := u.Fragment
+	if name == "" {
+		name = "AnyTLS-Node"
+	}
+	name, _ = url.QueryUnescape(name)
+
+	password := ""
+	if u.User != nil {
+		if p, ok := u.User.Password(); ok {
+			password = p
+		} else {
+			password = u.User.Username()
+		}
+		password, _ = url.QueryUnescape(password)
+	}
+
+	server := u.Hostname()
+	port, _ := strconv.Atoi(u.Port())
+	if port == 0 {
+		port = 443
+	}
+
+	q := u.Query()
+	sni := q.Get("sni")
+	if sni == "" {
+		sni = q.Get("peer")
+	}
+	fp := q.Get("fp")
+	if fp == "" {
+		fp = q.Get("client-fingerprint")
+	}
+	insecure := q.Get("insecure")
+	if insecure == "" {
+		insecure = q.Get("allowInsecure")
+	}
+	if insecure == "" {
+		insecure = q.Get("allow_insecure")
+	}
+	alpn := q.Get("alpn")
+
+	var sb strings.Builder
+	sb.WriteString(fmt.Sprintf("name: %s\ntype: anytls\nserver: %s\nport: %d\npassword: %s\nudp: true\n",
+		quoteYAML(name), server, port, quoteYAML(password)))
+	if sni != "" {
+		sb.WriteString(fmt.Sprintf("sni: %s\n", quoteYAML(sni)))
+	}
+	if fp != "" {
+		sb.WriteString(fmt.Sprintf("client-fingerprint: %s\n", quoteYAML(fp)))
+	}
+	if insecure == "1" || strings.EqualFold(insecure, "true") {
+		sb.WriteString("skip-cert-verify: true\n")
+	}
+	if alpn != "" {
+		sb.WriteString("alpn:\n")
+		for _, a := range strings.Split(alpn, ",") {
+			a = strings.TrimSpace(a)
+			if a != "" {
+				sb.WriteString(fmt.Sprintf("  - %s\n", quoteYAML(a)))
+			}
+		}
+	}
+
+	srvAddr := net.JoinHostPort(server, strconv.Itoa(port))
+
+	return &MiaospeedNode{
+		Name:     name,
+		Protocol: "anytls",
+		Server:   srvAddr,
 		Port:     port,
 		Payload:  sb.String(),
 	}, nil

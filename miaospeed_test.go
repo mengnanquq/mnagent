@@ -147,6 +147,46 @@ func TestParseProxyURIs(t *testing.T) {
 		}
 	})
 
+	t.Run("AnyTLS", func(t *testing.T) {
+		uri := "anytls://secret-pass@anytls.example:8443/?sni=tls.example&insecure=1&alpn=h2,http/1.1&client-fingerprint=chrome#HK-AnyTLS"
+		node, err := parseProxyURI(uri)
+		if err != nil {
+			t.Fatalf("解析失败: %v", err)
+		}
+		if node.Protocol != "anytls" || node.Server != "anytls.example:8443" || node.Name != "HK-AnyTLS" {
+			t.Fatalf("节点信息不符合预期: %+v", node)
+		}
+		if !strings.Contains(node.Payload, "type: anytls") ||
+			!strings.Contains(node.Payload, "password: \"secret-pass\"") ||
+			!strings.Contains(node.Payload, "sni: \"tls.example\"") ||
+			!strings.Contains(node.Payload, "skip-cert-verify: true") ||
+			!strings.Contains(node.Payload, "client-fingerprint: \"chrome\"") ||
+			!strings.Contains(node.Payload, "udp: true") ||
+			!strings.Contains(node.Payload, "- \"h2\"") {
+			t.Fatalf("Payload YAML 错误:\n%s", node.Payload)
+		}
+
+		// 测试 IPv6 与缺省配置
+		uri6 := "anytls://pwd@[2409:8a71:6a00:1953::615]:8964/?insecure=1#IPv6-Node"
+		node6, err := parseProxyURI(uri6)
+		if err != nil {
+			t.Fatalf("IPv6 解析失败: %v", err)
+		}
+		if node6.Server != "[2409:8a71:6a00:1953::615]:8964" || node6.Name != "IPv6-Node" {
+			t.Fatalf("IPv6 节点信息不符合预期: %+v", node6)
+		}
+
+		// 测试默认端口与默认名称
+		uriDefault := "anytls://letmein@example.com"
+		nodeDef, err := parseProxyURI(uriDefault)
+		if err != nil {
+			t.Fatalf("默认参数解析失败: %v", err)
+		}
+		if nodeDef.Server != "example.com:443" || nodeDef.Name != "AnyTLS-Node" {
+			t.Fatalf("默认参数不符合预期: %+v", nodeDef)
+		}
+	})
+
 	t.Run("不支持的协议", func(t *testing.T) {
 		uri := "ftp://example.com"
 		_, err := parseProxyURI(uri)
