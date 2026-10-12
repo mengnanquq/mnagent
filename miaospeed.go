@@ -329,7 +329,7 @@ func signMiaoSpeedRequest(token, buildToken string, req slaveRequest) (string, e
 	return base64.URLEncoding.EncodeToString(hasher.Sum(nil)), nil
 }
 
-// parseProxyTarget 将任务 Target（单节点链接、订阅 URL 或原生 YAML）解析为节点列表。
+// parseProxyTarget 将任务 Target（单节点链接、订阅 URL 或代理配置文件内容）解析为节点列表。
 func parseProxyTarget(ctx context.Context, target string) ([]MiaospeedNode, error) {
 	target = strings.TrimSpace(target)
 	if target == "" {
@@ -341,23 +341,133 @@ func parseProxyTarget(ctx context.Context, target string) ([]MiaospeedNode, erro
 		return fetchAndParseSubscription(ctx, target)
 	}
 
-	// 2. 如果包含换行且含有 YAML 关键字（如 type: ），直接作为原生配置。
-	if strings.Contains(target, "type:") && (strings.Contains(target, "server:") || strings.Contains(target, "port:")) {
+	// 2. 解析本地/直接传入的配置文件或节点文本（支持 Clash YAML、Sing-box JSON、Base64 订阅、多行 URI 及单节点）。
+	return parseProxyContent(target)
+}
+
+// parseProxyContent 解析代理配置文件或节点文本内容，支持：
+// 1. Clash/Meta 配置文件（包含 proxies:）
+// 2. Sing-box JSON 配置文件（包含 outbounds 或节点数组）
+// 3. 裸 YAML 代理节点列表（以 - name: / - { 开头）
+// 4. Base64 编码的订阅/配置内容
+// 5. 多行代理 URI 列表（ss/ssr/vmess/vless/trojan/hysteria2/tuic/anytls/socks5/snell）
+// 6. 单个原生 YAML 节点或单节点 URI
+func parseProxyContent(content string) ([]MiaospeedNode, error) {
+	content = strings.TrimSpace(content)
+	content = strings.TrimPrefix(content, "\xef\xbb\xbf") // 移除 UTF-8 BOM
+	content = strings.ReplaceAll(content, "\r\n", "\n")
+	content = strings.TrimSpace(content)
+	if content == "" {
+		return nil, errors.New("代理配置内容为空")
+	}
+
+	// 1. Clash YAML 配置（包含 proxies:）
+	if strings.Contains(content, "proxies:") {
+		nodes := parseClashYAMLProxies(content)
+		if len(nodes) > 0 {
+			return nodes, nil
+		}
+	}
+
+	// 2. Sing-box JSON 配置文件（以 { 或 [ 开头）
+	if strings.HasPrefix(content, "{") || strings.HasPrefix(content, "[") {
+		nodes := parseSingBoxJSON(content)
+		if len(nodes) > 0 {
+			return nodes, nil
+		}
+	}
+
+	// 3. 裸 YAML 代理列表（无顶层 proxies:，直接以 - name: 或 - { 开头）
+	trimmedLines := strings.Split(content, "\n")
+	firstNonEmpty := ""
+	for _, l := range trimmedLines {
+		tl := strings.TrimSpace(l)
+		if tl != "" && !strings.HasPrefix(tl, "#") {
+			firstNonEmpty = tl
+			break
+		}
+	}
+	if strings.HasPrefix(firstNonEmpty, "-") && (strings.Contains(content, "name:") || strings.Contains(content, "type:")) {
+		nodes := parseClashYAMLProxies("proxies:\n" + content)
+		if len(nodes) > 0 {
+			return nodes, nil
+		}
+	}
+
+	// 4. Base64 编码的配置文件或订阅内容
+	if isPossibleBase64(content) {
+		if decoded, err := decodeBase64Safe(content); err == nil && len(decoded) > 0 {
+			decStr := strings.TrimSpace(string(decoded))
+			if decStr != "" && decStr != content {
+				if nodes, err := parseProxyContent(decStr); err == nil && len(nodes) > 0 {
+					return nodes, nil
+				}
+			}
+		}
+	}
+
+	// 5. 多行代理 URI 列表扫描
+	var uriNodes []MiaospeedNode
+	for _, line := range trimmedLines {
+		line = strings.TrimSpace(line)
+		if line == "" || strings.HasPrefix(line, "#") || strings.HasPrefix(line, "//") {
+			continue
+		}
+		if n, err := parseProxyURI(line); err == nil && n != nil {
+			uriNodes = append(uriNodes, *n)
+		}
+	}
+	if len(uriNodes) > 0 {
+		return uriNodes, nil
+	}
+
+	// 6. 单个原生 YAML 节点（包含 type: 与 server:/port:）
+	if strings.Contains(content, "type:") && (strings.Contains(content, "server:") || strings.Contains(content, "port:")) {
+		name := "Custom-Node"
+		pType := ""
+		server := ""
+		port := ""
+		for _, line := range trimmedLines {
+			parseLineKeyValue(strings.TrimSpace(line), &name, &pType, &server, &port)
+		}
+		srv := server
+		if port != "" && !strings.Contains(server, ":") {
+			srv += ":" + port
+		}
 		return []MiaospeedNode{{
-			Name:    "Custom-Node",
-			Payload: target,
+			Name:     name,
+			Protocol: pType,
+			Server:   srv,
+			Payload:  content,
 		}}, nil
 	}
 
-	// 3. 解析单节点 URI（ss://, vmess://, trojan://, vless://, hysteria2://）。
-	node, err := parseProxyURI(target)
+	// 7. 单节点 URI 解析（保留单条 URI 的具体报错信息）
+	node, err := parseProxyURI(content)
 	if err != nil {
 		return nil, err
 	}
 	return []MiaospeedNode{*node}, nil
 }
 
-// fetchAndParseSubscription 拉取订阅并提取节点，支持 Base64 URI 列表与原生 Clash YAML。
+// isPossibleBase64 判断字符串是否可能为 Base64 编码的订阅文本。
+func isPossibleBase64(s string) bool {
+	s = strings.TrimSpace(s)
+	if len(s) < 8 || strings.Contains(s, "://") || strings.Contains(s, "proxies:") {
+		return false
+	}
+	for _, r := range s {
+		if (r >= 'A' && r <= 'Z') || (r >= 'a' && r <= 'z') || (r >= '0' && r <= '9') ||
+			r == '+' || r == '/' || r == '=' || r == '-' || r == '_' ||
+			r == '\n' || r == '\r' || r == ' ' || r == '\t' {
+			continue
+		}
+		return false
+	}
+	return true
+}
+
+// fetchAndParseSubscription 拉取订阅并提取节点，支持 Base64 URI 列表、Clash YAML 与 Sing-box JSON。
 func fetchAndParseSubscription(ctx context.Context, subURL string) ([]MiaospeedNode, error) {
 	// 依次尝试主流订阅客户端 User-Agent，优先获取原生 Clash-Meta 配置（miaospeed 基于 Clash-Meta 核心），避免手动逆向协议丢失 TLS/证书指纹与高级参数
 	userAgents := []string{"ClashMeta", "clash.meta", "Clash.Meta; mihomo", "mihomo", "v2rayng", "clash"}
@@ -391,36 +501,7 @@ func fetchAndParseSubscription(ctx context.Context, subURL string) ([]MiaospeedN
 		}
 
 		content := strings.TrimSpace(string(body))
-		// 1. 如果是 Clash YAML 配置（包含 proxies:），直接解析 YAML 节点
-		if strings.Contains(content, "proxies:") {
-			nodes := parseClashYAMLProxies(content)
-			if len(nodes) > 0 {
-				return nodes, nil
-			}
-		}
-
-		// 2. 尝试 Base64 解码并按行解析 URI
-		decoded, err := base64.StdEncoding.DecodeString(content)
-		if err != nil {
-			decoded, err = base64.RawStdEncoding.DecodeString(content)
-		}
-		if err == nil && len(decoded) > 0 {
-			content = string(decoded)
-		}
-
-		lines := strings.Split(content, "\n")
-		var nodes []MiaospeedNode
-		for _, line := range lines {
-			line = strings.TrimSpace(line)
-			if line == "" || strings.HasPrefix(line, "#") {
-				continue
-			}
-			if n, err := parseProxyURI(line); err == nil && n != nil {
-				nodes = append(nodes, *n)
-			}
-		}
-
-		if len(nodes) > 0 {
+		if nodes, err := parseProxyContent(content); err == nil && len(nodes) > 0 {
 			return nodes, nil
 		}
 		lastErr = errors.New("订阅中未找到有效代理节点")
@@ -434,6 +515,8 @@ func fetchAndParseSubscription(ctx context.Context, subURL string) ([]MiaospeedN
 
 // parseClashYAMLProxies 从原生 Clash/Meta 配置文件中提取 proxies 节点。
 func parseClashYAMLProxies(content string) []MiaospeedNode {
+	content = strings.TrimPrefix(content, "\xef\xbb\xbf")
+	content = strings.ReplaceAll(content, "\r\n", "\n")
 	lines := strings.Split(content, "\n")
 	var nodes []MiaospeedNode
 	inProxies := false
@@ -472,28 +555,35 @@ func parseClashYAMLProxies(content string) []MiaospeedNode {
 
 	for _, line := range lines {
 		trimmed := strings.TrimSpace(line)
-		if trimmed == "proxies:" {
-			inProxies = true
+		if !inProxies {
+			if trimmed == "proxies:" || strings.HasPrefix(trimmed, "proxies: ") || strings.HasPrefix(trimmed, "proxies:\t") || strings.HasPrefix(trimmed, "proxies:#") {
+				inProxies = true
+			}
 			continue
 		}
 		if inProxies {
+			// 先过滤空行与注释行，避免顶格注释行被误判为下一个顶级配置段而提前中断
+			if trimmed == "" || strings.HasPrefix(trimmed, "#") {
+				continue
+			}
+
 			// 退出 proxies 块（遇到未缩进的下一个顶级配置段）
 			if len(line) > 0 && !strings.HasPrefix(line, " ") && !strings.HasPrefix(line, "\t") && !strings.HasPrefix(line, "-") {
 				flushItem()
 				break
-			}
-			if trimmed == "" || strings.HasPrefix(trimmed, "#") {
-				continue
 			}
 
 			// 计算当前行前置空白缩进
 			indent := len(line) - len(strings.TrimLeft(line, " \t"))
 
 			// 单行格式: - {name: ..., server: ..., ...}
-			if strings.HasPrefix(trimmed, "- {") && strings.HasSuffix(trimmed, "}") {
+			if strings.HasPrefix(trimmed, "- {") || strings.HasPrefix(trimmed, "-{") {
 				flushItem()
 				baseIndent = indent
 				rawItem := strings.TrimSpace(strings.TrimPrefix(trimmed, "-"))
+				if closeIdx := strings.LastIndex(rawItem, "}"); closeIdx != -1 {
+					rawItem = rawItem[:closeIdx+1]
+				}
 				name := extractField(rawItem, "name")
 				pType := extractField(rawItem, "type")
 				server := extractField(rawItem, "server")
@@ -539,7 +629,9 @@ func parseClashYAMLProxies(content string) []MiaospeedNode {
 					relIndent = 0
 				}
 				currentItem.WriteString(strings.Repeat(" ", relIndent) + trimmed + "\n")
-				parseLineKeyValue(trimmed, &currentName, &currentType, &currentServer, &currentPort)
+				if relIndent == 0 {
+					parseLineKeyValue(trimmed, &currentName, &currentType, &currentServer, &currentPort)
+				}
 			}
 		}
 	}
@@ -665,6 +757,284 @@ func extractField(raw, key string) string {
 		}
 
 		start = actualIdx + len(key)
+	}
+}
+
+type singBoxOutbound struct {
+	Type              string `json:"type"`
+	Tag               string `json:"tag"`
+	Name              string `json:"name"`
+	Server            string `json:"server"`
+	ServerPort        int    `json:"server_port"`
+	Port              int    `json:"port"`
+	Method            string `json:"method"`
+	Cipher            string `json:"cipher"`
+	Password          string `json:"password"`
+	Username          string `json:"username"`
+	UUID              string `json:"uuid"`
+	Flow              string `json:"flow"`
+	Security          string `json:"security"`
+	AlterID           int    `json:"alter_id"`
+	AuthStr           string `json:"auth_str"`
+	UpMbps            int    `json:"up_mbps"`
+	DownMbps          int    `json:"down_mbps"`
+	CongestionControl string `json:"congestion_control"`
+	UDPRelayMode      string `json:"udp_relay_mode"`
+
+	TLS *struct {
+		Enabled    bool     `json:"enabled"`
+		ServerName string   `json:"server_name"`
+		Insecure   bool     `json:"insecure"`
+		ALPN       []string `json:"alpn"`
+		UTLS       *struct {
+			Enabled     bool   `json:"enabled"`
+			Fingerprint string `json:"fingerprint"`
+		} `json:"utls"`
+		Reality *struct {
+			Enabled   bool   `json:"enabled"`
+			PublicKey string `json:"public_key"`
+			ShortID   string `json:"short_id"`
+		} `json:"reality"`
+	} `json:"tls"`
+
+	Transport *struct {
+		Type        string            `json:"type"`
+		Path        string            `json:"path"`
+		Headers     map[string]string `json:"headers"`
+		ServiceName string            `json:"service_name"`
+	} `json:"transport"`
+
+	Obfs *struct {
+		Type     string `json:"type"`
+		Password string `json:"password"`
+	} `json:"obfs"`
+}
+
+// parseSingBoxJSON 从 Sing-box JSON 配置文件（或节点数组/单节点 JSON）中提取代理节点。
+func parseSingBoxJSON(content string) []MiaospeedNode {
+	content = strings.TrimSpace(content)
+	var outbounds []singBoxOutbound
+
+	if strings.HasPrefix(content, "[") {
+		_ = json.Unmarshal([]byte(content), &outbounds)
+	} else if strings.HasPrefix(content, "{") {
+		var wrapper struct {
+			Outbounds []singBoxOutbound `json:"outbounds"`
+			Proxies   []singBoxOutbound `json:"proxies"`
+		}
+		if err := json.Unmarshal([]byte(content), &wrapper); err == nil {
+			if len(wrapper.Outbounds) > 0 {
+				outbounds = wrapper.Outbounds
+			} else if len(wrapper.Proxies) > 0 {
+				outbounds = wrapper.Proxies
+			}
+		}
+		if len(outbounds) == 0 {
+			var single singBoxOutbound
+			if err := json.Unmarshal([]byte(content), &single); err == nil && single.Type != "" && single.Server != "" {
+				outbounds = []singBoxOutbound{single}
+			}
+		}
+	}
+
+	var nodes []MiaospeedNode
+	for _, ob := range outbounds {
+		if n := convertSingBoxOutbound(ob); n != nil {
+			nodes = append(nodes, *n)
+		}
+	}
+	return nodes
+}
+
+func convertSingBoxOutbound(ob singBoxOutbound) *MiaospeedNode {
+	pType := strings.ToLower(strings.TrimSpace(ob.Type))
+	switch pType {
+	case "", "direct", "block", "dns", "selector", "urltest", "tor", "ssh", "wireguard":
+		return nil
+	case "shadowsocks":
+		pType = "ss"
+	case "hy2":
+		pType = "hysteria2"
+	case "hy":
+		pType = "hysteria"
+	case "socks":
+		pType = "socks5"
+	}
+
+	port := ob.ServerPort
+	if port == 0 {
+		port = ob.Port
+	}
+	server := strings.TrimSpace(ob.Server)
+	if server == "" || port <= 0 {
+		return nil
+	}
+
+	name := strings.TrimSpace(ob.Tag)
+	if name == "" {
+		name = strings.TrimSpace(ob.Name)
+	}
+	if name == "" {
+		name = fmt.Sprintf("%s-%s:%d", pType, server, port)
+	}
+
+	var sb strings.Builder
+	switch pType {
+	case "ss":
+		cipher := ob.Method
+		if cipher == "" {
+			cipher = ob.Cipher
+		}
+		if cipher == "" {
+			cipher = "aes-256-gcm"
+		}
+		sb.WriteString(fmt.Sprintf("name: %s\ntype: ss\nserver: %s\nport: %d\ncipher: %s\npassword: %s\nudp: true\n",
+			quoteYAML(name), server, port, cipher, quoteYAML(ob.Password)))
+	case "vmess":
+		cipher := ob.Security
+		if cipher == "" {
+			cipher = "auto"
+		}
+		netType := "tcp"
+		if ob.Transport != nil && ob.Transport.Type != "" {
+			netType = ob.Transport.Type
+		}
+		sb.WriteString(fmt.Sprintf("name: %s\ntype: vmess\nserver: %s\nport: %d\nuuid: %s\nalterId: %d\ncipher: %s\nudp: true\nnetwork: %s\n",
+			quoteYAML(name), server, port, ob.UUID, ob.AlterID, cipher, netType))
+		writeSingBoxTLSAndTransport(&sb, ob, "servername")
+	case "vless":
+		netType := "tcp"
+		if ob.Transport != nil && ob.Transport.Type != "" {
+			netType = ob.Transport.Type
+		}
+		sb.WriteString(fmt.Sprintf("name: %s\ntype: vless\nserver: %s\nport: %d\nuuid: %s\nudp: true\nnetwork: %s\n",
+			quoteYAML(name), server, port, ob.UUID, netType))
+		if ob.Flow != "" {
+			sb.WriteString(fmt.Sprintf("flow: %s\n", quoteYAML(ob.Flow)))
+		}
+		writeSingBoxTLSAndTransport(&sb, ob, "servername")
+	case "trojan":
+		netType := "tcp"
+		if ob.Transport != nil && ob.Transport.Type != "" {
+			netType = ob.Transport.Type
+		}
+		sb.WriteString(fmt.Sprintf("name: %s\ntype: trojan\nserver: %s\nport: %d\npassword: %s\nudp: true\n",
+			quoteYAML(name), server, port, quoteYAML(ob.Password)))
+		if netType != "tcp" {
+			sb.WriteString(fmt.Sprintf("network: %s\n", netType))
+		}
+		writeSingBoxTLSAndTransport(&sb, ob, "sni")
+	case "hysteria2":
+		sb.WriteString(fmt.Sprintf("name: %s\ntype: hysteria2\nserver: %s\nport: %d\npassword: %s\nudp: true\n",
+			quoteYAML(name), server, port, quoteYAML(ob.Password)))
+		if ob.TLS != nil {
+			if ob.TLS.ServerName != "" {
+				sb.WriteString(fmt.Sprintf("sni: %s\n", quoteYAML(ob.TLS.ServerName)))
+			}
+			if ob.TLS.Insecure {
+				sb.WriteString("skip-cert-verify: true\n")
+			}
+			if len(ob.TLS.ALPN) > 0 {
+				sb.WriteString("alpn:\n")
+				for _, a := range ob.TLS.ALPN {
+					sb.WriteString(fmt.Sprintf("  - %s\n", quoteYAML(a)))
+				}
+			}
+		}
+		if ob.Obfs != nil && ob.Obfs.Type != "" {
+			sb.WriteString(fmt.Sprintf("obfs: %s\n", quoteYAML(ob.Obfs.Type)))
+			if ob.Obfs.Password != "" {
+				sb.WriteString(fmt.Sprintf("obfs-password: %s\n", quoteYAML(ob.Obfs.Password)))
+			}
+		}
+	case "tuic":
+		cc := ob.CongestionControl
+		if cc == "" {
+			cc = "bbr"
+		}
+		urm := ob.UDPRelayMode
+		if urm == "" {
+			urm = "native"
+		}
+		sb.WriteString(fmt.Sprintf("name: %s\ntype: tuic\nserver: %s\nport: %d\nuuid: %s\npassword: %s\nudp: true\ncongestion-controller: %s\nudp-relay-mode: %s\n",
+			quoteYAML(name), server, port, quoteYAML(ob.UUID), quoteYAML(ob.Password), quoteYAML(cc), quoteYAML(urm)))
+		if ob.TLS != nil {
+			if ob.TLS.ServerName != "" {
+				sb.WriteString(fmt.Sprintf("sni: %s\n", quoteYAML(ob.TLS.ServerName)))
+			}
+			if ob.TLS.Insecure {
+				sb.WriteString("skip-cert-verify: true\n")
+			}
+		}
+	case "anytls":
+		sb.WriteString(fmt.Sprintf("name: %s\ntype: anytls\nserver: %s\nport: %d\npassword: %s\nudp: true\n",
+			quoteYAML(name), server, port, quoteYAML(ob.Password)))
+		writeSingBoxTLSAndTransport(&sb, ob, "sni")
+	case "socks5":
+		sb.WriteString(fmt.Sprintf("name: %s\ntype: socks5\nserver: %s\nport: %d\nudp: true\n",
+			quoteYAML(name), server, port))
+		if ob.Username != "" {
+			sb.WriteString(fmt.Sprintf("username: %s\n", quoteYAML(ob.Username)))
+		}
+		if ob.Password != "" {
+			sb.WriteString(fmt.Sprintf("password: %s\n", quoteYAML(ob.Password)))
+		}
+	default:
+		return nil
+	}
+
+	return &MiaospeedNode{
+		Name:     name,
+		Protocol: pType,
+		Server:   fmt.Sprintf("%s:%d", server, port),
+		Port:     port,
+		Payload:  sb.String(),
+	}
+}
+
+func writeSingBoxTLSAndTransport(sb *strings.Builder, ob singBoxOutbound, sniKey string) {
+	if ob.TLS != nil && ob.TLS.Enabled {
+		if sniKey == "servername" {
+			sb.WriteString("tls: true\n")
+		}
+		if ob.TLS.ServerName != "" {
+			sb.WriteString(fmt.Sprintf("%s: %s\n", sniKey, quoteYAML(ob.TLS.ServerName)))
+		}
+		if ob.TLS.Insecure {
+			sb.WriteString("skip-cert-verify: true\n")
+		}
+		if ob.TLS.UTLS != nil && ob.TLS.UTLS.Fingerprint != "" {
+			sb.WriteString(fmt.Sprintf("client-fingerprint: %s\n", quoteYAML(ob.TLS.UTLS.Fingerprint)))
+		}
+		if len(ob.TLS.ALPN) > 0 {
+			sb.WriteString("alpn:\n")
+			for _, a := range ob.TLS.ALPN {
+				sb.WriteString(fmt.Sprintf("  - %s\n", quoteYAML(a)))
+			}
+		}
+		if ob.TLS.Reality != nil && ob.TLS.Reality.Enabled && ob.TLS.Reality.PublicKey != "" {
+			sb.WriteString("reality-opts:\n")
+			sb.WriteString(fmt.Sprintf("  public-key: %s\n", quoteYAML(ob.TLS.Reality.PublicKey)))
+			if ob.TLS.Reality.ShortID != "" {
+				sb.WriteString(fmt.Sprintf("  short-id: %s\n", quoteYAML(ob.TLS.Reality.ShortID)))
+			}
+		}
+	}
+	if ob.Transport != nil {
+		switch ob.Transport.Type {
+		case "ws":
+			sb.WriteString("ws-opts:\n")
+			if ob.Transport.Path != "" {
+				sb.WriteString(fmt.Sprintf("  path: %s\n", quoteYAML(ob.Transport.Path)))
+			}
+			if host := ob.Transport.Headers["Host"]; host != "" {
+				sb.WriteString(fmt.Sprintf("  headers:\n    Host: %s\n", quoteYAML(host)))
+			}
+		case "grpc":
+			if ob.Transport.ServiceName != "" {
+				sb.WriteString(fmt.Sprintf("grpc-opts:\n  grpc-service-name: %s\n", quoteYAML(ob.Transport.ServiceName)))
+			}
+		}
 	}
 }
 

@@ -1184,3 +1184,175 @@ func TestMiaospeedJobTimeoutAllowsLongRuns(t *testing.T) {
 		t.Fatalf("miaospeed 任务期望允许 30 分钟，实际: %v", got)
 	}
 }
+
+// TestParseProxyContent_Configs 验证对各类代理配置文件（Clash YAML、Sing-box JSON、裸列表、Base64及多行URI）的解析。
+func TestParseProxyContent_Configs(t *testing.T) {
+	t.Run("Clash YAML 完整配置文件（带顶格注释、BOM与CRLF）", func(t *testing.T) {
+		clashConfig := "\xef\xbb\xbfport: 7890\r\nsocks-port: 7891\r\nallow-lan: true\r\nmode: Rule\r\n\r\nproxies:\r\n" +
+			"# 顶格注释不应阻断解析\r\n" +
+			"  - name: \"HK-01\"\r\n" +
+			"    type: ss\r\n" +
+			"    server: 1.1.1.1\r\n" +
+			"    port: 8388\r\n" +
+			"    cipher: aes-128-gcm\r\n" +
+			"    password: \"pass123\"\r\n" +
+			"# 第二段顶格注释\r\n" +
+			"  - {name: \"JP-02\", type: trojan, server: 2.2.2.2, port: 443, password: \"trojanpass\"}\r\n" +
+			"\r\nproxy-groups:\r\n  - name: PROXY\r\n    type: select\r\n    proxies:\r\n      - HK-01\r\n"
+
+		nodes, err := parseProxyContent(clashConfig)
+		if err != nil {
+			t.Fatalf("解析 Clash 配置文件失败: %v", err)
+		}
+		if len(nodes) != 2 {
+			t.Fatalf("期望解析出 2 个节点，实际: %d (%+v)", len(nodes), nodes)
+		}
+		if nodes[0].Name != "HK-01" || nodes[0].Protocol != "ss" || nodes[0].Server != "1.1.1.1:8388" {
+			t.Errorf("节点 1 解析不符合预期: %+v", nodes[0])
+		}
+		if nodes[1].Name != "JP-02" || nodes[1].Protocol != "trojan" || nodes[1].Server != "2.2.2.2:443" {
+			t.Errorf("节点 2 解析不符合预期: %+v", nodes[1])
+		}
+	})
+
+	t.Run("裸 YAML 节点列表（无顶层 proxies:）", func(t *testing.T) {
+		rawYaml := `- name: "US-01"
+  type: hysteria2
+  server: us.example.com
+  port: 8443
+  password: "hy2password"
+- name: "SG-02"
+  type: vless
+  server: sg.example.com
+  port: 443
+  uuid: "00000000-0000-0000-0000-000000000000"
+`
+		nodes, err := parseProxyContent(rawYaml)
+		if err != nil {
+			t.Fatalf("解析裸 YAML 列表失败: %v", err)
+		}
+		if len(nodes) != 2 {
+			t.Fatalf("期望解析出 2 个节点，实际: %d", len(nodes))
+		}
+		if nodes[0].Name != "US-01" || nodes[0].Protocol != "hysteria2" {
+			t.Errorf("节点 1 异常: %+v", nodes[0])
+		}
+		if nodes[1].Name != "SG-02" || nodes[1].Protocol != "vless" {
+			t.Errorf("节点 2 异常: %+v", nodes[1])
+		}
+	})
+
+	t.Run("Sing-box JSON 配置文件（包含 outbounds 与 Reality）", func(t *testing.T) {
+		singboxJSON := `{
+  "outbounds": [
+    {
+      "type": "direct",
+      "tag": "direct-out"
+    },
+    {
+      "type": "vless",
+      "tag": "US-Reality",
+      "server": "us-reality.com",
+      "server_port": 443,
+      "uuid": "uuid-1234",
+      "flow": "xtls-rprx-vision",
+      "tls": {
+        "enabled": true,
+        "server_name": "yahoo.com",
+        "utls": {
+          "enabled": true,
+          "fingerprint": "chrome"
+        },
+        "reality": {
+          "enabled": true,
+          "public_key": "pubkey-123",
+          "short_id": "short-1"
+        }
+      }
+    },
+    {
+      "type": "shadowsocks",
+      "tag": "HK-SS",
+      "server": "1.2.3.4",
+      "server_port": 8388,
+      "method": "2022-blake3-aes-128-gcm",
+      "password": "sspassword"
+    },
+    {
+      "type": "block",
+      "tag": "block-out"
+    }
+  ]
+}`
+		nodes, err := parseProxyContent(singboxJSON)
+		if err != nil {
+			t.Fatalf("解析 Sing-box JSON 失败: %v", err)
+		}
+		if len(nodes) != 2 {
+			t.Fatalf("期望解析出 2 个节点（过滤 direct/block），实际: %d", len(nodes))
+		}
+		if nodes[0].Name != "US-Reality" || nodes[0].Protocol != "vless" {
+			t.Errorf("Sing-box VLESS 节点解析错误: %+v", nodes[0])
+		}
+		if !strings.Contains(nodes[0].Payload, "reality-opts:") || !strings.Contains(nodes[0].Payload, `public-key: "pubkey-123"`) {
+			t.Errorf("Sing-box Reality Payload 错误:\n%s", nodes[0].Payload)
+		}
+		if nodes[1].Name != "HK-SS" || nodes[1].Protocol != "ss" {
+			t.Errorf("Sing-box SS 节点解析错误: %+v", nodes[1])
+		}
+	})
+
+	t.Run("Base64 订阅文本文件", func(t *testing.T) {
+		plainList := "trojan://pass1@t1.com:443#Trojan-1\r\nvless://uuid@v1.com:443?security=tls#VLESS-1\r\n"
+		b64Content := base64.StdEncoding.EncodeToString([]byte(plainList))
+
+		nodes, err := parseProxyContent(b64Content)
+		if err != nil {
+			t.Fatalf("解析 Base64 订阅失败: %v", err)
+		}
+		if len(nodes) != 2 {
+			t.Fatalf("期望解析出 2 个节点，实际: %d", len(nodes))
+		}
+		if nodes[0].Name != "Trojan-1" || nodes[1].Name != "VLESS-1" {
+			t.Errorf("Base64 节点名称解析异常: %+v", nodes)
+		}
+	})
+
+	t.Run("多行代理 URI 文本文件（带空行与注释）", func(t *testing.T) {
+		multiLines := `# 我的自建节点
+ss://YWVzLTEyOC1nY206cGFzczEyMw==@1.2.3.4:8388#My-SS
+
+// 备用节点
+hysteria2://mypass@hy2.example:443#My-HY2
+`
+		nodes, err := parseProxyContent(multiLines)
+		if err != nil {
+			t.Fatalf("解析多行 URI 文本失败: %v", err)
+		}
+		if len(nodes) != 2 {
+			t.Fatalf("期望解析出 2 个节点，实际: %d", len(nodes))
+		}
+		if nodes[0].Name != "My-SS" || nodes[1].Name != "My-HY2" {
+			t.Errorf("多行 URI 节点名称异常: %+v", nodes)
+		}
+	})
+
+	t.Run("单个原生 YAML 节点", func(t *testing.T) {
+		singleYaml := `name: "My-Single-Node"
+type: trojan
+server: single.example.com
+port: 443
+password: "pwd"
+`
+		nodes, err := parseProxyContent(singleYaml)
+		if err != nil {
+			t.Fatalf("解析单原生 YAML 节点失败: %v", err)
+		}
+		if len(nodes) != 1 {
+			t.Fatalf("期望解析出 1 个节点，实际: %d", len(nodes))
+		}
+		if nodes[0].Name != "My-Single-Node" || nodes[0].Protocol != "trojan" || nodes[0].Server != "single.example.com:443" {
+			t.Errorf("单 YAML 节点解析异常: %+v", nodes[0])
+		}
+	})
+}

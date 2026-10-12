@@ -76,7 +76,7 @@ opkg install nexttrace           # 若未安装 nexttrace（或使用 --nexttrac
 
 #### MiaoSpeed 测速支持的测试模式
 
-`miaospeed` 任务支持单节点链接（`ss://`, `vmess://`, `trojan://`, `vless://`, `hysteria2://`）或订阅地址（`http(s)://`）。任务的 `query` 或 `protocol` 可指定以下测试类型（未指定默认执行**全量测试**，也支持以英文逗号拼接多个模式）：
+`miaospeed` 任务支持单节点链接（`ss://`, `vmess://`, `trojan://`, `vless://`, `hysteria2://`, `tuic://`, `anytls://`）、订阅地址（`http(s)://`）或代理配置文件内容（Clash YAML、Sing-box JSON、Base64 订阅文本与多行节点列表）。任务的 `query` 或 `protocol` 可指定以下测试类型（未指定默认执行**全量测试**，也支持以英文逗号拼接多个模式）：
 
 1. **代理连通性测试**（`connectivity` / `conn` / `连通性`）：测试代理可用性、HTTP 响应状态码及 RTT 延迟；
 2. **拓扑测试**（`topology` / `topo` / `拓扑`）：测试链路入站/出站国家地区、落地 IP 及 DNS 劫持检测；
