@@ -432,10 +432,7 @@ func parseProxyContent(content string) ([]MiaospeedNode, error) {
 		for _, line := range trimmedLines {
 			parseLineKeyValue(strings.TrimSpace(line), &name, &pType, &server, &port)
 		}
-		srv := server
-		if port != "" && !strings.Contains(server, ":") {
-			srv += ":" + port
-		}
+		srv := formatServerPortString(server, port)
 		return []MiaospeedNode{{
 			Name:     name,
 			Protocol: pType,
@@ -535,10 +532,7 @@ func parseClashYAMLProxies(content string) []MiaospeedNode {
 		if inItem && currentItem.Len() > 0 {
 			payload := strings.TrimSpace(currentItem.String())
 			if currentName != "" && payload != "" {
-				srv := currentServer
-				if currentPort != "" && !strings.Contains(currentServer, ":") {
-					srv = fmt.Sprintf("%s:%s", currentServer, currentPort)
-				}
+				srv := formatServerPortString(currentServer, currentPort)
 				nodes = append(nodes, MiaospeedNode{
 					Name:     currentName,
 					Protocol: currentType,
@@ -591,10 +585,7 @@ func parseClashYAMLProxies(content string) []MiaospeedNode {
 				server := extractField(rawItem, "server")
 				port := extractField(rawItem, "port")
 				if name != "" {
-					srv := server
-					if port != "" && !strings.Contains(server, ":") {
-						srv += ":" + port
-					}
+					srv := formatServerPortString(server, port)
 					nodes = append(nodes, MiaospeedNode{
 						Name:     name,
 						Protocol: pType,
@@ -880,6 +871,8 @@ func convertSingBoxOutbound(ob singBoxOutbound) *MiaospeedNode {
 		name = fmt.Sprintf("%s-%s:%d", pType, server, port)
 	}
 
+	cleanServer := strings.Trim(strings.TrimSpace(server), "[]")
+
 	var sb strings.Builder
 	switch pType {
 	case "ss":
@@ -891,7 +884,7 @@ func convertSingBoxOutbound(ob singBoxOutbound) *MiaospeedNode {
 			cipher = "aes-256-gcm"
 		}
 		sb.WriteString(fmt.Sprintf("name: %s\ntype: ss\nserver: %s\nport: %d\ncipher: %s\npassword: %s\nudp: true\n",
-			quoteYAML(name), server, port, cipher, quoteYAML(ob.Password)))
+			quoteYAML(name), quoteYAML(cleanServer), port, cipher, quoteYAML(ob.Password)))
 	case "vmess":
 		cipher := ob.Security
 		if cipher == "" {
@@ -902,7 +895,7 @@ func convertSingBoxOutbound(ob singBoxOutbound) *MiaospeedNode {
 			netType = ob.Transport.Type
 		}
 		sb.WriteString(fmt.Sprintf("name: %s\ntype: vmess\nserver: %s\nport: %d\nuuid: %s\nalterId: %d\ncipher: %s\nudp: true\nnetwork: %s\n",
-			quoteYAML(name), server, port, ob.UUID, ob.AlterID, cipher, netType))
+			quoteYAML(name), quoteYAML(cleanServer), port, ob.UUID, ob.AlterID, cipher, netType))
 		writeSingBoxTLSAndTransport(&sb, ob, "servername")
 	case "vless":
 		netType := "tcp"
@@ -910,7 +903,7 @@ func convertSingBoxOutbound(ob singBoxOutbound) *MiaospeedNode {
 			netType = ob.Transport.Type
 		}
 		sb.WriteString(fmt.Sprintf("name: %s\ntype: vless\nserver: %s\nport: %d\nuuid: %s\nudp: true\nnetwork: %s\n",
-			quoteYAML(name), server, port, ob.UUID, netType))
+			quoteYAML(name), quoteYAML(cleanServer), port, ob.UUID, netType))
 		if ob.Flow != "" {
 			sb.WriteString(fmt.Sprintf("flow: %s\n", quoteYAML(ob.Flow)))
 		}
@@ -921,14 +914,14 @@ func convertSingBoxOutbound(ob singBoxOutbound) *MiaospeedNode {
 			netType = ob.Transport.Type
 		}
 		sb.WriteString(fmt.Sprintf("name: %s\ntype: trojan\nserver: %s\nport: %d\npassword: %s\nudp: true\n",
-			quoteYAML(name), server, port, quoteYAML(ob.Password)))
+			quoteYAML(name), quoteYAML(cleanServer), port, quoteYAML(ob.Password)))
 		if netType != "tcp" {
 			sb.WriteString(fmt.Sprintf("network: %s\n", netType))
 		}
 		writeSingBoxTLSAndTransport(&sb, ob, "sni")
 	case "hysteria2":
 		sb.WriteString(fmt.Sprintf("name: %s\ntype: hysteria2\nserver: %s\nport: %d\npassword: %s\nudp: true\n",
-			quoteYAML(name), server, port, quoteYAML(ob.Password)))
+			quoteYAML(name), quoteYAML(cleanServer), port, quoteYAML(ob.Password)))
 		if ob.TLS != nil {
 			if ob.TLS.ServerName != "" {
 				sb.WriteString(fmt.Sprintf("sni: %s\n", quoteYAML(ob.TLS.ServerName)))
@@ -959,7 +952,7 @@ func convertSingBoxOutbound(ob singBoxOutbound) *MiaospeedNode {
 			urm = "native"
 		}
 		sb.WriteString(fmt.Sprintf("name: %s\ntype: tuic\nserver: %s\nport: %d\nuuid: %s\npassword: %s\nudp: true\ncongestion-controller: %s\nudp-relay-mode: %s\n",
-			quoteYAML(name), server, port, quoteYAML(ob.UUID), quoteYAML(ob.Password), quoteYAML(cc), quoteYAML(urm)))
+			quoteYAML(name), quoteYAML(cleanServer), port, quoteYAML(ob.UUID), quoteYAML(ob.Password), quoteYAML(cc), quoteYAML(urm)))
 		if ob.TLS != nil {
 			if ob.TLS.ServerName != "" {
 				sb.WriteString(fmt.Sprintf("sni: %s\n", quoteYAML(ob.TLS.ServerName)))
@@ -970,11 +963,11 @@ func convertSingBoxOutbound(ob singBoxOutbound) *MiaospeedNode {
 		}
 	case "anytls":
 		sb.WriteString(fmt.Sprintf("name: %s\ntype: anytls\nserver: %s\nport: %d\npassword: %s\nudp: true\n",
-			quoteYAML(name), server, port, quoteYAML(ob.Password)))
+			quoteYAML(name), quoteYAML(cleanServer), port, quoteYAML(ob.Password)))
 		writeSingBoxTLSAndTransport(&sb, ob, "sni")
 	case "socks5":
 		sb.WriteString(fmt.Sprintf("name: %s\ntype: socks5\nserver: %s\nport: %d\nudp: true\n",
-			quoteYAML(name), server, port))
+			quoteYAML(name), quoteYAML(cleanServer), port))
 		if ob.Username != "" {
 			sb.WriteString(fmt.Sprintf("username: %s\n", quoteYAML(ob.Username)))
 		}
@@ -988,7 +981,7 @@ func convertSingBoxOutbound(ob singBoxOutbound) *MiaospeedNode {
 	return &MiaospeedNode{
 		Name:     name,
 		Protocol: pType,
-		Server:   fmt.Sprintf("%s:%d", server, port),
+		Server:   formatServerAddress(server, port),
 		Port:     port,
 		Payload:  sb.String(),
 	}
@@ -1150,9 +1143,10 @@ func parseShadowsocksURI(rawURI string, u *url.URL) (*MiaospeedNode, error) {
 		return nil, errors.New("无效的 Shadowsocks 节点配置")
 	}
 
+	cleanHost := strings.Trim(strings.TrimSpace(host), "[]")
 	var sb strings.Builder
 	sb.WriteString(fmt.Sprintf("name: %s\ntype: ss\nserver: %s\nport: %d\ncipher: %s\npassword: %s\nudp: true\n",
-		quoteYAML(name), host, port, method, quoteYAML(password)))
+		quoteYAML(name), quoteYAML(cleanHost), port, method, quoteYAML(password)))
 	if plugin := u.Query().Get("plugin"); plugin != "" {
 		parts := strings.SplitN(plugin, ";", 2)
 		sb.WriteString(fmt.Sprintf("plugin: %s\n", quoteYAML(parts[0])))
@@ -1164,7 +1158,7 @@ func parseShadowsocksURI(rawURI string, u *url.URL) (*MiaospeedNode, error) {
 	return &MiaospeedNode{
 		Name:     name,
 		Protocol: "ss",
-		Server:   fmt.Sprintf("%s:%d", host, port),
+		Server:   formatServerAddress(host, port),
 		Port:     port,
 		Payload:  sb.String(),
 	}, nil
@@ -1221,9 +1215,10 @@ func parseVmessURI(rawURI string) (*MiaospeedNode, error) {
 	fp := getString(v, "fp")
 	alpn := getString(v, "alpn")
 
+	cleanServer := strings.Trim(strings.TrimSpace(server), "[]")
 	var sb strings.Builder
 	sb.WriteString(fmt.Sprintf("name: %s\ntype: vmess\nserver: %s\nport: %d\nuuid: %s\nalterId: %d\ncipher: %s\nnetwork: %s\nudp: true\n",
-		quoteYAML(name), server, port, uuid, alterID, cipher, netType))
+		quoteYAML(name), quoteYAML(cleanServer), port, uuid, alterID, cipher, netType))
 	if tls {
 		sb.WriteString("tls: true\n")
 		if sni != "" {
@@ -1266,7 +1261,7 @@ func parseVmessURI(rawURI string) (*MiaospeedNode, error) {
 	return &MiaospeedNode{
 		Name:     name,
 		Protocol: "vmess",
-		Server:   fmt.Sprintf("%s:%d", server, port),
+		Server:   formatServerAddress(server, port),
 		Port:     port,
 		Payload:  sb.String(),
 	}, nil
@@ -1296,9 +1291,10 @@ func parseTrojanURI(u *url.URL) (*MiaospeedNode, error) {
 	}
 	alpn := q.Get("alpn")
 
+	cleanServer := strings.Trim(strings.TrimSpace(server), "[]")
 	var sb strings.Builder
 	sb.WriteString(fmt.Sprintf("name: %s\ntype: trojan\nserver: %s\nport: %d\npassword: %s\nudp: true\n",
-		quoteYAML(name), server, port, quoteYAML(password)))
+		quoteYAML(name), quoteYAML(cleanServer), port, quoteYAML(password)))
 	if sni != "" {
 		sb.WriteString(fmt.Sprintf("sni: %s\n", quoteYAML(sni)))
 	}
@@ -1315,7 +1311,7 @@ func parseTrojanURI(u *url.URL) (*MiaospeedNode, error) {
 	return &MiaospeedNode{
 		Name:     name,
 		Protocol: "trojan",
-		Server:   fmt.Sprintf("%s:%d", server, port),
+		Server:   formatServerAddress(server, port),
 		Port:     port,
 		Payload:  sb.String(),
 	}, nil
@@ -1354,9 +1350,10 @@ func parseVlessURI(u *url.URL) (*MiaospeedNode, error) {
 	}
 	alpn := q.Get("alpn")
 
+	cleanServer := strings.Trim(strings.TrimSpace(server), "[]")
 	var sb strings.Builder
 	sb.WriteString(fmt.Sprintf("name: %s\ntype: vless\nserver: %s\nport: %d\nuuid: %s\nnetwork: %s\nudp: true\n",
-		quoteYAML(name), server, port, uuid, netType))
+		quoteYAML(name), quoteYAML(cleanServer), port, uuid, netType))
 	if flow != "" {
 		sb.WriteString(fmt.Sprintf("flow: %s\n", quoteYAML(flow)))
 	}
@@ -1430,7 +1427,7 @@ func parseVlessURI(u *url.URL) (*MiaospeedNode, error) {
 	return &MiaospeedNode{
 		Name:     name,
 		Protocol: "vless",
-		Server:   fmt.Sprintf("%s:%d", server, port),
+		Server:   formatServerAddress(server, port),
 		Port:     port,
 		Payload:  sb.String(),
 	}, nil
@@ -1476,9 +1473,10 @@ func parseHysteria2URI(u *url.URL) (*MiaospeedNode, error) {
 	obfsPassword := q.Get("obfs-password")
 	alpn := q.Get("alpn")
 
+	cleanServer := strings.Trim(strings.TrimSpace(server), "[]")
 	var sb strings.Builder
 	sb.WriteString(fmt.Sprintf("name: %s\ntype: hysteria2\nserver: %s\nport: %d\npassword: %s\nudp: true\n",
-		quoteYAML(name), server, port, quoteYAML(password)))
+		quoteYAML(name), quoteYAML(cleanServer), port, quoteYAML(password)))
 	if sni != "" {
 		sb.WriteString(fmt.Sprintf("sni: %s\n", quoteYAML(sni)))
 	}
@@ -1504,7 +1502,7 @@ func parseHysteria2URI(u *url.URL) (*MiaospeedNode, error) {
 	return &MiaospeedNode{
 		Name:     name,
 		Protocol: "hysteria2",
-		Server:   fmt.Sprintf("%s:%d", server, port),
+		Server:   formatServerAddress(server, port),
 		Port:     port,
 		Payload:  sb.String(),
 	}, nil
@@ -1560,9 +1558,10 @@ func parseTuicURI(u *url.URL) (*MiaospeedNode, error) {
 		udpRelay = "native"
 	}
 
+	cleanServer := strings.Trim(strings.TrimSpace(server), "[]")
 	var sb strings.Builder
 	sb.WriteString(fmt.Sprintf("name: %s\ntype: tuic\nserver: %s\nport: %d\nuuid: %s\npassword: %s\nudp: true\n",
-		quoteYAML(name), server, port, quoteYAML(uuid), quoteYAML(password)))
+		quoteYAML(name), quoteYAML(cleanServer), port, quoteYAML(uuid), quoteYAML(password)))
 	if sni != "" {
 		sb.WriteString(fmt.Sprintf("sni: %s\n", quoteYAML(sni)))
 	}
@@ -1580,7 +1579,7 @@ func parseTuicURI(u *url.URL) (*MiaospeedNode, error) {
 	return &MiaospeedNode{
 		Name:     name,
 		Protocol: "tuic",
-		Server:   fmt.Sprintf("%s:%d", server, port),
+		Server:   formatServerAddress(server, port),
 		Port:     port,
 		Payload:  sb.String(),
 	}, nil
@@ -1638,9 +1637,10 @@ func parseSSRURI(rawURI string) (*MiaospeedNode, error) {
 		}
 	}
 
+	cleanHost := strings.Trim(strings.TrimSpace(host), "[]")
 	var sb strings.Builder
 	sb.WriteString(fmt.Sprintf("name: %s\ntype: ssr\nserver: %s\nport: %d\ncipher: %s\npassword: %s\nprotocol: %s\nobfs: %s\nudp: true\n",
-		quoteYAML(name), host, port, method, quoteYAML(password), protocol, obfs))
+		quoteYAML(name), quoteYAML(cleanHost), port, method, quoteYAML(password), protocol, obfs))
 	if obfsParam != "" {
 		sb.WriteString(fmt.Sprintf("obfs-param: %s\n", quoteYAML(obfsParam)))
 	}
@@ -1651,7 +1651,7 @@ func parseSSRURI(rawURI string) (*MiaospeedNode, error) {
 	return &MiaospeedNode{
 		Name:     name,
 		Protocol: "ssr",
-		Server:   fmt.Sprintf("%s:%d", host, port),
+		Server:   formatServerAddress(host, port),
 		Port:     port,
 		Payload:  sb.String(),
 	}, nil
@@ -1698,9 +1698,10 @@ func parseHysteria1URI(u *url.URL) (*MiaospeedNode, error) {
 		insecure = q.Get("allowInsecure")
 	}
 
+	cleanServer := strings.Trim(strings.TrimSpace(server), "[]")
 	var sb strings.Builder
 	sb.WriteString(fmt.Sprintf("name: %s\ntype: hysteria\nserver: %s\nport: %d\nprotocol: %s\n",
-		quoteYAML(name), server, port, protocol))
+		quoteYAML(name), quoteYAML(cleanServer), port, protocol))
 	if auth != "" {
 		sb.WriteString(fmt.Sprintf("auth-str: %s\n", quoteYAML(auth)))
 	}
@@ -1723,7 +1724,7 @@ func parseHysteria1URI(u *url.URL) (*MiaospeedNode, error) {
 	return &MiaospeedNode{
 		Name:     name,
 		Protocol: "hysteria",
-		Server:   fmt.Sprintf("%s:%d", server, port),
+		Server:   formatServerAddress(server, port),
 		Port:     port,
 		Payload:  sb.String(),
 	}, nil
@@ -1746,9 +1747,10 @@ func parseSocks5URI(u *url.URL) (*MiaospeedNode, error) {
 		password, _ = u.User.Password()
 	}
 
+	cleanServer := strings.Trim(strings.TrimSpace(server), "[]")
 	var sb strings.Builder
 	sb.WriteString(fmt.Sprintf("name: %s\ntype: socks5\nserver: %s\nport: %d\nudp: true\n",
-		quoteYAML(name), server, port))
+		quoteYAML(name), quoteYAML(cleanServer), port))
 	if username != "" {
 		sb.WriteString(fmt.Sprintf("username: %s\n", quoteYAML(username)))
 	}
@@ -1759,7 +1761,7 @@ func parseSocks5URI(u *url.URL) (*MiaospeedNode, error) {
 	return &MiaospeedNode{
 		Name:     name,
 		Protocol: "socks5",
-		Server:   fmt.Sprintf("%s:%d", server, port),
+		Server:   formatServerAddress(server, port),
 		Port:     port,
 		Payload:  sb.String(),
 	}, nil
@@ -1788,9 +1790,10 @@ func parseSnellURI(u *url.URL) (*MiaospeedNode, error) {
 	obfs := q.Get("obfs")
 	obfsHost := q.Get("host")
 
+	cleanServer := strings.Trim(strings.TrimSpace(server), "[]")
 	var sb strings.Builder
 	sb.WriteString(fmt.Sprintf("name: %s\ntype: snell\nserver: %s\nport: %d\npsk: %s\nversion: %s\nudp: true\n",
-		quoteYAML(name), server, port, quoteYAML(psk), version))
+		quoteYAML(name), quoteYAML(cleanServer), port, quoteYAML(psk), version))
 	if obfs != "" || obfsHost != "" {
 		sb.WriteString("obfs-opts:\n")
 		if obfs != "" {
@@ -1804,7 +1807,7 @@ func parseSnellURI(u *url.URL) (*MiaospeedNode, error) {
 	return &MiaospeedNode{
 		Name:     name,
 		Protocol: "snell",
-		Server:   fmt.Sprintf("%s:%d", server, port),
+		Server:   formatServerAddress(server, port),
 		Port:     port,
 		Payload:  sb.String(),
 	}, nil
@@ -1851,9 +1854,10 @@ func parseAnyTLSURI(u *url.URL) (*MiaospeedNode, error) {
 	}
 	alpn := q.Get("alpn")
 
+	cleanServer := strings.Trim(strings.TrimSpace(server), "[]")
 	var sb strings.Builder
 	sb.WriteString(fmt.Sprintf("name: %s\ntype: anytls\nserver: %s\nport: %d\npassword: %s\nudp: true\n",
-		quoteYAML(name), server, port, quoteYAML(password)))
+		quoteYAML(name), quoteYAML(cleanServer), port, quoteYAML(password)))
 	if sni != "" {
 		sb.WriteString(fmt.Sprintf("sni: %s\n", quoteYAML(sni)))
 	}
@@ -1873,7 +1877,7 @@ func parseAnyTLSURI(u *url.URL) (*MiaospeedNode, error) {
 		}
 	}
 
-	srvAddr := net.JoinHostPort(server, strconv.Itoa(port))
+	srvAddr := formatServerAddress(server, port)
 
 	return &MiaospeedNode{
 		Name:     name,
@@ -1882,6 +1886,32 @@ func parseAnyTLSURI(u *url.URL) (*MiaospeedNode, error) {
 		Port:     port,
 		Payload:  sb.String(),
 	}, nil
+}
+
+// formatServerAddress 将服务器地址与端口安全拼装为标准 host:port 字符串；对于 IPv6 字面量地址自动添加中括号。
+func formatServerAddress(server string, port int) string {
+	cleanServer := strings.Trim(strings.TrimSpace(server), "[]")
+	if port > 0 {
+		return net.JoinHostPort(cleanServer, strconv.Itoa(port))
+	}
+	return cleanServer
+}
+
+// formatServerPortString 将字符串类型的端口与服务器地址安全拼装为 host:port 字符串；
+// 自动规整 IPv6 字面量格式并补充端口，避免 IPv6 冒号导致端口丢失。
+func formatServerPortString(server, portStr string) string {
+	cleanServer := strings.Trim(strings.TrimSpace(server), "[]")
+	portStr = strings.TrimSpace(portStr)
+	if portStr != "" {
+		p, err := strconv.Atoi(portStr)
+		if err == nil && p > 0 {
+			return net.JoinHostPort(cleanServer, strconv.Itoa(p))
+		}
+	}
+	if host, p, err := net.SplitHostPort(cleanServer); err == nil {
+		return net.JoinHostPort(strings.Trim(host, "[]"), p)
+	}
+	return cleanServer
 }
 
 func quoteYAML(s string) string {
@@ -2006,10 +2036,11 @@ func runMiaospeedJob(ctx context.Context, binary, ghProxy string, job Job, log l
 	}
 	token := generateRandomHex(16)
 
-	// 3. 启动临时 miaospeed server 进程
+	// 3. 启动临时 miaospeed server 进程（开启 -ipv6 支持全场景 IPv6 节点直连与 AAAA 域名解析）
 	cmd := exec.CommandContext(taskCtx, binPath, "server",
 		"-bind", fmt.Sprintf("127.0.0.1:%d", port),
 		"-token", token,
+		"-ipv6",
 	)
 	cmd.WaitDelay = 3 * time.Second
 	serverOut := &cappedBuffer{max: maxOutputBytes}
@@ -2731,23 +2762,27 @@ func buildDefaultMediaScripts() []slaveScript {
 	return []slaveScript{
 		{
 			// 覆盖 miaospeed 默认的 default_ip.js 与 default_geoip.js：
-			// 默认脚本对每个节点顺序请求 IPv4 + IPv6 (2606:4700:4700::1111) 且单次 3000ms，
-			// 导致无 IPv6 的正常节点每次白等 3s、死节点重试 3 次阻塞 18s。
-			// 此处收敛为轻量 IPv4 1500ms 快速探测，大幅加速大订阅多节点测速。
+			// 优化为轻量双栈顺序探测（先取 IPv4，纯 IPv6 节点快速回退至 IPv6 Cloudflare trace），
+			// 且单次超时收敛为 1500ms，既支持 IPv6 落地检测，又杜绝死节点漫长等待。
 			ID:   "ip_fast",
 			Type: "ip",
 			Content: `function ip_resolve() {
-    var content = (get(fetch("https://1.1.1.1/cdn-cgi/trace", {
-        headers: {'User-Agent': 'Mozilla/5.0'},
-        retry: 1,
-        timeout: 1500
-    }), "body") || "").trim();
-    var m = content.match(/ip=(\S+)/);
-    if (m && m[1]) return [m[1].trim()];
+    var urls = ["https://1.1.1.1/cdn-cgi/trace", "https://[2606:4700:4700::1111]/cdn-cgi/trace"];
+    for (var i = 0; i < urls.length; i++) {
+        var content = (get(fetch(urls[i], {
+            headers: {'User-Agent': 'Mozilla/5.0'},
+            retry: 1,
+            timeout: 1500
+        }), "body") || "").trim();
+        var m = content.match(/ip=(\S+)/);
+        if (m && m[1]) return [m[1].trim()];
+    }
     return [];
 }
 function handler(ip) {
-    var content = fetch("https://ipv4.ipleak.net/json/" + ip, {
+    var isv6 = ip.indexOf(":") >= 0;
+    var url = isv6 ? ("https://ipv6.ipleak.net/json/" + ip) : ("https://ipv4.ipleak.net/json/" + ip);
+    var content = fetch(url, {
         headers: {'User-Agent': 'Mozilla/5.0'},
         retry: 1,
         timeout: 2000

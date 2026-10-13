@@ -1446,3 +1446,95 @@ func TestExecuteMiaospeedTaskPreservesPartialProgressOnTimeout(t *testing.T) {
 		t.Fatalf("保留的节点名称异常: %+v", report.SubReports)
 	}
 }
+
+// TestIPv6NodeSupportAndDualStackScript 验证全协议对 IPv6 字面量节点地址的解析、安全引用格式化及双栈落地探测脚本。
+func TestIPv6NodeSupportAndDualStackScript(t *testing.T) {
+	t.Run("VLESS IPv6 节点", func(t *testing.T) {
+		uri := "vless://80a6c919-fcc8-49da-ace8-84bf0b75e81a@[2409:8a71:6a00:1953::615]:443?security=tls&sni=example.com#IPv6-VLESS"
+		node, err := parseProxyURI(uri)
+		if err != nil {
+			t.Fatalf("解析 VLESS IPv6 失败: %v", err)
+		}
+		if node.Server != "[2409:8a71:6a00:1953::615]:443" {
+			t.Fatalf("Server 期望标准中括号 IPv6 host:port，实际: %q", node.Server)
+		}
+		if !strings.Contains(node.Payload, `server: "2409:8a71:6a00:1953::615"`) {
+			t.Fatalf("Payload 期望包含转义后的 IPv6 地址，实际:\n%s", node.Payload)
+		}
+	})
+
+	t.Run("Trojan IPv6 节点", func(t *testing.T) {
+		uri := "trojan://password123@[2001:db8::1]:8443#IPv6-Trojan"
+		node, err := parseProxyURI(uri)
+		if err != nil {
+			t.Fatalf("解析 Trojan IPv6 失败: %v", err)
+		}
+		if node.Server != "[2001:db8::1]:8443" {
+			t.Fatalf("Server 期望 [2001:db8::1]:8443，实际: %q", node.Server)
+		}
+		if !strings.Contains(node.Payload, `server: "2001:db8::1"`) {
+			t.Fatalf("Payload 期望包含 server: \"2001:db8::1\"，实际:\n%s", node.Payload)
+		}
+	})
+
+	t.Run("Hysteria2 IPv6 节点", func(t *testing.T) {
+		uri := "hysteria2://password123@[2606:4700::1]:443?sni=bing.com#IPv6-HY2"
+		node, err := parseProxyURI(uri)
+		if err != nil {
+			t.Fatalf("解析 Hysteria2 IPv6 失败: %v", err)
+		}
+		if node.Server != "[2606:4700::1]:443" {
+			t.Fatalf("Server 期望 [2606:4700::1]:443，实际: %q", node.Server)
+		}
+		if !strings.Contains(node.Payload, `server: "2606:4700::1"`) {
+			t.Fatalf("Payload 期望包含 server: \"2606:4700::1\"，实际:\n%s", node.Payload)
+		}
+	})
+
+	t.Run("Sing-box JSON IPv6 节点提取", func(t *testing.T) {
+		sbJSON := `{
+  "outbounds": [
+    {
+      "type": "vless",
+      "tag": "SB-IPv6-Node",
+      "server": "2409:8a71:6a00:1953::1",
+      "server_port": 443,
+      "uuid": "00000000-0000-0000-0000-000000000000"
+    }
+  ]
+}`
+		nodes, err := parseProxyContent(sbJSON)
+		if err != nil {
+			t.Fatalf("解析 Sing-box JSON 失败: %v", err)
+		}
+		if len(nodes) != 1 {
+			t.Fatalf("期望提取 1 个节点，实际: %d", len(nodes))
+		}
+		if nodes[0].Server != "[2409:8a71:6a00:1953::1]:443" {
+			t.Fatalf("Sing-box 提取的 IPv6 节点 Server 期望带中括号，实际: %q", nodes[0].Server)
+		}
+		if !strings.Contains(nodes[0].Payload, `server: "2409:8a71:6a00:1953::1"`) {
+			t.Fatalf("Payload 期望引用 IPv6 纯地址，实际:\n%s", nodes[0].Payload)
+		}
+	})
+
+	t.Run("双栈快速 IP 探测脚本覆盖与回退", func(t *testing.T) {
+		scripts := buildDefaultMediaScripts()
+		var ipScript *slaveScript
+		for i := range scripts {
+			if scripts[i].Type == "ip" {
+				ipScript = &scripts[i]
+				break
+			}
+		}
+		if ipScript == nil {
+			t.Fatal("缺少 Type=ip 的快速探测脚本")
+		}
+		if !strings.Contains(ipScript.Content, "1.1.1.1") || !strings.Contains(ipScript.Content, "[2606:4700:4700::1111]") {
+			t.Fatalf("ip_resolve 必须包含 IPv4 与 IPv6 Cloudflare trace 双端点，实际:\n%s", ipScript.Content)
+		}
+		if !strings.Contains(ipScript.Content, "ipv6.ipleak.net") {
+			t.Fatalf("handler 必须支持 ipv6.ipleak.net 探测 IPv6 归属地，实际:\n%s", ipScript.Content)
+		}
+	})
+}
