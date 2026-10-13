@@ -242,3 +242,24 @@ func TestParseConfigRejectsHostFlag(t *testing.T) {
 		t.Fatalf("botURL = %q", cfg.botURL)
 	}
 }
+
+func TestClientHeartbeat(t *testing.T) {
+	var count atomic.Int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/heartbeat" && r.Method == http.MethodPost {
+			count.Add(1)
+			w.WriteHeader(http.StatusNoContent)
+			return
+		}
+		http.NotFound(w, r)
+	}))
+	defer srv.Close()
+
+	cli := newClient(testConfig(srv.URL, nil))
+	if err := cli.heartbeat(context.Background()); err != nil {
+		t.Fatalf("heartbeat 失败: %v", err)
+	}
+	if got := count.Load(); got != 1 {
+		t.Fatalf("心跳请求次数 = %d, want 1", got)
+	}
+}

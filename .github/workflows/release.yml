@@ -64,11 +64,11 @@ jobs:
         include:
           - { goos: linux, goarch: amd64 }
           - { goos: linux, goarch: arm64 }
-          # GOARM=5 的 32 位 ARM 二进制可运行在 ARMv5/6/7 上（OpenWrt 路由器多为 armv7/armv6）
-          - { goos: linux, goarch: arm, goarm: '5' }
-          # OpenWrt 上常见的 MIPS / RISC-V 目标（静态二进制，musl 通用）
-          - { goos: linux, goarch: mipsle }
-          - { goos: linux, goarch: mips }
+          # GOARM=5 的 32 位 ARM 二进制可运行在 ARMv5/6/7 上（OpenWrt 路由器多为 armv7/armv6），启用 UPX 缩减体积
+          - { goos: linux, goarch: arm, goarm: '5', upx: true }
+          # OpenWrt 上常见的 MIPS 目标（启用 UPX 缩减至 ~3-4MB，适配 16M/32M Flash）
+          - { goos: linux, goarch: mipsle, upx: true }
+          - { goos: linux, goarch: mips, upx: true }
           - { goos: linux, goarch: mips64le }
           - { goos: linux, goarch: mips64 }
           - { goos: linux, goarch: riscv64 }
@@ -81,6 +81,9 @@ jobs:
       - uses: actions/setup-go@v5
         with:
           go-version-file: go.mod
+      - name: Install UPX
+        if: matrix.upx
+        run: sudo apt-get update && sudo apt-get install -y upx
       - name: Test
         run: go test ./...
       - name: Build
@@ -98,6 +101,9 @@ jobs:
           output="mnagent_${GOOS}_${GOARCH}${ext}"
           go build -trimpath -ldflags "-s -w -X main.version=${VERSION}" \
             -o "${output}" .
+          if [ "${{ matrix.upx }}" = "true" ]; then
+            upx --lzma --best "${output}" || upx -9 "${output}"
+          fi
           sha256sum "${output}" > "${output}.sha256"
       - name: Upload artifacts
         uses: actions/upload-artifact@v4

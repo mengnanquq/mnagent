@@ -207,6 +207,22 @@ func (c *client) sendProgress(ctx context.Context, p Progress) (bool, error) {
 	return false, nil
 }
 
+// heartbeat 发送轻量保活心跳，更新服务端的 lastSeen 时间戳。
+func (c *client) heartbeat(ctx context.Context) error {
+	resp, err := c.do(ctx, http.MethodPost, "/heartbeat", nil)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode == http.StatusOK || resp.StatusCode == http.StatusNoContent {
+		return nil
+	}
+	if resp.StatusCode == http.StatusUnauthorized {
+		return errUnauthorized
+	}
+	return fmt.Errorf("心跳失败：%s %s", resp.Status, readSnippet(resp.Body))
+}
+
 // do 发送一次带鉴权头的请求。
 func (c *client) do(ctx context.Context, method, path string, body []byte) (*http.Response, error) {
 	token, err := c.tokens.get()

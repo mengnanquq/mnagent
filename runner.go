@@ -327,6 +327,7 @@ func isHeavy(job Job) bool {
 // loop 不断领取任务并执行，直到 ctx 结束；启用自动更新时按周期检查新版本。
 func (a *agent) loop(ctx context.Context) error {
 	defer a.tasksWG.Wait()
+	a.startHeartbeat(ctx)
 	backoff := a.cfg.minBackoff
 	var nextCheck time.Time
 	for {
@@ -413,6 +414,28 @@ func (a *agent) loop(ctx context.Context) error {
 			a.execute(ctx, *job)
 		}
 	}
+}
+
+// startHeartbeat 启动独立于任务执行的周期心跳协程，确保长任务执行期间服务端 lastSeen 始终保活。
+func (a *agent) startHeartbeat(ctx context.Context) {
+	a.tasksWG.Add(1)
+	go func() {
+		defer a.tasksWG.Done()
+		ticker := time.NewTicker(20 * time.Second)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-ticker.C:
+				hbCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
+				if err := a.client.heartbeat(hbCtx); err != nil {
+					a.logger.Debug("保活心跳未送达", "error", err)
+				}
+				cancel()
+			}
+		}
+	}()
 }
 
 // newUpdater 构建自更新器（自动更新、check/apply CLI 共用）。
