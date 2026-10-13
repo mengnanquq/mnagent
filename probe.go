@@ -219,6 +219,16 @@ func pingProbe(ctx context.Context, job Job, allowPrivate bool) (LatencyReport, 
 	}
 	defer conn.Close()
 
+	stopWatch := make(chan struct{})
+	go func() {
+		select {
+		case <-ctx.Done():
+			_ = conn.Close()
+		case <-stopWatch:
+		}
+	}()
+	defer close(stopWatch)
+
 	buf := make([]byte, 1500)
 	for i := 0; i < count; i++ {
 		if ctx.Err() != nil {
@@ -389,13 +399,18 @@ func tcpingProbe(ctx context.Context, job Job, allowPrivate bool) (LatencyReport
 	}
 	report := LatencyReport{Kind: kindTCPing, Target: address, Resolved: resolved, Sent: count}
 
+	dialAddress := address
+	if resolved != "" {
+		dialAddress = net.JoinHostPort(resolved, strconv.Itoa(port))
+	}
+
 	dialer := &net.Dialer{Timeout: timeout}
 	for i := 0; i < count; i++ {
 		if ctx.Err() != nil {
 			break
 		}
 		start := time.Now()
-		conn, err := dialer.DialContext(ctx, "tcp", address)
+		conn, err := dialer.DialContext(ctx, "tcp", dialAddress)
 		rtt := time.Since(start)
 		attempt := LatencyAttempt{Index: i + 1}
 		if err != nil {
