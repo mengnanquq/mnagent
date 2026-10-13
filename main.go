@@ -55,13 +55,14 @@ type config struct {
 	pollTimeout     time.Duration
 	logLevel        slog.Level
 
-	autoUpdate      bool
-	updateInterval  time.Duration
-	checkUpdateOnce bool
-	applyUpdate     string
-	skipUpdate      string
-	ghProxy         string
-	diagJob         string
+	autoUpdate         bool
+	updateInterval     time.Duration
+	checkUpdateOnce    bool
+	applyUpdate        string
+	skipUpdate         string
+	ghProxy            string
+	diagJob            string
+	allowPrivateProbes bool
 }
 
 func main() {
@@ -103,7 +104,7 @@ func runWithContext(ctx context.Context, args []string) error {
 	}
 
 	if cfg.diagJob != "" {
-		runner := newRunnerFull(cfg.binary, cfg.miaospeedBinary, cfg.ghProxy, log)
+		runner := newRunnerFull(cfg.binary, cfg.miaospeedBinary, cfg.ghProxy, cfg.allowPrivateProbes, log)
 		res := runner.run(ctx, Job{
 			ID:        "diag",
 			Kind:      "miaospeed",
@@ -117,7 +118,7 @@ func runWithContext(ctx context.Context, args []string) error {
 
 	cli := newClient(cfg)
 	tracker := newJobTracker()
-	rnr := newRunnerFull(cfg.binary, cfg.miaospeedBinary, cfg.ghProxy, log)
+	rnr := newRunnerFull(cfg.binary, cfg.miaospeedBinary, cfg.ghProxy, cfg.allowPrivateProbes, log)
 	rnr.setProgressReporter(func(p Progress) {
 		pCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
 		defer cancel()
@@ -146,23 +147,24 @@ func runWithContext(ctx context.Context, args []string) error {
 func parseConfig(args []string) (*config, error) {
 	fs := flag.NewFlagSet("mnagent", flag.ContinueOnError)
 	var (
-		botURL     = fs.String("bot", "", "机器人 agent 端点基地址，例如 https://mnbot.example.org/agent")
-		tokenValue = fs.String("token", "", "接入令牌（不推荐：优先用 -token-file 或 MNAGENT_TOKEN）")
-		tokenFile  = fs.String("token-file", "", "存放接入令牌的文件路径（默认 "+defaultTokenFile()+"）")
-		binary     = fs.String("nexttrace", "nexttrace", "nexttrace 可执行文件路径或在 PATH 中的名称")
-		miaospeed  = fs.String("miaospeed", "miaospeed", "miaospeed 可执行文件路径或在 PATH 中的名称")
-		minBackoff = fs.Duration("min-backoff", defaultMinBackoff, "轮询失败后的最小重试间隔")
-		maxBackoff = fs.Duration("max-backoff", defaultMaxBackoff, "轮询失败后的最大重试间隔")
-		pollWait   = fs.Duration("poll-timeout", defaultPollWait, "单次长轮询的客户端超时")
-		autoUpdate = fs.Bool("auto-update", false, "自动更新：定期检查 GitHub Releases，有新版本时下载并重启服务")
-		updateIntv = fs.Duration("update-interval", autoUpdateDefaultInterval, "自动更新检查间隔")
-		checkUpd   = fs.Bool("check-update", false, "检查一次更新后退出（不下载）")
-		applyUpd   = fs.String("apply-update", "", "下载并安装指定版本后退出（如 v0.1.7）；latest 表示最新版")
-		skipUpd    = fs.String("skip-update", "", "跳过指定版本一段时间（如 v0.1.7，默认 24 小时）")
-		ghProxy    = fs.String("gh-proxy", "", "GitHub 代理加速前缀，例如 https://gh-proxy.com/")
-		logLevel   = fs.String("log-level", "info", "日志级别：debug / info / warn / error")
-		showVer    = fs.Bool("version", false, "输出版本后退出")
-		diagJob    = fs.String("diag-job", "", "本地直接执行一次测速任务并输出调试信息后退出")
+		botURL       = fs.String("bot", "", "机器人 agent 端点基地址，例如 https://mnbot.example.org/agent")
+		tokenValue   = fs.String("token", "", "接入令牌（不推荐：优先用 -token-file 或 MNAGENT_TOKEN）")
+		tokenFile    = fs.String("token-file", "", "存放接入令牌的文件路径（默认 "+defaultTokenFile()+"）")
+		binary       = fs.String("nexttrace", "nexttrace", "nexttrace 可执行文件路径或在 PATH 中的名称")
+		miaospeed    = fs.String("miaospeed", "miaospeed", "miaospeed 可执行文件路径或在 PATH 中的名称")
+		minBackoff   = fs.Duration("min-backoff", defaultMinBackoff, "轮询失败后的最小重试间隔")
+		maxBackoff   = fs.Duration("max-backoff", defaultMaxBackoff, "轮询失败后的最大重试间隔")
+		pollWait     = fs.Duration("poll-timeout", defaultPollWait, "单次长轮询的客户端超时")
+		autoUpdate   = fs.Bool("auto-update", false, "自动更新：定期检查 GitHub Releases，有新版本时下载并重启服务")
+		updateIntv   = fs.Duration("update-interval", autoUpdateDefaultInterval, "自动更新检查间隔")
+		checkUpd     = fs.Bool("check-update", false, "检查一次更新后退出（不下载）")
+		applyUpd     = fs.String("apply-update", "", "下载并安装指定版本后退出（如 v0.1.7）；latest 表示最新版")
+		skipUpd      = fs.String("skip-update", "", "跳过指定版本一段时间（如 v0.1.7，默认 24 小时）")
+		ghProxy      = fs.String("gh-proxy", "", "GitHub 代理加速前缀，例如 https://gh-proxy.com/")
+		logLevel     = fs.String("log-level", "info", "日志级别：debug / info / warn / error")
+		showVer      = fs.Bool("version", false, "输出版本后退出")
+		diagJob      = fs.String("diag-job", "", "本地直接执行一次测速任务并输出调试信息后退出")
+		allowPrivate = fs.Bool("allow-private-probes", false, "允许探测内网私有地址与链路本地地址（默认禁止，防范 SSRF/云元数据盗取）")
 	)
 	if err := fs.Parse(args); err != nil {
 		return nil, err
@@ -237,13 +239,14 @@ func parseConfig(args []string) (*config, error) {
 		pollTimeout:     *pollWait,
 		logLevel:        parseLogLevel(*logLevel),
 
-		autoUpdate:      *autoUpdate,
-		updateInterval:  *updateIntv,
-		checkUpdateOnce: *checkUpd,
-		applyUpdate:     strings.TrimSpace(*applyUpd),
-		skipUpdate:      strings.TrimSpace(*skipUpd),
-		ghProxy:         proxyVal,
-		diagJob:         strings.TrimSpace(*diagJob),
+		autoUpdate:         *autoUpdate,
+		updateInterval:     *updateIntv,
+		checkUpdateOnce:    *checkUpd,
+		applyUpdate:        strings.TrimSpace(*applyUpd),
+		skipUpdate:         strings.TrimSpace(*skipUpd),
+		ghProxy:            proxyVal,
+		diagJob:            strings.TrimSpace(*diagJob),
+		allowPrivateProbes: *allowPrivate,
 	}, nil
 }
 

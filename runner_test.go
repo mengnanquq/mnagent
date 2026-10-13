@@ -353,7 +353,9 @@ func TestAgentLoopProbeJobEndToEnd(t *testing.T) {
 		maxBackoff:  50 * time.Millisecond,
 		pollTimeout: 2 * time.Second,
 	}
-	a := &agent{cfg: cfg, logger: testLogger{t}, client: newClient(cfg), runner: newRunner(cfg.binary, nil)}
+	rnr := newRunner(cfg.binary, nil)
+	rnr.allowPrivateProbes = true
+	a := &agent{cfg: cfg, logger: testLogger{t}, client: newClient(cfg), runner: rnr}
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()

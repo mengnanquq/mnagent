@@ -24,7 +24,7 @@ func TestProbeKindRouting(t *testing.T) {
 	if isProbeKind(kindTrace) || isProbeKind("") {
 		t.Fatal("trace 不应走进程内探针")
 	}
-	if _, err := runProbe(context.Background(), Job{Kind: "nope", Target: "1.1.1.1"}); err == nil {
+	if _, err := runProbe(context.Background(), Job{Kind: "nope", Target: "1.1.1.1"}, false); err == nil {
 		t.Fatal("未知探针类型应报错")
 	}
 	// 未知类型不应走 nexttrace（避免把畸形任务当追踪执行）
@@ -65,7 +65,7 @@ func TestTCPingProbeLocalListener(t *testing.T) {
 	}()
 	port := listener.Addr().(*net.TCPAddr).Port
 
-	report, err := tcpingProbe(context.Background(), Job{Target: "127.0.0.1", Port: port, Count: 2, TimeoutMS: 2000})
+	report, err := tcpingProbe(context.Background(), Job{Target: "127.0.0.1", Port: port, Count: 2, TimeoutMS: 2000}, true)
 	if err != nil {
 		t.Fatalf("tcping 失败: %v", err)
 	}
@@ -89,7 +89,7 @@ func TestTCPingProbeRefusedPort(t *testing.T) {
 	port := listener.Addr().(*net.TCPAddr).Port
 	listener.Close() // 关闭后该端口无人监听
 
-	report, err := tcpingProbe(context.Background(), Job{Target: "127.0.0.1", Port: port, Count: 1, TimeoutMS: 2000})
+	report, err := tcpingProbe(context.Background(), Job{Target: "127.0.0.1", Port: port, Count: 1, TimeoutMS: 2000}, true)
 	if err != nil {
 		t.Fatalf("tcping 不应因连接失败而报错: %v", err)
 	}
@@ -103,7 +103,7 @@ func TestTCPingProbeRefusedPort(t *testing.T) {
 
 // TestTCPingProbeRejectsBadPort 端口越界应直接报错。
 func TestTCPingProbeRejectsBadPort(t *testing.T) {
-	if _, err := tcpingProbe(context.Background(), Job{Target: "127.0.0.1", Port: 70000}); err == nil {
+	if _, err := tcpingProbe(context.Background(), Job{Target: "127.0.0.1", Port: 70000}, true); err == nil {
 		t.Fatal("非法端口应报错")
 	}
 }
@@ -117,7 +117,7 @@ func TestPingProbeLocalhost(t *testing.T) {
 	}
 	conn.Close()
 
-	report, err := pingProbe(context.Background(), Job{Target: "127.0.0.1", Count: 2, TimeoutMS: 3000})
+	report, err := pingProbe(context.Background(), Job{Target: "127.0.0.1", Count: 2, TimeoutMS: 3000}, true)
 	if err != nil {
 		t.Fatalf("ping 失败: %v", err)
 	}
@@ -140,7 +140,7 @@ func TestHTTPProbeOK(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	report, err := httpProbe(context.Background(), Job{Target: srv.URL, TimeoutMS: 5000})
+	report, err := httpProbe(context.Background(), Job{Target: srv.URL, TimeoutMS: 5000}, true)
 	if err != nil {
 		t.Fatalf("http 探针失败: %v", err)
 	}
@@ -169,7 +169,7 @@ func TestHTTPProbeCountsRedirects(t *testing.T) {
 	}))
 	defer redirect.Close()
 
-	report, err := httpProbe(context.Background(), Job{Target: redirect.URL, TimeoutMS: 5000})
+	report, err := httpProbe(context.Background(), Job{Target: redirect.URL, TimeoutMS: 5000}, true)
 	if err != nil {
 		t.Fatalf("http 探针失败: %v", err)
 	}
@@ -181,9 +181,47 @@ func TestHTTPProbeCountsRedirects(t *testing.T) {
 // TestHTTPProbeRejectsBadURL 非 http(s) 目标应被拒绝。
 func TestHTTPProbeRejectsBadURL(t *testing.T) {
 	for _, target := range []string{"", "example.com", "ftp://example.com", "file:///etc/passwd"} {
-		if _, err := httpProbe(context.Background(), Job{Target: target}); err == nil {
+		if _, err := httpProbe(context.Background(), Job{Target: target}, true); err == nil {
 			t.Fatalf("%q 应被拒绝", target)
 		}
+	}
+}
+
+func TestBlockedProbeIP(t *testing.T) {
+	blocked := []string{
+		"127.0.0.1",
+		"::1",
+		"10.0.0.1",
+		"192.168.1.1",
+		"172.16.0.1",
+		"169.254.169.254", // AWS/GCP/Alibaba Cloud metadata
+		"100.64.0.1",      // CGNAT
+	}
+	for _, ipStr := range blocked {
+		ip := net.ParseIP(ipStr)
+		if !isBlockedProbeIP(ip) {
+			t.Errorf("isBlockedProbeIP(%q) 期望返回 true，实际 false", ipStr)
+		}
+	}
+
+	public := []string{
+		"1.1.1.1",
+		"8.8.8.8",
+		"2606:4700:4700::1111",
+	}
+	for _, ipStr := range public {
+		ip := net.ParseIP(ipStr)
+		if isBlockedProbeIP(ip) {
+			t.Errorf("isBlockedProbeIP(%q) 期望返回 false，实际 true", ipStr)
+		}
+	}
+
+	// 默认未开启 allowPrivate 时，拦截云元数据
+	if _, err := httpProbe(context.Background(), Job{Target: "http://169.254.169.254/latest/meta-data/"}, false); err == nil {
+		t.Fatal("未开启 allowPrivate 时探测云元数据必须被拦截")
+	}
+	if _, err := tcpingProbe(context.Background(), Job{Target: "169.254.169.254", Port: 80}, false); err == nil {
+		t.Fatal("未开启 allowPrivate 时 tcping 云元数据必须被拦截")
 	}
 }
 
@@ -226,6 +264,7 @@ func TestRunProbeJobProducesData(t *testing.T) {
 	port := listener.Addr().(*net.TCPAddr).Port
 
 	r := newRunner("nexttrace", nil)
+	r.allowPrivateProbes = true
 	res := r.run(context.Background(), Job{Kind: kindTCPing, Target: "127.0.0.1", Port: port, Count: 1, TimeoutMS: 2000})
 	if res.ErrText != "" {
 		t.Fatalf("不应报错: %q", res.ErrText)

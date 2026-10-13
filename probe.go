@@ -125,18 +125,38 @@ func normalizeCount(count int) int {
 	return count
 }
 
+// isBlockedProbeIP 判断 IP 是否属于回环、私有网段、链路本地、运营商级 NAT 或云实例元数据地址，防范 SSRF。
+func isBlockedProbeIP(ip net.IP) bool {
+	if ip == nil {
+		return true
+	}
+	if ip.IsLoopback() || ip.IsPrivate() || ip.IsLinkLocalUnicast() || ip.IsLinkLocalMulticast() || ip.IsUnspecified() || ip.IsMulticast() {
+		return true
+	}
+	if ip4 := ip.To4(); ip4 != nil {
+		// 100.64.0.0/10 (CGNAT) & 169.254.0.0/16 (Link-local / Cloud Metadata)
+		if ip4[0] == 100 && ip4[1] >= 64 && ip4[1] <= 127 {
+			return true
+		}
+		if ip4[0] == 169 && ip4[1] == 254 {
+			return true
+		}
+	}
+	return false
+}
+
 // runProbe 执行一次进程内探针。这些探针不依赖任何外部二进制，
 // 因此 OpenWrt 等精简系统上也能直接用。
-func runProbe(ctx context.Context, job Job) (probeOutcome, error) {
+func runProbe(ctx context.Context, job Job, allowPrivate bool) (probeOutcome, error) {
 	switch probeKind(job) {
 	case kindPing:
-		report, err := pingProbe(ctx, job)
+		report, err := pingProbe(ctx, job, allowPrivate)
 		return marshalProbe(report, err)
 	case kindTCPing:
-		report, err := tcpingProbe(ctx, job)
+		report, err := tcpingProbe(ctx, job, allowPrivate)
 		return marshalProbe(report, err)
 	case kindHTTP:
-		report, err := httpProbe(ctx, job)
+		report, err := httpProbe(ctx, job, allowPrivate)
 		return marshalProbe(report, err)
 	case kindDNS:
 		report, err := dnsProbe(ctx, job)
@@ -179,7 +199,7 @@ func summarizeProbe(report any) string {
 
 // pingProbe 发送 ICMP echo 并统计延迟。优先使用非特权 ICMP（SOCK_DGRAM），
 // 不可用时回退到需要 CAP_NET_RAW 的原始套接字。
-func pingProbe(ctx context.Context, job Job) (LatencyReport, error) {
+func pingProbe(ctx context.Context, job Job, allowPrivate bool) (LatencyReport, error) {
 	count := normalizeCount(job.Count)
 	target := strings.TrimSpace(job.Target)
 	timeout := probeTimeout(ctx, job.TimeoutMS)
@@ -187,6 +207,9 @@ func pingProbe(ctx context.Context, job Job) (LatencyReport, error) {
 	resolved, ip, ipv6, err := resolveEchoTarget(ctx, target)
 	if err != nil {
 		return LatencyReport{}, err
+	}
+	if !allowPrivate && isBlockedProbeIP(ip) {
+		return LatencyReport{}, fmt.Errorf("安全策略拦截：禁止探测私有或云元数据地址 (%s)", ip.String())
 	}
 	report := LatencyReport{Kind: kindPing, Target: target, Resolved: resolved, Sent: count}
 
@@ -334,7 +357,7 @@ func echoErrorText(err error) string {
 // ---------- tcping ----------
 
 // tcpingProbe 反复建立 TCP 连接，统计握手延迟。
-func tcpingProbe(ctx context.Context, job Job) (LatencyReport, error) {
+func tcpingProbe(ctx context.Context, job Job, allowPrivate bool) (LatencyReport, error) {
 	count := normalizeCount(job.Count)
 	timeout := probeTimeout(ctx, job.TimeoutMS)
 	host := strings.TrimSpace(job.Target)
@@ -351,6 +374,17 @@ func tcpingProbe(ctx context.Context, job Job) (LatencyReport, error) {
 	if net.ParseIP(host) == nil {
 		if ips, err := net.DefaultResolver.LookupIPAddr(ctx, host); err == nil && len(ips) > 0 {
 			resolved = ips[0].IP.String()
+		}
+	}
+	if !allowPrivate {
+		if ip := net.ParseIP(host); ip != nil {
+			if isBlockedProbeIP(ip) {
+				return LatencyReport{}, fmt.Errorf("安全策略拦截：禁止探测私有或云元数据地址 (%s)", ip.String())
+			}
+		} else if resolved != "" {
+			if ip := net.ParseIP(resolved); ip != nil && isBlockedProbeIP(ip) {
+				return LatencyReport{}, fmt.Errorf("安全策略拦截：禁止探测私有或云元数据地址 (%s)", ip.String())
+			}
 		}
 	}
 	report := LatencyReport{Kind: kindTCPing, Target: address, Resolved: resolved, Sent: count}
@@ -439,7 +473,7 @@ func shortDialError(err error) string {
 // ---------- http ----------
 
 // httpProbe 发起一次 HTTP(S) 请求并分阶段计时。
-func httpProbe(ctx context.Context, job Job) (HTTPReport, error) {
+func httpProbe(ctx context.Context, job Job, allowPrivate bool) (HTTPReport, error) {
 	raw := strings.TrimSpace(job.Target)
 	parsed, err := url.Parse(raw)
 	if err != nil || (parsed.Scheme != "http" && parsed.Scheme != "https") || parsed.Host == "" {
@@ -481,7 +515,35 @@ func httpProbe(ctx context.Context, job Job) (HTTPReport, error) {
 	}
 	req.Header.Set("User-Agent", "mnagent/"+version)
 
+	dialer := &net.Dialer{Timeout: timeout}
+	transport := &http.Transport{
+		Proxy: http.ProxyFromEnvironment,
+		DialContext: func(ctx context.Context, network, addr string) (net.Conn, error) {
+			host, port, err := net.SplitHostPort(addr)
+			if err != nil {
+				return nil, err
+			}
+			ips, err := net.DefaultResolver.LookupIP(ctx, "ip", host)
+			if err != nil {
+				return nil, err
+			}
+			if len(ips) == 0 {
+				return nil, fmt.Errorf("无法解析目标主机: %s", host)
+			}
+			if !allowPrivate {
+				for _, ip := range ips {
+					if isBlockedProbeIP(ip) {
+						return nil, fmt.Errorf("安全策略拦截：禁止探测私有或云元数据地址 (%s)", ip.String())
+					}
+				}
+			}
+			return dialer.DialContext(ctx, network, net.JoinHostPort(ips[0].String(), port))
+		},
+	}
+	defer transport.CloseIdleConnections()
+
 	client := &http.Client{
+		Transport: transport,
 		CheckRedirect: func(_ *http.Request, via []*http.Request) error {
 			redirects = len(via)
 			if len(via) >= httpMaxRedirects {

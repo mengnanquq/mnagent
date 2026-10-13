@@ -64,9 +64,10 @@ type runner struct {
 	jsonOutput      atomic.Bool // 是否附加 -j（旧版本 nexttrace 不支持时自动关闭）。
 	// waitDelay 限制“进程已被杀掉、但仍有子进程占着输出管道”时的额外等待，
 	// 避免超时任务因为派生的孙进程而把 agent 卡死。
-	waitDelay  time.Duration
-	logger     logger // 可选：记录实际执行的 argv，便于与主机上手跑结果对照。
-	onProgress func(Progress)
+	waitDelay          time.Duration
+	allowPrivateProbes bool
+	logger             logger // 可选：记录实际执行的 argv，便于与主机上手跑结果对照。
+	onProgress         func(Progress)
 }
 
 // setProgressReporter 注入实时进度回调。
@@ -76,22 +77,23 @@ func (r *runner) setProgressReporter(fn func(Progress)) {
 
 // newRunner 构建执行器，默认请求 JSON 输出。
 func newRunner(binary string, log logger) *runner {
-	return newRunnerFull(binary, "miaospeed", "", log)
+	return newRunnerFull(binary, "miaospeed", "", false, log)
 }
 
 // newRunnerWithMiaospeed 构建执行器，可指定 miaospeed 可执行文件路径。
 func newRunnerWithMiaospeed(binary, miaospeed string, log logger) *runner {
-	return newRunnerFull(binary, miaospeed, "", log)
+	return newRunnerFull(binary, miaospeed, "", false, log)
 }
 
 // newRunnerFull 构建执行器，可指定 miaospeed 路径与 GitHub 代理前缀。
-func newRunnerFull(binary, miaospeed, ghProxy string, log logger) *runner {
+func newRunnerFull(binary, miaospeed, ghProxy string, allowPrivate bool, log logger) *runner {
 	r := &runner{
-		binary:          binary,
-		miaospeedBinary: miaospeed,
-		ghProxy:         ghProxy,
-		waitDelay:       5 * time.Second,
-		logger:          log,
+		binary:             binary,
+		miaospeedBinary:    miaospeed,
+		ghProxy:            ghProxy,
+		allowPrivateProbes: allowPrivate,
+		waitDelay:          5 * time.Second,
+		logger:             log,
 	}
 	r.jsonOutput.Store(true)
 	return r
@@ -158,7 +160,7 @@ func (r *runner) runMiaospeed(ctx context.Context, job Job) runResult {
 func (r *runner) runProbeJob(ctx context.Context, job Job, kind string) runResult {
 	runCtx, cancel := context.WithTimeout(ctx, job.Timeout())
 	defer cancel()
-	outcome, err := runProbe(runCtx, job)
+	outcome, err := runProbe(runCtx, job, r.allowPrivateProbes)
 	result := runResult{Output: outcome.Output, Data: outcome.Data}
 	if err != nil {
 		result.ErrText = err.Error()
