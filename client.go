@@ -182,18 +182,29 @@ type Progress struct {
 	Stage    string `json:"stage,omitempty"`
 }
 
-// sendProgress 上报实时进度，单次失败不阻塞主流程。
-func (c *client) sendProgress(ctx context.Context, p Progress) error {
+// progressResponse 机器人侧针对进度上报的可选控制返回。
+type progressResponse struct {
+	Cancel bool `json:"cancel,omitempty"`
+}
+
+// sendProgress 上报实时进度，返回机器人是否要求取消该任务（单次网络错误不阻塞主流程）。
+func (c *client) sendProgress(ctx context.Context, p Progress) (bool, error) {
 	payload, err := json.Marshal(p)
 	if err != nil {
-		return err
+		return false, err
 	}
 	resp, err := c.do(ctx, http.MethodPost, "/progress", payload)
 	if err != nil {
-		return err
+		return false, err
 	}
 	defer resp.Body.Close()
-	return nil
+	if resp.StatusCode == http.StatusOK {
+		var pr progressResponse
+		if err := json.NewDecoder(resp.Body).Decode(&pr); err == nil && pr.Cancel {
+			return true, nil
+		}
+	}
+	return false, nil
 }
 
 // do 发送一次带鉴权头的请求。

@@ -2038,31 +2038,30 @@ func runMiaospeedJob(ctx context.Context, binary, ghProxy string, job Job, log l
 	token := generateRandomHex(16)
 
 	// 3. 启动临时 miaospeed server 进程（开启 -ipv6 支持全场景 IPv6 节点直连与 AAAA 域名解析）
-	cmd := exec.CommandContext(taskCtx, binPath, "server",
-		"-bind", fmt.Sprintf("127.0.0.1:%d", port),
-		"-token", token,
-		"-ipv6",
-	)
-	cmd.WaitDelay = 3 * time.Second
-	serverOut := &cappedBuffer{max: maxOutputBytes}
-	cmd.Stdout = serverOut
-	cmd.Stderr = serverOut
+		cmd := exec.CommandContext(taskCtx, binPath, "server",
+			"-bind", fmt.Sprintf("127.0.0.1:%d", port),
+			"-token", token,
+			"-ipv6",
+		)
+		setupCmdProcessGroup(cmd)
+		cmd.WaitDelay = 3 * time.Second
+		serverOut := &cappedBuffer{max: maxOutputBytes}
+		cmd.Stdout = serverOut
+		cmd.Stderr = serverOut
 
-	if log != nil {
-		log.Debug("启动 miaospeed 服务", "binary", binPath, "port", port, "timeout", dynamicTimeout, "nodes", len(nodes))
-	}
-
-	if err := cmd.Start(); err != nil {
-		return "", nil, fmt.Errorf("启动 miaospeed 失败: %w", err)
-	}
-
-	// 确保退出时终止进程
-	defer func() {
-		if cmd.Process != nil {
-			_ = cmd.Process.Kill()
+		if log != nil {
+			log.Debug("启动 miaospeed 服务", "binary", binPath, "port", port, "timeout", dynamicTimeout, "nodes", len(nodes))
 		}
-		_ = cmd.Wait()
-	}()
+
+		if err := cmd.Start(); err != nil {
+			return "", nil, fmt.Errorf("启动 miaospeed 失败: %w", err)
+		}
+
+		// 确保退出时终止进程
+		defer func() {
+			killProcessGroup(cmd)
+			_ = cmd.Wait()
+		}()
 
 	addr := fmt.Sprintf("127.0.0.1:%d", port)
 	if err := waitForPortReady(taskCtx, addr, 4*time.Second); err != nil {

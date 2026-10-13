@@ -229,6 +229,7 @@ func clampText(s string, max int) string {
 // exec 以 argv 方式调用 nexttrace（不经 shell），并捕获受限输出。
 func (r *runner) exec(ctx context.Context, args []string) (string, int, error) {
 	cmd := exec.CommandContext(ctx, r.binary, args...)
+	setupCmdProcessGroup(cmd)
 	cmd.WaitDelay = r.waitDelay
 	if r.logger != nil {
 		r.logger.Debug("执行 nexttrace", "argv", strings.Join(append([]string{r.binary}, args...), " "))
@@ -299,11 +300,16 @@ func looksLikeUnknownFlag(out string) bool {
 
 // agent 把客户端与执行器串成“领取 → 执行 → 回传”的主循环。
 type agent struct {
-	cfg    *config
-	logger logger
-	client *client
-	runner *runner
-	update *updater
+	cfg     *config
+	logger  logger
+	client  *client
+	runner  *runner
+	update  *updater
+	tracker *jobTracker
+
+	heavyActive atomic.Bool
+	heavyDone   chan struct{}
+	tasksWG     sync.WaitGroup
 }
 
 // logger 是本包用到的最小日志接口，便于测试注入。
@@ -313,8 +319,14 @@ type logger interface {
 	Debug(msg string, args ...any)
 }
 
+func isHeavy(job Job) bool {
+	kind := probeKind(job)
+	return kind == kindTrace || kind == "miaospeed" || kind == "speed"
+}
+
 // loop 不断领取任务并执行，直到 ctx 结束；启用自动更新时按周期检查新版本。
 func (a *agent) loop(ctx context.Context) error {
+	defer a.tasksWG.Wait()
 	backoff := a.cfg.minBackoff
 	var nextCheck time.Time
 	for {
@@ -360,7 +372,46 @@ func (a *agent) loop(ctx context.Context) error {
 		if job == nil {
 			continue // 空响应：立刻再轮询。
 		}
-		a.execute(ctx, *job)
+
+		// 收到任务取消控制包
+		if job.Kind == "cancel" {
+			if a.tracker != nil {
+				if a.tracker.Cancel(job.ID) {
+					a.logger.Info("已按指令中止正在执行的任务", "job", job.ID)
+				}
+			}
+			continue
+		}
+
+		if isHeavy(*job) {
+			if a.heavyActive.Load() {
+				// 已有重任务在执行，等待其完成，避免并发重任务抢占带宽与端口
+				select {
+				case <-a.heavyDone:
+				case <-ctx.Done():
+					return nil
+				}
+				continue
+			}
+
+			a.heavyActive.Store(true)
+			doneCh := make(chan struct{})
+			a.heavyDone = doneCh
+			a.tasksWG.Add(1)
+			go func(j Job) {
+				defer func() {
+					a.heavyActive.Store(false)
+					close(doneCh)
+					a.tasksWG.Done()
+				}()
+				a.execute(ctx, j)
+			}(*job)
+		} else {
+			// 轻任务（ping / tcping / http / dns）：
+			// 当重任务在跑时，主循环继续长轮询收到轻任务并直接执行，秒级返回结果，
+			// 不再受前序耗时测速阻塞。
+			a.execute(ctx, *job)
+		}
 	}
 }
 
@@ -564,7 +615,14 @@ func (a *agent) execute(ctx context.Context, job Job) {
 	a.logger.Info("开始执行任务", "job", job.ID, "kind", probeKind(job), "target", job.Target,
 		"hops", job.Hops, "port", job.Port, "protocol", job.Protocol, "count", job.Count)
 
-	run := a.runner.run(ctx, job)
+	taskCtx, taskCancel := context.WithCancel(ctx)
+	defer taskCancel()
+	if a.tracker != nil {
+		a.tracker.Register(job.ID, taskCancel)
+		defer a.tracker.Unregister(job.ID)
+	}
+
+	run := a.runner.run(taskCtx, job)
 	output, errText, exitCode := run.Output, run.ErrText, run.ExitCode
 
 	// 回传不依赖任务上下文：即使任务超时或进程正在退出，也尽量让机器人拿到结果，

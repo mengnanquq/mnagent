@@ -116,19 +116,23 @@ func runWithContext(ctx context.Context, args []string) error {
 	}
 
 	cli := newClient(cfg)
+	tracker := newJobTracker()
 	rnr := newRunnerFull(cfg.binary, cfg.miaospeedBinary, cfg.ghProxy, log)
 	rnr.setProgressReporter(func(p Progress) {
 		pCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
 		defer cancel()
-		_ = cli.sendProgress(pCtx, p)
+		if cancelled, _ := cli.sendProgress(pCtx, p); cancelled {
+			tracker.Cancel(p.ID)
+		}
 	})
 
 	agent := &agent{
-		cfg:    cfg,
-		logger: log,
-		client: cli,
-		runner: rnr,
-		update: newUpdater(cfg, log),
+		cfg:     cfg,
+		logger:  log,
+		client:  cli,
+		runner:  rnr,
+		update:  newUpdater(cfg, log),
+		tracker: tracker,
 	}
 	log.Info("mnagent 已启动",
 		"version", version, "bot", cfg.botURL,
