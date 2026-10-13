@@ -134,7 +134,8 @@ func isMiaospeedKind(kind string) bool {
 
 // runMiaospeed 执行 miaospeed 代理测速。
 func (r *runner) runMiaospeed(ctx context.Context, job Job) runResult {
-	runCtx, cancel := context.WithTimeout(ctx, job.Timeout())
+	// 测速超时由任务内部根据实际节点数量动态计算，外层仅用最大时限兜底，避免长订阅测速被提前截断。
+	runCtx, cancel := context.WithTimeout(ctx, jobMiaospeedMaxTimeout)
 	defer cancel()
 
 	output, data, err := runMiaospeedJob(runCtx, r.miaospeedBinary, r.ghProxy, job, r.logger, r.onProgress)

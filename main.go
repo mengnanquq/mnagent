@@ -118,7 +118,9 @@ func runWithContext(ctx context.Context, args []string) error {
 	cli := newClient(cfg)
 	rnr := newRunnerFull(cfg.binary, cfg.miaospeedBinary, cfg.ghProxy, log)
 	rnr.setProgressReporter(func(p Progress) {
-		_ = cli.sendProgress(context.Background(), p)
+		pCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
+		defer cancel()
+		_ = cli.sendProgress(pCtx, p)
 	})
 
 	agent := &agent{

@@ -1356,3 +1356,93 @@ password: "pwd"
 		}
 	})
 }
+
+// TestMultiNodePlanSkipsHijackAndIncludesFastIPScript 验证多节点批量测速跳过硬编码 42s 超时的 matrixHijack 并注入快速 GeoIP 脚本。
+func TestMultiNodePlanSkipsHijackAndIncludesFastIPScript(t *testing.T) {
+	// 单节点应包含 matrixHijack
+	planSingle := buildMiaospeedTestPlan(Job{Query: "full"}, 1)
+	hasHijackSingle := false
+	for _, m := range planSingle.Matrices {
+		if m.Type == matrixHijack {
+			hasHijackSingle = true
+			break
+		}
+	}
+	if !hasHijackSingle {
+		t.Fatal("单节点全量测速应保留 matrixHijack")
+	}
+
+	// 多节点（如 130 个节点）应跳过 matrixHijack，避免每个死节点被硬编码 42s 超时阻塞
+	planMulti := buildMiaospeedTestPlan(Job{Query: "full"}, 130)
+	for _, m := range planMulti.Matrices {
+		if m.Type == matrixHijack {
+			t.Fatal("多节点全量测速不应包含 matrixHijack（会导致死节点卡住 42s）")
+		}
+	}
+
+	// 验证注入了 Type: "ip" 的快速 GeoIP 脚本
+	hasFastIP := false
+	for _, s := range planMulti.Scripts {
+		if s.Type == "ip" && strings.Contains(s.Content, "ip_resolve") {
+			hasFastIP = true
+			break
+		}
+	}
+	if !hasFastIP {
+		t.Fatal("全量测速脚本应包含 Type=ip 的快速 ip_resolve 脚本以避免默认 IPv6 超时")
+	}
+}
+
+// TestExecuteMiaospeedTaskPreservesPartialProgressOnTimeout 验证当多节点测速中途超时或断开时，已测完的节点结果不会丢失。
+func TestExecuteMiaospeedTaskPreservesPartialProgressOnTimeout(t *testing.T) {
+	token := "secret-token"
+	handler := websocket.Handler(func(ws *websocket.Conn) {
+		var req slaveRequest
+		if err := websocket.JSON.Receive(ws, &req); err != nil {
+			return
+		}
+		// 发送前 2 个节点的完成进度
+		for i := 0; i < 2; i++ {
+			_ = websocket.JSON.Send(ws, slaveResponse{
+				Progress: &slaveProgress{
+					Index: i,
+					Record: &slaveEntrySlot{
+						Grouping: "test",
+						Matrices: []matrixResponse{
+							{Type: matrixRTTPing, Payload: `{"Value":25.0}`},
+							{Type: matrixHTTPPing, Payload: `{"Value":35.0}`},
+							{Type: matrixPacketLoss, Payload: `{"Value":0}`},
+						},
+					},
+				},
+			})
+		}
+		// 模拟第 3 个节点卡住直到客户端上下文超时
+		time.Sleep(500 * time.Millisecond)
+	})
+
+	server := httptest.NewServer(handler)
+	defer server.Close()
+
+	wsURL := "ws://" + server.Listener.Addr().String() + "/"
+	origin := "http://" + server.Listener.Addr().String() + "/"
+	nodes := []MiaospeedNode{
+		{Name: "Node-1", Protocol: "vless", Server: "1.1.1.1:443"},
+		{Name: "Node-2", Protocol: "vless", Server: "2.2.2.2:443"},
+		{Name: "Node-3-Stuck", Protocol: "vless", Server: "3.3.3.3:443"},
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 150*time.Millisecond)
+	defer cancel()
+
+	report, err := executeMiaospeedTask(ctx, wsURL, origin, token, nodes, 3, Job{ID: "partial-test"}, nil, nil)
+	if err != nil {
+		t.Fatalf("期望在有已完成节点进度时返回部分结果而非报错丢弃，实际 err=%v", err)
+	}
+	if len(report.SubReports) != 2 {
+		t.Fatalf("期望保留已完成的 2 个节点报告，实际: %d", len(report.SubReports))
+	}
+	if report.SubReports[0].NodeName != "Node-1" || report.SubReports[1].NodeName != "Node-2" {
+		t.Fatalf("保留的节点名称异常: %+v", report.SubReports)
+	}
+}

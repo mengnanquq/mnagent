@@ -16,6 +16,7 @@ import (
 	"net/url"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"time"
@@ -124,7 +125,10 @@ func (r MiaospeedReport) Format() string {
 		b.WriteString(fmt.Sprintf("连通性: HTTP 状态码 %d\n", r.HTTPCode))
 	}
 
-	if r.PingRTTMs > 0 || r.PingConnMs > 0 || r.PacketLoss > 0 {
+	isOffline := r.PacketLoss >= 100 && r.PingRTTMs == 0 && r.PingConnMs == 0
+	if isOffline {
+		b.WriteString("延迟: 节点不可达 (100% 丢包)\n")
+	} else if r.PingRTTMs > 0 || r.PingConnMs > 0 || r.PacketLoss > 0 {
 		var parts []string
 		if r.PingRTTMs > 0 {
 			parts = append(parts, fmt.Sprintf("RTT %.1f ms", r.PingRTTMs))
@@ -137,8 +141,6 @@ func (r MiaospeedReport) Format() string {
 		}
 		parts = append(parts, fmt.Sprintf("丢包 %.1f%%", r.PacketLoss))
 		b.WriteString("延迟: " + strings.Join(parts, " | ") + "\n")
-	} else if r.PacketLoss >= 100 {
-		b.WriteString("延迟: 节点不可达 (100% 丢包)\n")
 	}
 
 	if r.UDPType != "" {
@@ -1885,13 +1887,25 @@ func parseAnyTLSURI(u *url.URL) (*MiaospeedNode, error) {
 func quoteYAML(s string) string {
 	s = strings.ReplaceAll(s, `\`, `\\`)
 	s = strings.ReplaceAll(s, `"`, `\"`)
+	s = strings.ReplaceAll(s, "\r", `\r`)
+	s = strings.ReplaceAll(s, "\n", `\n`)
+	s = strings.ReplaceAll(s, "\t", `\t`)
 	return `"` + s + `"`
+}
+
+func sanitizeYAMLToken(s string) string {
+	return strings.Map(func(r rune) rune {
+		if r == '\r' || r == '\n' || r == '\t' || r < 0x20 {
+			return -1
+		}
+		return r
+	}, strings.TrimSpace(s))
 }
 
 func getString(m map[string]any, k string) string {
 	if v, ok := m[k]; ok {
 		if s, ok := v.(string); ok {
-			return s
+			return sanitizeYAMLToken(s)
 		}
 	}
 	return ""
@@ -1945,9 +1959,12 @@ func runMiaospeedJob(ctx context.Context, binary, ghProxy string, job Job, log l
 	if p, err := exec.LookPath(binary); err == nil {
 		binPath = p
 	} else if _, err := os.Stat(binary); err != nil {
-		// 未找到可执行文件，尝试从 AirportR/miaospeed 自动下载安装（继承使用 ghProxy）
-		if installed, err := autoInstallMiaospeed(ctx, binary, ghProxy, log); err == nil && installed != "" {
-			binPath = installed
+		// 未找到可执行文件，若配置为 miaospeed 标准文件名则尝试从 AirportR/miaospeed 自动下载安装
+		baseName := strings.ToLower(filepath.Base(binary))
+		if baseName == "miaospeed" || baseName == "miaospeed.exe" {
+			if installed, err := autoInstallMiaospeed(ctx, binary, ghProxy, log); err == nil && installed != "" {
+				binPath = installed
+			}
 		}
 	}
 
@@ -1964,6 +1981,9 @@ func runMiaospeedJob(ctx context.Context, binary, ghProxy string, job Job, log l
 	dynamicTimeout := CalcMiaospeedTimeout(len(nodes))
 	if reqTimeout := time.Duration(job.TimeoutMS) * time.Millisecond; reqTimeout > dynamicTimeout {
 		dynamicTimeout = reqTimeout
+	}
+	if dynamicTimeout > jobMiaospeedMaxTimeout {
+		dynamicTimeout = jobMiaospeedMaxTimeout
 	}
 
 	taskCtx, cancelTask := context.WithTimeout(ctx, dynamicTimeout)
@@ -1992,9 +2012,9 @@ func runMiaospeedJob(ctx context.Context, binary, ghProxy string, job Job, log l
 		"-token", token,
 	)
 	cmd.WaitDelay = 3 * time.Second
-	var serverOut strings.Builder
-	cmd.Stdout = &serverOut
-	cmd.Stderr = &serverOut
+	serverOut := &cappedBuffer{max: maxOutputBytes}
+	cmd.Stdout = serverOut
+	cmd.Stderr = serverOut
 
 	if log != nil {
 		log.Debug("启动 miaospeed 服务", "binary", binPath, "port", port, "timeout", dynamicTimeout, "nodes", len(nodes))
@@ -2137,29 +2157,36 @@ func buildMiaospeedTestPlan(job Job, nodeCount ...int) miaospeedTestPlan {
 
 	// 默认或明确指定为全量测试
 	if len(modes) == 0 || modes[ModeFull] {
+		matrices := []slaveRequestMatrixEntry{
+			{Type: matrixRTTPing},
+			{Type: matrixHTTPPing},
+			{Type: matrixPacketLoss},
+			{Type: matrixHTTPCode},
+			{Type: matrixInboundGeoIP},
+			{Type: matrixOutboundGeoIP},
+		}
+		// 单节点测速包含防劫持检测；多节点批量测速跳过 matrixHijack
+		//（miaospeed 内部 checkHijack 硬编码 2×3×7s=42s 超时且无视 TaskTimeout，会导致死节点卡住 42s，而多节点表格不展示该项）
+		if count <= 1 {
+			matrices = append(matrices, slaveRequestMatrixEntry{Type: matrixHijack})
+		}
+		matrices = append(matrices,
+			slaveRequestMatrixEntry{Type: matrixUDPType},
+			slaveRequestMatrixEntry{Type: matrixAverageSpeed},
+			slaveRequestMatrixEntry{Type: matrixMaxSpeed},
+			slaveRequestMatrixEntry{Type: "TEST_SCRIPT", Params: "youtube"},
+			slaveRequestMatrixEntry{Type: "TEST_SCRIPT", Params: "netflix"},
+			slaveRequestMatrixEntry{Type: "TEST_SCRIPT", Params: "disney"},
+			slaveRequestMatrixEntry{Type: "TEST_SCRIPT", Params: "openai"},
+			slaveRequestMatrixEntry{Type: "TEST_SCRIPT", Params: "claude"},
+			slaveRequestMatrixEntry{Type: "TEST_SCRIPT", Params: "spotify"},
+			slaveRequestMatrixEntry{Type: "TEST_SCRIPT", Params: "tiktok"},
+			slaveRequestMatrixEntry{Type: "TEST_SCRIPT", Params: "bilibili"},
+			slaveRequestMatrixEntry{Type: "TEST_SCRIPT", Params: "wikipedia"},
+		)
 		return miaospeedTestPlan{
-			ModeDescription: "全量测试",
-			Matrices: []slaveRequestMatrixEntry{
-				{Type: matrixRTTPing},
-				{Type: matrixHTTPPing},
-				{Type: matrixPacketLoss},
-				{Type: matrixHTTPCode},
-				{Type: matrixInboundGeoIP},
-				{Type: matrixOutboundGeoIP},
-				{Type: matrixHijack},
-				{Type: matrixUDPType},
-				{Type: matrixAverageSpeed},
-				{Type: matrixMaxSpeed},
-				{Type: "TEST_SCRIPT", Params: "youtube"},
-				{Type: "TEST_SCRIPT", Params: "netflix"},
-				{Type: "TEST_SCRIPT", Params: "disney"},
-				{Type: "TEST_SCRIPT", Params: "openai"},
-				{Type: "TEST_SCRIPT", Params: "claude"},
-				{Type: "TEST_SCRIPT", Params: "spotify"},
-				{Type: "TEST_SCRIPT", Params: "tiktok"},
-				{Type: "TEST_SCRIPT", Params: "bilibili"},
-				{Type: "TEST_SCRIPT", Params: "wikipedia"},
-			},
+			ModeDescription:   "全量测试",
+			Matrices:          matrices,
 			Scripts:           buildDefaultMediaScripts(),
 			DownloadThreading: 4,
 			DownloadDuration:  downloadDuration,
@@ -2259,25 +2286,30 @@ func executeMiaospeedTask(ctx context.Context, wsURL, origin, token string, node
 		return nil, fmt.Errorf("配置 websocket 失败: %w", err)
 	}
 
-	var ws *websocket.Conn
-	dialErrChan := make(chan error, 1)
+	type dialResult struct {
+		conn *websocket.Conn
+		err  error
+	}
+	dialCh := make(chan dialResult, 1)
 	go func() {
 		conn, err := websocket.DialConfig(wsCfg)
-		if err != nil {
-			dialErrChan <- err
-			return
-		}
-		ws = conn
-		close(dialErrChan)
+		dialCh <- dialResult{conn: conn, err: err}
 	}()
 
+	var ws *websocket.Conn
 	select {
 	case <-ctx.Done():
+		go func() {
+			if res := <-dialCh; res.conn != nil {
+				_ = res.conn.Close()
+			}
+		}()
 		return nil, ctx.Err()
-	case err := <-dialErrChan:
-		if err != nil {
-			return nil, fmt.Errorf("连接 miaospeed 服务失败: %w", err)
+	case res := <-dialCh:
+		if res.err != nil {
+			return nil, fmt.Errorf("连接 miaospeed 服务失败: %w", res.err)
 		}
+		ws = res.conn
 	}
 	defer ws.Close()
 
@@ -2352,23 +2384,30 @@ func executeMiaospeedTask(ctx context.Context, wsURL, origin, token string, node
 
 	// 接收结果
 	startTime := time.Now()
+	var lastProgressTime time.Time
 	var progressSlots []slaveEntrySlot
 	for {
 		select {
 		case <-ctx.Done():
+			if len(progressSlots) > 0 {
+				resTask := &slaveTask{Results: progressSlots}
+				return parseSlaveTaskResult(resTask, nodes, totalNodes, plan, time.Since(startTime)), nil
+			}
 			return nil, ctx.Err()
 		default:
 		}
 
-		_ = ws.SetReadDeadline(time.Now().Add(5 * time.Second))
 		var resp slaveResponse
-		if err := readNextSlaveJSON(ws, &resp); err != nil {
-			if errors.Is(err, io.EOF) || errors.Is(err, io.ErrUnexpectedEOF) {
+		if err := readNextSlaveJSON(ctx, ws, &resp); err != nil {
+			if errors.Is(err, io.EOF) || errors.Is(err, io.ErrUnexpectedEOF) || errors.Is(err, context.DeadlineExceeded) || errors.Is(err, context.Canceled) {
 				break
 			}
 			var netErr net.Error
 			if errors.As(err, &netErr) && netErr.Timeout() {
 				continue
+			}
+			if len(progressSlots) > 0 {
+				break
 			}
 			return nil, fmt.Errorf("读取 miaospeed 响应失败: %w", err)
 		}
@@ -2385,16 +2424,20 @@ func executeMiaospeedTask(ctx context.Context, wsURL, origin, token string, node
 			if onProgress != nil {
 				curIdx := resp.Progress.Index + 1
 				curName := ""
-				if resp.Progress.Index < len(nodes) {
+				if resp.Progress.Index >= 0 && resp.Progress.Index < len(nodes) {
 					curName = nodes[resp.Progress.Index].Name
 				}
-				onProgress(Progress{
-					ID:       job.ID,
-					Current:  curIdx,
-					Total:    len(nodes),
-					NodeName: curName,
-					Stage:    "全量测速中",
-				})
+				now := time.Now()
+				if curIdx == 1 || curIdx >= len(nodes) || now.Sub(lastProgressTime) >= 600*time.Millisecond {
+					lastProgressTime = now
+					onProgress(Progress{
+						ID:       job.ID,
+						Current:  curIdx,
+						Total:    len(nodes),
+						NodeName: curName,
+						Stage:    "全量测速中",
+					})
+				}
 			}
 		}
 
@@ -2410,6 +2453,9 @@ func executeMiaospeedTask(ctx context.Context, wsURL, origin, token string, node
 		return report, nil
 	}
 
+	if ctx.Err() != nil {
+		return nil, ctx.Err()
+	}
 	return nil, errors.New("miaospeed 连接已关闭，但未收到结果数据")
 }
 
@@ -2680,9 +2726,50 @@ func generateRandomHex(n int) string {
 	return hex.EncodeToString(b)
 }
 
-// buildDefaultMediaScripts 返回主流流媒体检测的轻量 JavaScript 脚本集。
+// buildDefaultMediaScripts 返回主流流媒体检测与快速 GeoIP 探测的轻量 JavaScript 脚本集。
 func buildDefaultMediaScripts() []slaveScript {
 	return []slaveScript{
+		{
+			// 覆盖 miaospeed 默认的 default_ip.js 与 default_geoip.js：
+			// 默认脚本对每个节点顺序请求 IPv4 + IPv6 (2606:4700:4700::1111) 且单次 3000ms，
+			// 导致无 IPv6 的正常节点每次白等 3s、死节点重试 3 次阻塞 18s。
+			// 此处收敛为轻量 IPv4 1500ms 快速探测，大幅加速大订阅多节点测速。
+			ID:   "ip_fast",
+			Type: "ip",
+			Content: `function ip_resolve() {
+    var content = (get(fetch("https://1.1.1.1/cdn-cgi/trace", {
+        headers: {'User-Agent': 'Mozilla/5.0'},
+        retry: 1,
+        timeout: 1500
+    }), "body") || "").trim();
+    var m = content.match(/ip=(\S+)/);
+    if (m && m[1]) return [m[1].trim()];
+    return [];
+}
+function handler(ip) {
+    var content = fetch("https://ipv4.ipleak.net/json/" + ip, {
+        headers: {'User-Agent': 'Mozilla/5.0'},
+        retry: 1,
+        timeout: 2000
+    });
+    var ret = safeParse(get(content, "body"));
+    return {
+        "ip": get(ret, "ip", ""),
+        "isp": get(ret, "isp_name", ""),
+        "organization": get(ret, "isp_name", ""),
+        "latitude": get(ret, "latitude", 0),
+        "longitude": get(ret, "longitude", 0),
+        "asn": parseInt(get(ret, "as_number", 0), 10) || 0,
+        "asn_organization": get(ret, "isp_name", ""),
+        "timezone": get(ret, "time_zone", ""),
+        "region": get(ret, "region_name", ""),
+        "city": get(ret, "city_name", ""),
+        "country": get(ret, "country_name", ""),
+        "country_code": get(ret, "country_code", "")
+    };
+}`,
+			TimeoutMillis: 2500,
+		},
 		{
 			ID:   "youtube",
 			Type: "media",
@@ -2851,24 +2938,41 @@ func mapScriptKey(key string) string {
 }
 
 // readNextSlaveJSON 从 ws 连接中读取下一条完整的 JSON 响应并反序列化。
-func readNextSlaveJSON(ws *websocket.Conn, dest any) error {
+// 内部处理 5s ReadDeadline 超时并在 ctx 未结束时继续累积读取，防止跨读取周期拆帧丢失半包数据。
+func readNextSlaveJSON(ctx context.Context, ws *websocket.Conn, dest any) error {
 	var buf bytes.Buffer
-	chunk := make([]byte, 4096)
+	chunk := make([]byte, 32*1024)
 	for {
+		if ctx.Err() != nil {
+			return ctx.Err()
+		}
+		_ = ws.SetReadDeadline(time.Now().Add(5 * time.Second))
 		n, err := ws.Read(chunk)
 		if n > 0 {
 			buf.Write(chunk[:n])
 			b := bytes.TrimSpace(buf.Bytes())
 			if len(b) > 0 && b[0] == '{' && b[len(b)-1] == '}' {
-				if jsonErr := json.Unmarshal(b, dest); jsonErr == nil {
-					return nil
+				if json.Valid(b) {
+					if jsonErr := json.Unmarshal(b, dest); jsonErr == nil {
+						return nil
+					}
 				}
 			}
 		}
 		if err != nil {
+			var netErr net.Error
+			if errors.As(err, &netErr) && netErr.Timeout() {
+				if ctx.Err() != nil {
+					return ctx.Err()
+				}
+				continue
+			}
 			if buf.Len() > 0 {
-				if jsonErr := json.Unmarshal(bytes.TrimSpace(buf.Bytes()), dest); jsonErr == nil {
-					return nil
+				b := bytes.TrimSpace(buf.Bytes())
+				if len(b) > 0 && json.Valid(b) {
+					if jsonErr := json.Unmarshal(b, dest); jsonErr == nil {
+						return nil
+					}
 				}
 			}
 			return err
