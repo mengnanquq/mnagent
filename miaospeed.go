@@ -19,6 +19,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 	"unicode"
 
@@ -2517,9 +2518,25 @@ func parseSingleSlot(slot slaveEntrySlot, node *MiaospeedNode, plan miaospeedTes
 		case matrixUDPType:
 			rep.UDPType = parseMatrixString(m.Payload)
 		case matrixInboundGeoIP:
-			_, rep.InboundGeo = parseMatrixGeo(m.Payload)
-			if rep.InboundGeo == rep.NodeName || rep.InboundGeo == rep.Server {
-				rep.InboundGeo = ""
+			inIP, inGeo := parseMatrixGeo(m.Payload)
+			rep.InboundGeo = inGeo
+			if rep.InboundGeo == rep.NodeName || rep.InboundGeo == rep.Server || rep.InboundGeo == "" {
+				// 若 miaospeed 原生未能解析入站 Geo（如 IPv6 节点因官方核心缺少端口剥离 bug 导致查询失败），从节点 server 主动提取并解析入站 Geo
+				if node != nil && node.Server != "" && !isLocalHost(node.Server) {
+					sHost := extractHost(node.Server)
+					if resolvedIP, resolvedGeo := queryIPGeo(sHost); resolvedGeo != "" && resolvedGeo != "本地直连" {
+						rep.InboundGeo = resolvedGeo
+						if resolvedIP != "" {
+							inIP = resolvedIP
+						}
+					}
+				}
+				if rep.InboundGeo == rep.NodeName || rep.InboundGeo == rep.Server {
+					rep.InboundGeo = ""
+				}
+			}
+			if inIP != "" && rep.InboundGeo != "" && !strings.Contains(rep.InboundGeo, inIP) && !strings.Contains(rep.InboundGeo, "(") {
+				rep.InboundGeo = fmt.Sprintf("%s (%s)", rep.InboundGeo, inIP)
 			}
 		case matrixOutboundGeoIP:
 			rep.OutboundIP, rep.OutboundGeo = parseMatrixGeo(m.Payload)
@@ -2539,6 +2556,17 @@ func parseSingleSlot(slot slaveEntrySlot, node *MiaospeedNode, plan miaospeedTes
 			}
 		}
 	}
+
+	if rep.InboundGeo == "" && node != nil && node.Server != "" && !isLocalHost(node.Server) {
+		sHost := extractHost(node.Server)
+		if resolvedIP, resolvedGeo := queryIPGeo(sHost); resolvedGeo != "" && resolvedGeo != "本地直连" {
+			rep.InboundGeo = resolvedGeo
+			if resolvedIP != "" && !strings.Contains(rep.InboundGeo, resolvedIP) && !strings.Contains(rep.InboundGeo, "(") {
+				rep.InboundGeo = fmt.Sprintf("%s (%s)", rep.InboundGeo, resolvedIP)
+			}
+		}
+	}
+
 	return rep
 }
 
@@ -2702,6 +2730,141 @@ func parseMatrixGeo(payload string) (ip, geo string) {
 		return "", ""
 	}
 	return "", payload
+}
+
+// extractHost 从形如 "host:port" 或 "[ipv6]:port" 中提取纯主机名或 IP。
+func extractHost(addr string) string {
+	addr = strings.TrimSpace(addr)
+	if h, _, err := net.SplitHostPort(addr); err == nil {
+		return strings.Trim(h, "[]")
+	}
+	return strings.Trim(addr, "[]")
+}
+
+// isLocalHost 判断地址是否为本地回环或未指定地址。
+func isLocalHost(addr string) bool {
+	h := extractHost(addr)
+	if h == "" || h == "localhost" || h == "127.0.0.1" || h == "::1" || h == "0.0.0.0" {
+		return true
+	}
+	ip := net.ParseIP(h)
+	return ip != nil && (ip.IsLoopback() || ip.IsUnspecified())
+}
+
+var (
+	geoCacheMu  sync.RWMutex
+	geoCacheMap = make(map[string]struct{ ip, geo string })
+)
+
+// queryIPGeo 主动查询 IP 或域名的地理位置与运营商（带线程安全内存缓存）。
+func queryIPGeo(host string) (ip, geo string) {
+	cleanHost := extractHost(host)
+	if cleanHost == "" {
+		return "", ""
+	}
+	parsedIP := net.ParseIP(cleanHost)
+	if parsedIP != nil && (parsedIP.IsLoopback() || parsedIP.IsPrivate() || parsedIP.IsUnspecified()) {
+		return cleanHost, "本地直连"
+	}
+
+	geoCacheMu.RLock()
+	if cached, ok := geoCacheMap[cleanHost]; ok {
+		geoCacheMu.RUnlock()
+		return cached.ip, cached.geo
+	}
+	geoCacheMu.RUnlock()
+
+	targetIP := cleanHost
+	if parsedIP == nil {
+		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+		ips, err := net.DefaultResolver.LookupIP(ctx, "ip", cleanHost)
+		cancel()
+		if err == nil && len(ips) > 0 {
+			targetIP = ips[0].String()
+		}
+	}
+
+	isV6 := strings.Contains(targetIP, ":")
+	apiURL := "https://ipv4.ipleak.net/json/" + targetIP
+	if isV6 {
+		apiURL = "https://ipv6.ipleak.net/json/" + targetIP
+	}
+
+	client := &http.Client{Timeout: 3 * time.Second}
+	req, err := http.NewRequest(http.MethodGet, apiURL, nil)
+	if err == nil {
+		req.Header.Set("User-Agent", "Mozilla/5.0")
+		resp, err := client.Do(req)
+		if err == nil && resp.StatusCode == http.StatusOK {
+			defer resp.Body.Close()
+			var info struct {
+				CountryName string `json:"country_name"`
+				ISPName     string `json:"isp_name"`
+				IP          string `json:"ip"`
+			}
+			if err := json.NewDecoder(io.LimitReader(resp.Body, 64*1024)).Decode(&info); err == nil {
+				if info.IP != "" {
+					targetIP = info.IP
+				}
+				parts := make([]string, 0, 2)
+				if info.CountryName != "" {
+					parts = append(parts, info.CountryName)
+				}
+				if info.ISPName != "" && info.ISPName != info.CountryName {
+					parts = append(parts, info.ISPName)
+				}
+				if len(parts) > 0 {
+					geo = strings.Join(parts, " ")
+				}
+			}
+		} else if resp != nil {
+			_ = resp.Body.Close()
+		}
+	}
+
+	if geo == "" {
+		reqSB, err := http.NewRequest(http.MethodGet, "https://api.ip.sb/geoip/"+targetIP, nil)
+		if err == nil {
+			reqSB.Header.Set("User-Agent", "Mozilla/5.0")
+			respSB, err := client.Do(reqSB)
+			if err == nil && respSB.StatusCode == http.StatusOK {
+				defer respSB.Body.Close()
+				var infoSB struct {
+					Country string `json:"country"`
+					ISP     string `json:"isp"`
+					IP      string `json:"ip"`
+				}
+				if err := json.NewDecoder(io.LimitReader(respSB.Body, 64*1024)).Decode(&infoSB); err == nil {
+					if infoSB.IP != "" {
+						targetIP = infoSB.IP
+					}
+					parts := make([]string, 0, 2)
+					if infoSB.Country != "" {
+						parts = append(parts, infoSB.Country)
+					}
+					if infoSB.ISP != "" && infoSB.ISP != infoSB.Country {
+						parts = append(parts, infoSB.ISP)
+					}
+					if len(parts) > 0 {
+						geo = strings.Join(parts, " ")
+					}
+				}
+			} else if respSB != nil {
+				_ = respSB.Body.Close()
+			}
+		}
+	}
+
+	ip = targetIP
+	if geo == "" && ip != "" {
+		geo = ip
+	}
+
+	geoCacheMu.Lock()
+	geoCacheMap[cleanHost] = struct{ ip, geo string }{ip: ip, geo: geo}
+	geoCacheMu.Unlock()
+
+	return ip, geo
 }
 
 // parseMatrixHijack 解析防劫持 JSON

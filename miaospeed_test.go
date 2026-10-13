@@ -1538,3 +1538,24 @@ func TestIPv6NodeSupportAndDualStackScript(t *testing.T) {
 		}
 	})
 }
+
+func TestIPv6InboundGeoFallback(t *testing.T) {
+	node := &MiaospeedNode{
+		Name:     "SS2022-v6",
+		Protocol: "ss",
+		Server:   "[2406:da18:1:1::1]:8388",
+	}
+	// 模拟 miaospeed 遇到 IPv6 时原生未切端口导致只返回 Domain
+	slot := slaveEntrySlot{
+		Matrices: []matrixResponse{
+			{Type: matrixInboundGeoIP, Payload: `{"Domain":"[2406:da18:1:1::1]:8388"}`},
+		},
+	}
+	rep := parseSingleSlot(slot, node, miaospeedTestPlan{})
+	if rep.InboundGeo == "" {
+		t.Fatal("IPv6 节点的入站信息不应为空")
+	}
+	if !strings.Contains(rep.InboundGeo, "2406:da18:1:1::1") {
+		t.Fatalf("入站信息应包含节点的 IPv6 地址，实际: %q", rep.InboundGeo)
+	}
+}
