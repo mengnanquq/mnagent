@@ -11,6 +11,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -179,7 +180,7 @@ func TestLooksLikeUnknownFlag(t *testing.T) {
 // TestAgentLoopEndToEnd 用假机器人验证“领取 → 执行 → 回传”整条链路。
 func TestAgentLoopEndToEnd(t *testing.T) {
 	var results atomic.Int64
-	release := make(chan struct{})
+	var servedJob atomic.Bool
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if got := r.Header.Get("Authorization"); got != "Bearer tok" {
 			w.WriteHeader(http.StatusUnauthorized)
@@ -191,17 +192,16 @@ func TestAgentLoopEndToEnd(t *testing.T) {
 				w.WriteHeader(http.StatusBadRequest)
 				return
 			}
-			select {
-			case <-release:
-				w.WriteHeader(http.StatusNoContent)
+			if servedJob.CompareAndSwap(false, true) {
+				w.Header().Set("Content-Type", "application/json")
+				_, _ = w.Write([]byte(`{"id":"job-1","target":"1.1.1.1","hops":5,"timeout_ms":5000}`))
 				return
-			default:
 			}
-			w.Header().Set("Content-Type", "application/json")
-			_, _ = w.Write([]byte(`{"id":"job-1","target":"1.1.1.1","hops":5,"timeout_ms":5000}`))
+			w.WriteHeader(http.StatusNoContent)
 		case "/results":
 			results.Add(1)
-			close(release)
+			w.WriteHeader(http.StatusNoContent)
+		case "/heartbeat":
 			w.WriteHeader(http.StatusNoContent)
 		default:
 			http.NotFound(w, r)
@@ -240,6 +240,73 @@ func TestAgentLoopEndToEnd(t *testing.T) {
 	case <-time.After(2 * time.Second):
 		t.Fatal("取消后 loop 未退出")
 	}
+}
+
+func TestAgentLoopSequentialHeavyTasksExecuted(t *testing.T) {
+	var pollCount atomic.Int32
+	var completedJobs sync.Map
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/jobs":
+			c := pollCount.Add(1)
+			if c == 1 {
+				w.Header().Set("Content-Type", "application/json")
+				_, _ = w.Write([]byte(`{"id":"heavy-1","kind":"trace","target":"1.1.1.1","hops":5,"timeout_ms":5000}`))
+				return
+			}
+			if c == 2 {
+				w.Header().Set("Content-Type", "application/json")
+				_, _ = w.Write([]byte(`{"id":"heavy-2","kind":"trace","target":"8.8.8.8","hops":5,"timeout_ms":5000}`))
+				return
+			}
+			w.WriteHeader(http.StatusNoContent)
+		case "/results":
+			var res Result
+			_ = json.NewDecoder(r.Body).Decode(&res)
+			completedJobs.Store(res.ID, true)
+			w.WriteHeader(http.StatusNoContent)
+		case "/heartbeat":
+			w.WriteHeader(http.StatusNoContent)
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer srv.Close()
+
+	cfg := &config{
+		botURL:      srv.URL,
+		tokens:      &tokenSource{value: "tok"},
+		binary:      writeScript(t, `echo "trace ok"`),
+		minBackoff:  10 * time.Millisecond,
+		maxBackoff:  50 * time.Millisecond,
+		pollTimeout: 2 * time.Second,
+	}
+	a := &agent{cfg: cfg, logger: testLogger{t}, client: newClient(cfg), runner: newRunner(cfg.binary, nil)}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	done := make(chan error, 1)
+	go func() { done <- a.loop(ctx) }()
+
+	deadline := time.Now().Add(3 * time.Second)
+	for time.Now().Before(deadline) {
+		_, ok1 := completedJobs.Load("heavy-1")
+		_, ok2 := completedJobs.Load("heavy-2")
+		if ok1 && ok2 {
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+
+	if _, ok := completedJobs.Load("heavy-1"); !ok {
+		t.Fatal("heavy-1 未执行或未回传结果")
+	}
+	if _, ok := completedJobs.Load("heavy-2"); !ok {
+		t.Fatal("heavy-2 未执行或被丢弃")
+	}
+	cancel()
+	_ = <-done
 }
 
 // testLogger 把日志输出到测试日志，便于排查失败原因。

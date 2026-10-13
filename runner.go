@@ -394,7 +394,6 @@ func (a *agent) loop(ctx context.Context) error {
 				case <-ctx.Done():
 					return nil
 				}
-				continue
 			}
 
 			a.heavyActive.Store(true)
