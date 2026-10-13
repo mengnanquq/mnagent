@@ -89,20 +89,16 @@ for arg in "$@"; do
 	esac
 done
 
-# 需要 root：非 root 时用 sudo 自我提权重跑（先把脚本落到临时文件），否则给出明确提示。
+# 需要 root：非 root 时若脚本为本地文件则通过 sudo 自我提权重跑，管道执行则直接给出提示避免读空 stdin。
 if [ "$(id -u)" != "0" ]; then
-	if command -v sudo >/dev/null 2>&1; then
+	if command -v sudo >/dev/null 2>&1 && [ -f "$0" ]; then
 		log "需要 root 权限，正在通过 sudo 重新执行"
-		elevated="$(mktemp)"
-		cat > "$elevated"
-		if sudo sh "$elevated" "$@"; then
-			rm -f "$elevated"
+		if sudo sh "$0" "$@"; then
 			exit 0
 		fi
-		rm -f "$elevated"
 		die "提权失败：请以 root 运行（或用 sudo -i 后再执行本条命令）"
 	fi
-	die "需要 root 权限（OpenWrt 请以 root 登录；其他系统请安装 sudo 或用 root 运行）"
+	die "需要 root 权限（管道安装请用 curl ... | sudo sh -s -- ...；OpenWrt 请以 root 登录）"
 fi
 
 while [ $# -gt 0 ]; do

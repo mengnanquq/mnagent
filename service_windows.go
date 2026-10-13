@@ -4,6 +4,7 @@ package main
 
 import (
 	"context"
+	"time"
 
 	"golang.org/x/sys/windows/svc"
 )
@@ -40,7 +41,10 @@ func (s *mnagentWindowsService) Execute(args []string, r <-chan svc.ChangeReques
 			case svc.Stop, svc.Shutdown:
 				changes <- svc.Status{State: svc.StopPending}
 				cancel()
-				<-errCh
+				select {
+				case <-errCh:
+				case <-time.After(10 * time.Second):
+				}
 				changes <- svc.Status{State: svc.Stopped}
 				return false, 0
 			}

@@ -215,7 +215,7 @@ func pingProbe(ctx context.Context, job Job) (LatencyReport, error) {
 				attempt.Error = echoErrorText(readErr)
 				break
 			}
-			if !parseEchoReply(buf[:n], ipv6, i) {
+			if !parseEchoReply(buf[:n], ipv6, udpSocket, i) {
 				continue // 其它序号/其它报文，继续等待本次回包
 			}
 			attempt.OK = true
@@ -300,7 +300,7 @@ func writeEcho(conn *icmp.PacketConn, ip net.IP, isV6, udpSocket bool, seq int) 
 
 // parseEchoReply 判断回包是否为本次请求的 echo reply。
 // 往返时间由调用方在本地计时（不依赖回包内容，避免时钟/ID 差异）。
-func parseEchoReply(data []byte, isV6 bool, seq int) bool {
+func parseEchoReply(data []byte, isV6, udpSocket bool, seq int) bool {
 	proto := 1
 	var want icmp.Type = ipv4.ICMPTypeEchoReply
 	if isV6 {
@@ -315,7 +315,10 @@ func parseEchoReply(data []byte, isV6 bool, seq int) bool {
 	if !ok || echo.Seq != seq {
 		return false
 	}
-	// 非特权 ICMP 由内核分配 ID，因此只按序号匹配。
+	// 非特权 ICMP 由内核分配 ID；原始套接字会收到全机 ICMP 报文，需校验进程 ID。
+	if !udpSocket && echo.ID != (os.Getpid()&0xffff) {
+		return false
+	}
 	return true
 }
 
@@ -370,7 +373,11 @@ func tcpingProbe(ctx context.Context, job Job) (LatencyReport, error) {
 		}
 		report.Attempts = append(report.Attempts, attempt)
 		if i < count-1 {
-			sleepCtx(ctx, probeInterval-rtt)
+			wait := probeInterval - rtt
+			if wait < 50*time.Millisecond {
+				wait = 50 * time.Millisecond
+			}
+			sleepCtx(ctx, wait)
 		}
 	}
 	fillLatencyStats(&report)
@@ -606,9 +613,9 @@ func probeTimeout(ctx context.Context, timeoutMS int64) time.Duration {
 	if timeout <= 0 {
 		timeout = 15 * time.Second
 	}
-	// 单次探测（一次回包/一次握手）不超过 10 秒，整体由任务超时兜底。
-	if timeout > 10*time.Second {
-		timeout = 10 * time.Second
+	// 单次探测（一次回包/一次握手）不超过 15 秒，整体由任务超时兜底。
+	if timeout > 15*time.Second {
+		timeout = 15 * time.Second
 	}
 	if deadline, ok := ctx.Deadline(); ok {
 		if remaining := time.Until(deadline); remaining < timeout {
