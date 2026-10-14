@@ -49,6 +49,7 @@ const (
 	ModeFull         = "full"         // 全量测试
 	ModeLatency      = "latency"      // 延迟测试
 	ModeUDP          = "udp"          // UDP 类型测试
+	ModeMedia        = "media"        // 流媒体专测
 )
 
 // MiaoSpeed 官方测试项 Matrix 常量。
@@ -2171,6 +2172,8 @@ func buildMiaospeedTestPlan(job Job, nodeCount ...int) miaospeedTestPlan {
 			modes[ModeLatency] = true
 		case "udp", "nat", "stun", "udp类型", "udp类型测试":
 			modes[ModeUDP] = true
+		case "media", "unlock", "流媒体", "流媒体测试", "流媒体专测":
+			modes[ModeMedia] = true
 		case "full", "all", "total", "全量", "全量测试":
 			modes[ModeFull] = true
 		}
@@ -2268,6 +2271,20 @@ func buildMiaospeedTestPlan(job Job, nodeCount ...int) miaospeedTestPlan {
 		matrixSet[matrixHTTPCode] = true
 		matrixSet[matrixOutboundGeoIP] = true
 		plan.STUNURL = defaultSTUNServer
+	}
+	if modes[ModeMedia] {
+		descriptions = append(descriptions, "流媒体测试")
+		matrixSet[matrixRTTPing] = true
+		matrixSet[matrixHTTPPing] = true
+		matrixSet[matrixPacketLoss] = true
+		matrixSet[matrixHTTPCode] = true
+		matrixSet[matrixOutboundGeoIP] = true
+		plan.Scripts = buildDefaultMediaScripts()
+		for _, platform := range []string{
+			"youtube", "netflix", "disney", "openai", "claude", "spotify", "tiktok", "bilibili", "wikipedia",
+		} {
+			plan.Matrices = append(plan.Matrices, slaveRequestMatrixEntry{Type: "TEST_SCRIPT", Params: platform})
+		}
 	}
 	if modes[ModeSingleSpeed] {
 		descriptions = append(descriptions, "单线程测速")
