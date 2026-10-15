@@ -327,12 +327,18 @@ if ($svcStatus -and $svcStatus.Status -eq "Running") {
     Write-Host @"
 
 ============================================================
-  mnagent Windows 服务已成功安装并启动！
+  ⚡ mnagent Windows 服务已成功安装并启动！
 ============================================================
-  安装目录: $InstallDir
-  主执行程序: $mnagentBin
-  服务名称: mnagent (自启状态: 自动)
-  管理命令:
+  • 安装目录: $InstallDir
+  • 主执行程序: $mnagentBin
+  • 服务名称: mnagent (自启状态: 自动)
+  • 追踪引擎: nexttrace ($nexttraceBin)
+  • 测速引擎: miaospeed ($miaospeedBin)
+  • 自动更新: $(if ($AutoUpdate.IsPresent -and -not $NoAutoUpdate.IsPresent) { "启用 (每 $UpdateInterval)" } else { "未启用" })
+------------------------------------------------------------
+  👉 验证接入：请在 Telegram 机器人中发送 /host status 查看心跳
+============================================================
+  常用管理命令:
     查看状态: Get-Service mnagent
     启动服务: Start-Service mnagent  (或 net start mnagent)
     停止服务: Stop-Service mnagent   (或 net stop mnagent)

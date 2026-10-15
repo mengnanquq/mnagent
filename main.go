@@ -103,18 +103,34 @@ func runWithContext(ctx context.Context, args []string) error {
 		return err
 	}
 
-	if cfg.diagJob != "" {
-		runner := newRunnerFull(cfg.binary, cfg.miaospeedBinary, cfg.ghProxy, cfg.allowPrivateProbes, log)
-		res := runner.run(ctx, Job{
-			ID:        "diag",
-			Kind:      "miaospeed",
-			Target:    cfg.diagJob,
-			Query:     "full",
-			TimeoutMS: 180000,
-		})
-		fmt.Printf("=== DIAG RESULT ===\nExitCode: %d\nErr: %q\nOut: %s\n", res.ExitCode, res.ErrText, res.Output)
-		return nil
-	}
+		if cfg.diagJob != "" {
+			runner := newRunnerFull(cfg.binary, cfg.miaospeedBinary, cfg.ghProxy, cfg.allowPrivateProbes, log)
+			res := runner.run(ctx, Job{
+				ID:        "diag",
+				Kind:      "miaospeed",
+				Target:    cfg.diagJob,
+				Query:     "full",
+				TimeoutMS: 180000,
+			})
+			fmt.Println("================================================================")
+			fmt.Println("  ⚡ mnagent 本地测速诊断结果 (Diagnostic Report)")
+			fmt.Println("================================================================")
+			fmt.Printf("  • 退出代码: %d\n", res.ExitCode)
+			if res.ErrText != "" {
+				fmt.Printf("  • 错误信息: %s\n", res.ErrText)
+			} else {
+				fmt.Printf("  • 执行状态: 成功 (OK)\n")
+			}
+			fmt.Println("----------------------------------------------------------------")
+			fmt.Println("  输出详情:")
+			if res.Output != "" {
+				fmt.Println(res.Output)
+			} else {
+				fmt.Println("  (无标准输出)")
+			}
+			fmt.Println("================================================================")
+			return nil
+		}
 
 	cli := newClient(cfg)
 	tracker := newJobTracker()
@@ -146,6 +162,13 @@ func runWithContext(ctx context.Context, args []string) error {
 // parseConfig 解析命令行参数并校验必填项。
 func parseConfig(args []string) (*config, error) {
 	fs := flag.NewFlagSet("mnagent", flag.ContinueOnError)
+	fs.Usage = func() {
+		fmt.Fprintf(fs.Output(), "⚡ mnagent %s (%s/%s) - 猛男 Bot 拨测探针客户端\n\n", version, runtime.GOOS, runtime.GOARCH)
+		fmt.Fprintf(fs.Output(), "用法：\n")
+		fmt.Fprintf(fs.Output(), "  mnagent -bot <URL> -token-file <路径> [选项...]\n\n")
+		fmt.Fprintf(fs.Output(), "参数选项：\n")
+		fs.PrintDefaults()
+	}
 	var (
 		botURL       = fs.String("bot", "", "机器人 agent 端点基地址，例如 https://mnbot.example.org/agent")
 		tokenValue   = fs.String("token", "", "接入令牌（不推荐：优先用 -token-file 或 MNAGENT_TOKEN）")
@@ -170,7 +193,7 @@ func parseConfig(args []string) (*config, error) {
 		return nil, err
 	}
 	if *showVer {
-		fmt.Println("mnagent", version)
+		fmt.Printf("mnagent %s (%s/%s, %s)\n", version, runtime.GOOS, runtime.GOARCH, runtime.Version())
 		os.Exit(0)
 	}
 
