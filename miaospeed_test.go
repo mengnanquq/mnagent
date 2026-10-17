@@ -308,13 +308,14 @@ func TestExecuteMiaospeedTask(t *testing.T) {
 // TestMiaospeedReportJSONSerialization 验证直接返回的 JSON 数据结构供机器人端处理。
 func TestMiaospeedReportJSONSerialization(t *testing.T) {
 	report := MiaospeedReport{
-		TestMode:  "全量测试",
-		NodeName:  "Tokyo-01",
-		Protocol:  "vmess",
-		Server:    "1.2.3.4:443",
-		HTTPCode:  204,
-		PingRTTMs: 28.5,
-		UDPType:   "FullCone",
+		TestMode:         "全量测试",
+		MiaospeedVersion: "v4.7.7",
+		NodeName:         "Tokyo-01",
+		Protocol:         "vmess",
+		Server:           "1.2.3.4:443",
+		HTTPCode:         204,
+		PingRTTMs:        28.5,
+		UDPType:          "FullCone",
 		RawResults: []slaveEntrySlot{
 			{
 				Grouping: "test",
@@ -336,8 +337,26 @@ func TestMiaospeedReportJSONSerialization(t *testing.T) {
 	if parsed["node_name"] != "Tokyo-01" || parsed["udp_type"] != "FullCone" || parsed["http_code"] != float64(204) {
 		t.Fatalf("JSON 字段不符合预期: %+v", parsed)
 	}
+	if parsed["miaospeed_version"] != "v4.7.7" {
+		t.Fatalf("miaospeed_version 序列化失败: got=%v, want=v4.7.7", parsed["miaospeed_version"])
+	}
 	if _, ok := parsed["raw_results"]; !ok {
 		t.Fatalf("未携带原始 raw_results 字段供 bot 高级处理: %+v", parsed)
+	}
+}
+
+func TestGetMiaospeedVersion(t *testing.T) {
+	ctx := context.Background()
+
+	// 1. 从 server 启动输出中提取
+	serverOut := " __  __ _\n|  \\/  (_)\nversion: 4.7.7\ncommit: 6d086e9\nlistening on 127.0.0.1:12345"
+	if ver := getMiaospeedVersion(ctx, "/tmp/mock-miaospeed-server", serverOut); ver != "v4.7.7" {
+		t.Errorf("未能从 server 输出中提取版本号: got %q, want v4.7.7", ver)
+	}
+
+	// 2. 验证缓存命中
+	if ver := getMiaospeedVersion(ctx, "/tmp/mock-miaospeed-server", ""); ver != "v4.7.7" {
+		t.Errorf("未能从缓存中读取版本号: got %q, want v4.7.7", ver)
 	}
 }
 

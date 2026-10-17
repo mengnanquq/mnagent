@@ -79,34 +79,42 @@ type MiaospeedNode struct {
 
 // MiaospeedReport 包含测速任务的结构化结果。
 type MiaospeedReport struct {
-	TotalNodes      int               `json:"total_nodes,omitempty"`
-	TestMode        string            `json:"test_mode,omitempty"`
-	NodeName        string            `json:"node_name"`
-	Protocol        string            `json:"protocol,omitempty"`
-	Server          string            `json:"server,omitempty"`
-	HTTPCode        int               `json:"http_code,omitempty"`
-	PingRTTMs       float64           `json:"ping_rtt_ms,omitempty"`
-	PingConnMs      float64           `json:"ping_conn_ms,omitempty"`
-	MaxRTTMs        float64           `json:"max_rtt_ms,omitempty"`
-	PacketLoss      float64           `json:"packet_loss_pct,omitempty"`
-	UDPType         string            `json:"udp_type,omitempty"`
-	DownloadThreads int               `json:"download_threads,omitempty"`
-	AvgSpeedBps     float64           `json:"avg_speed_bps,omitempty"` // 字节/秒
-	MaxSpeedBps     float64           `json:"max_speed_bps,omitempty"` // 字节/秒
-	InboundGeo      string            `json:"inbound_geo,omitempty"`
-	OutboundIP      string            `json:"outbound_ip,omitempty"`
-	OutboundGeo     string            `json:"outbound_geo,omitempty"`
-	Hijack          string            `json:"hijack,omitempty"`
-	MediaUnlock     map[string]string `json:"media_unlock,omitempty"`
-	SubReports      []MiaospeedReport `json:"sub_reports,omitempty"`
-	DurationMs      int64             `json:"duration_ms"`
-	RawResults      []slaveEntrySlot  `json:"raw_results,omitempty"`
+	TotalNodes       int               `json:"total_nodes,omitempty"`
+	TestMode         string            `json:"test_mode,omitempty"`
+	MiaospeedVersion string            `json:"miaospeed_version,omitempty"`
+	NodeName         string            `json:"node_name"`
+	Protocol         string            `json:"protocol,omitempty"`
+	Server           string            `json:"server,omitempty"`
+	HTTPCode         int               `json:"http_code,omitempty"`
+	PingRTTMs        float64           `json:"ping_rtt_ms,omitempty"`
+	PingConnMs       float64           `json:"ping_conn_ms,omitempty"`
+	MaxRTTMs         float64           `json:"max_rtt_ms,omitempty"`
+	PacketLoss       float64           `json:"packet_loss_pct,omitempty"`
+	UDPType          string            `json:"udp_type,omitempty"`
+	DownloadThreads  int               `json:"download_threads,omitempty"`
+	AvgSpeedBps      float64           `json:"avg_speed_bps,omitempty"` // 字节/秒
+	MaxSpeedBps      float64           `json:"max_speed_bps,omitempty"` // 字节/秒
+	InboundGeo       string            `json:"inbound_geo,omitempty"`
+	OutboundIP       string            `json:"outbound_ip,omitempty"`
+	OutboundGeo      string            `json:"outbound_geo,omitempty"`
+	Hijack           string            `json:"hijack,omitempty"`
+	MediaUnlock      map[string]string `json:"media_unlock,omitempty"`
+	SubReports       []MiaospeedReport `json:"sub_reports,omitempty"`
+	DurationMs       int64             `json:"duration_ms"`
+	RawResults       []slaveEntrySlot  `json:"raw_results,omitempty"`
 }
 
 // Format 格式化排版文本，供 Telegram 机器人展示。
 func (r MiaospeedReport) Format() string {
 	var b strings.Builder
 	title := "⚡ MiaoSpeed 测速报告"
+	if r.MiaospeedVersion != "" {
+		v := r.MiaospeedVersion
+		if !strings.HasPrefix(strings.ToLower(v), "v") {
+			v = "v" + v
+		}
+		title = fmt.Sprintf("⚡ MiaoSpeed %s 测速报告", v)
+	}
 	if r.TestMode != "" {
 		title += " · " + r.TestMode
 	}
@@ -2078,6 +2086,14 @@ func runMiaospeedJob(ctx context.Context, binary, ghProxy string, job Job, log l
 		return "", nil, err
 	}
 
+	// 探测并记录 miaospeed 引擎版本
+	if miaoVer := getMiaospeedVersion(taskCtx, binPath, serverOut.String()); miaoVer != "" {
+		report.MiaospeedVersion = miaoVer
+		for i := range report.SubReports {
+			report.SubReports[i].MiaospeedVersion = miaoVer
+		}
+	}
+
 	data, err := json.Marshal(report)
 	if err != nil {
 		return "", nil, fmt.Errorf("序列化结果数据失败: %w", err)
@@ -2085,6 +2101,65 @@ func runMiaospeedJob(ctx context.Context, binary, ghProxy string, job Job, log l
 
 	// 数据直接返回 JSON 供机器人端解析与排版展示
 	return string(data), data, nil
+}
+
+var (
+	cachedMiaospeedVerMu sync.RWMutex
+	cachedMiaospeedVer   = make(map[string]string)
+)
+
+func getMiaospeedVersion(ctx context.Context, binPath string, serverOutput string) string {
+	// 1. 如果 server 启动日志中已包含版本号（如 "version: 4.7.7"），直接提取
+	if serverOutput != "" {
+		cleaned := stripANSI(serverOutput)
+		if m := miaospeedVerPattern.FindStringSubmatch(cleaned); len(m) >= 2 {
+			ver := m[1]
+			if !strings.HasPrefix(strings.ToLower(ver), "v") {
+				ver = "v" + ver
+			}
+			cachedMiaospeedVerMu.Lock()
+			cachedMiaospeedVer[binPath] = ver
+			cachedMiaospeedVerMu.Unlock()
+			return ver
+		}
+	}
+
+	// 2. 检查内存缓存
+	cachedMiaospeedVerMu.RLock()
+	ver, ok := cachedMiaospeedVer[binPath]
+	cachedMiaospeedVerMu.RUnlock()
+	if ok && ver != "" {
+		return ver
+	}
+
+	// 3. 尝试调用 -version 或 version
+	detCtx, cancel := context.WithTimeout(ctx, 1500*time.Millisecond)
+	defer cancel()
+	cmd := exec.CommandContext(detCtx, binPath, "-version")
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		cmd2 := exec.CommandContext(detCtx, binPath, "version")
+		if out2, err2 := cmd2.CombinedOutput(); err2 == nil {
+			out = out2
+			err = nil
+		}
+	}
+	cleaned := stripANSI(string(out))
+	if m := miaospeedVerPattern.FindStringSubmatch(cleaned); len(m) >= 2 {
+		ver = m[1]
+	} else if m := genericVerPattern.FindStringSubmatch(cleaned); len(m) >= 2 {
+		ver = m[1]
+	}
+	if ver != "" {
+		if !strings.HasPrefix(strings.ToLower(ver), "v") {
+			ver = "v" + ver
+		}
+		cachedMiaospeedVerMu.Lock()
+		cachedMiaospeedVer[binPath] = ver
+		cachedMiaospeedVerMu.Unlock()
+		return ver
+	}
+	return ""
 }
 
 // autoInstallMiaospeed 在运行时自动下载并解压 AirportR/miaospeed Release，严格继承使用 ghProxy。
