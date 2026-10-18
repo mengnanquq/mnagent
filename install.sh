@@ -489,10 +489,69 @@ if [ "$RUN_USER" != "root" ]; then
 	fi
 fi
 
-NEXTTRACE_PATH="$(command -v "$NEXTTRACE_BIN" 2>/dev/null || true)"
+# find_binary <名称或路径>：在系统 PATH 及常用二进制目录中查找可执行文件。
+# 兼容 OpenWrt / BusyBox 等 PATH 默认不包含 /usr/local/bin 的环境。
+find_binary() {
+	_target="$1"
+	if [ -f "$_target" ] && [ -x "$_target" ]; then
+		printf '%s' "$_target"
+		return 0
+	fi
+	_found="$(command -v "$_target" 2>/dev/null || true)"
+	if [ -n "$_found" ] && [ -x "$_found" ]; then
+		printf '%s' "$_found"
+		return 0
+	fi
+	for _dir in "$PREFIX" /usr/local/bin /usr/bin /bin /usr/sbin /sbin; do
+		if [ -n "$_dir" ] && [ -x "$_dir/$_target" ]; then
+			printf '%s' "$_dir/$_target"
+			return 0
+		fi
+	done
+	return 1
+}
 
-# 缺少 nexttrace 时，按照官方 README 引导进行自动化安装：
-# https://github.com/nxtrace/NTrace-core/blob/main/README.md
+map_nexttrace_arch() {
+	case "$1" in
+		amd64) echo "amd64";;
+		arm64) echo "arm64";;
+		arm)   echo "armv7";;
+		386)   echo "386";;
+		mips)  echo "mips";;
+		mipsle) echo "mipsle";;
+		mips64) echo "mips64";;
+		mips64le) echo "mips64le";;
+		riscv64) echo "riscv64";;
+		*) echo "$1";;
+	esac
+}
+
+download_nexttrace() {
+	nt_arch="$(map_nexttrace_arch "$ARCH")"
+	nt_asset="nexttrace_${OS}_${nt_arch}"
+	if [ "$OS" = "darwin" ]; then
+		nt_asset="nexttrace_darwin_universal"
+	fi
+	url="https://github.com/nxtrace/NTrace-core/releases/latest/download/${nt_asset}"
+	url="$(apply_gh_proxy "$url")"
+	if [ -n "$GH_PROXY" ]; then
+		log "通过 GitHub 代理下载 nexttrace（${OS}/${nt_arch}，代理：${GH_PROXY}）"
+	else
+		log "从 GitHub Releases 下载 nexttrace（${OS}/${nt_arch}）"
+	fi
+	if download "$url" "$PREFIX/.nexttrace.new"; then
+		install_file "$PREFIX/.nexttrace.new" "$PREFIX/nexttrace" 0755
+		rm -f "$PREFIX/.nexttrace.new"
+		NEXTTRACE_PATH="$PREFIX/nexttrace"
+	fi
+}
+
+NEXTTRACE_PATH="$(find_binary "$NEXTTRACE_BIN" || true)"
+
+# 缺少 nexttrace 时，按照官方推荐规范进行自动化安装：
+# 1. OpenWrt opkg 包管理器
+# 2. 官方一键脚本（显式指定 --bin-dir "$PREFIX"，避免 OpenWrt 等环境装入非 PATH 目录）
+# 3. GitHub Releases 预编译二进制直连下载（支持 GH_PROXY 代理）
 if [ -z "$NEXTTRACE_PATH" ] && [ "$INSTALL_NEXTTRACE" = "yes" ]; then
 	log "环境缺少 nexttrace，正在按照官方推荐方式安装..."
 	# 1. 如果是 OpenWrt / ImmortalWrt 且有 opkg，优先尝试包管理器官方包
@@ -500,7 +559,7 @@ if [ -z "$NEXTTRACE_PATH" ] && [ "$INSTALL_NEXTTRACE" = "yes" ]; then
 		log "尝试通过 opkg 安装 nexttrace"
 		opkg update >/dev/null 2>&1 || true
 		opkg install nexttrace >/dev/null 2>&1 || true
-		NEXTTRACE_PATH="$(command -v "$NEXTTRACE_BIN" 2>/dev/null || true)"
+		NEXTTRACE_PATH="$(find_binary "$NEXTTRACE_BIN" || true)"
 	fi
 
 	# 2. Linux / macOS 通用官方一键脚本（curl -sL https://nxtrace.org/nt | bash）
@@ -510,15 +569,31 @@ if [ -z "$NEXTTRACE_PATH" ] && [ "$INSTALL_NEXTTRACE" = "yes" ]; then
 		if command -v bash >/dev/null 2>&1; then
 			SH_BIN="bash"
 		fi
-		if download_stdout "https://nxtrace.org/nt" | "$SH_BIN" >/dev/null 2>&1; then
-			NEXTTRACE_PATH="$(command -v "$NEXTTRACE_BIN" 2>/dev/null || true)"
+		if download_stdout "https://nxtrace.org/nt" | "$SH_BIN" -s -- --bin-dir "$PREFIX" >/dev/null 2>&1 \
+			|| download_stdout "https://nxtrace.org/nt" | "$SH_BIN" >/dev/null 2>&1; then
+			NEXTTRACE_PATH="$(find_binary "$NEXTTRACE_BIN" || true)"
 		fi
 	fi
 
+	# 3. 官方脚本若失败，直接从 GitHub Releases 下载预编译二进制兜底
+	if [ -z "$NEXTTRACE_PATH" ]; then
+		download_nexttrace || true
+		NEXTTRACE_PATH="$(find_binary "$NEXTTRACE_BIN" || true)"
+	fi
+
 	if [ -n "$NEXTTRACE_PATH" ]; then
-		log "nexttrace 安装成功：$NEXTTRACE_PATH"
+		log "nexttrace 安装成功：${NEXTTRACE_PATH}"
 	else
 		warn "自动安装 nexttrace 失败，请参考官方说明手动安装：https://github.com/nxtrace/NTrace-core"
+	fi
+fi
+
+# 若已安装在非 PATH 常用目录（如 /usr/local/bin/nexttrace），在 OpenWrt 下自动建立软链接到 $PREFIX 保证全局可用
+if [ "$PLATFORM" = "openwrt" ] && [ -n "$NEXTTRACE_PATH" ] && [ -x "$NEXTTRACE_PATH" ]; then
+	if [ "$NEXTTRACE_PATH" != "$PREFIX/nexttrace" ] && [ ! -e "$PREFIX/nexttrace" ]; then
+		ln -sf "$NEXTTRACE_PATH" "$PREFIX/nexttrace" 2>/dev/null \
+			&& log "已建立软链接：${PREFIX}/nexttrace -> ${NEXTTRACE_PATH}" || true
+		NEXTTRACE_PATH="$PREFIX/nexttrace"
 	fi
 fi
 
@@ -596,23 +671,26 @@ download_miaospeed() {
 	rm -rf "$tmp"
 }
 
-MIAOSPEED_PATH="$(command -v "$MIAOSPEED_BIN" 2>/dev/null || true)"
-if [ -z "$MIAOSPEED_PATH" ] && [ -x "$PREFIX/miaospeed" ]; then
-	MIAOSPEED_PATH="$PREFIX/miaospeed"
-fi
+MIAOSPEED_PATH="$(find_binary "$MIAOSPEED_BIN" || true)"
 
 # 缺少 miaospeed 时，尝试从 GitHub Releases 自动下载安装
 if [ -z "$MIAOSPEED_PATH" ] && [ "$INSTALL_MIAOSPEED" = "yes" ]; then
 	log "环境缺少 miaospeed，正在从 AirportR/miaospeed 获取并安装..."
 	download_miaospeed
-	MIAOSPEED_PATH="$(command -v "$MIAOSPEED_BIN" 2>/dev/null || true)"
-	if [ -z "$MIAOSPEED_PATH" ] && [ -x "$PREFIX/miaospeed" ]; then
-		MIAOSPEED_PATH="$PREFIX/miaospeed"
-	fi
+	MIAOSPEED_PATH="$(find_binary "$MIAOSPEED_BIN" || true)"
 	if [ -n "$MIAOSPEED_PATH" ]; then
 		log "miaospeed 安装成功：${MIAOSPEED_PATH}"
 	else
 		warn "自动安装 miaospeed 失败，如需测速请参考官方说明手动安装：https://github.com/AirportR/miaospeed"
+	fi
+fi
+
+# 在 OpenWrt 下若位于非 $PREFIX 目录，同样建立软链接
+if [ "$PLATFORM" = "openwrt" ] && [ -n "$MIAOSPEED_PATH" ] && [ -x "$MIAOSPEED_PATH" ]; then
+	if [ "$MIAOSPEED_PATH" != "$PREFIX/miaospeed" ] && [ ! -e "$PREFIX/miaospeed" ]; then
+		ln -sf "$MIAOSPEED_PATH" "$PREFIX/miaospeed" 2>/dev/null \
+			&& log "已建立软链接：${PREFIX}/miaospeed -> ${MIAOSPEED_PATH}" || true
+		MIAOSPEED_PATH="$PREFIX/miaospeed"
 	fi
 fi
 
@@ -695,6 +773,7 @@ USE_PROCD=1
 			-token-file $TOKEN_FILE \\
 			-nexttrace $NEXTTRACE_EXEC \\
 			-miaospeed $MIAOSPEED_EXEC$AUTO_UPDATE_ARGS
+		procd_set_param env PATH="/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
 		procd_set_param respawn
 		procd_set_param stdout 1
 		procd_set_param stderr 1
@@ -722,7 +801,8 @@ PROCD_EOF
 	fi
 	# sysupgrade 会保留 /etc，但 /usr 下的二进制需要在 sysupgrade.conf 中登记才会随备份保留。
 	if [ -e /etc ] && { [ -w /etc/sysupgrade.conf ] || [ ! -e /etc/sysupgrade.conf ]; }; then
-		for path in "$PREFIX/mnagent" "$TOKEN_DIR"; do
+		for path in "$PREFIX/mnagent" "$PREFIX/nexttrace" "$PREFIX/miaospeed" "$NEXTTRACE_EXEC" "$MIAOSPEED_EXEC" "$TOKEN_DIR"; do
+			[ -e "$path" ] || continue
 			grep -qxF "$path" /etc/sysupgrade.conf 2>/dev/null \
 				|| echo "$path" >> /etc/sysupgrade.conf 2>/dev/null \
 				|| true  # /etc 不可写（例如非 OpenWrt 环境）时静默跳过

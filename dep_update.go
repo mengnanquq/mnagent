@@ -110,6 +110,23 @@ func resolveBinaryPath(bin string) (string, bool) {
 			return p, true
 		}
 	}
+	// 备选常用路径回退（兼容 OpenWrt 等 PATH 缺少 /usr/local/bin 或相对当前二进制路径的环境）
+	var fallbackDirs []string
+	if exe, err := os.Executable(); err == nil {
+		fallbackDirs = append(fallbackDirs, filepath.Dir(exe))
+	}
+	if runtime.GOOS != "windows" {
+		fallbackDirs = append(fallbackDirs, "/usr/local/bin", "/usr/bin", "/bin", "/usr/sbin", "/sbin")
+	}
+	for _, dir := range fallbackDirs {
+		candidate := filepath.Join(dir, trimmed)
+		if runtime.GOOS == "windows" && !strings.HasSuffix(strings.ToLower(candidate), ".exe") {
+			candidate += ".exe"
+		}
+		if fi, err := os.Stat(candidate); err == nil && !fi.IsDir() {
+			return candidate, true
+		}
+	}
 	return trimmed, false
 }
 
@@ -343,7 +360,7 @@ func resolveInstallTarget(configuredPath, defaultName string) string {
 		dest += ".exe"
 	}
 	if dest == "" || dest == defaultName || !filepath.IsAbs(dest) {
-		if p, err := exec.LookPath(defaultName); err == nil && filepath.IsAbs(p) {
+		if p, ok := resolveBinaryPath(defaultName); ok && filepath.IsAbs(p) {
 			dest = p
 		} else {
 			exe, err := os.Executable()

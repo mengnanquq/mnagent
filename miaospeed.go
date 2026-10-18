@@ -1996,7 +1996,7 @@ func runMiaospeedJob(ctx context.Context, binary, ghProxy string, job Job, log l
 	}
 
 	binPath := binary
-	if p, err := exec.LookPath(binary); err == nil {
+	if p, ok := resolveBinaryPath(binary); ok {
 		binPath = p
 	} else if _, err := os.Stat(binary); err != nil {
 		// 未找到可执行文件，若配置为 miaospeed 标准文件名则尝试从 AirportR/miaospeed 自动下载安装

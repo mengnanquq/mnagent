@@ -407,27 +407,36 @@ func TestReplaceExecutableAndCleanup(t *testing.T) {
 	// 在 Linux 上 cleanupOldExecutables 是 no-op，直接验证函数不崩溃
 }
 
-// TestResolveBinaryPathWindows 验证 Windows 扩展名智能匹配。
-func TestResolveBinaryPathWindows(t *testing.T) {
+// TestResolveBinaryPathFallback 验证当可执行文件位于非 PATH 目录（如二进制同级目录或 /usr/local/bin）时的兜底发现机制。
+func TestResolveBinaryPathFallback(t *testing.T) {
 	tmpDir := t.TempDir()
-	exePath := filepath.Join(tmpDir, "mytool.exe")
-	_ = os.WriteFile(exePath, []byte("binary"), 0755)
-
-	// 如果传入带 .exe
-	if p, ok := resolveBinaryPath(exePath); !ok || p != exePath {
-		t.Fatalf("resolveBinaryPath 完整路径失败: p=%s, ok=%v", p, ok)
+	myTool := filepath.Join(tmpDir, "custom-probe")
+	if runtime.GOOS == "windows" {
+		myTool += ".exe"
+	}
+	if err := os.WriteFile(myTool, []byte("echo ok"), 0755); err != nil {
+		t.Fatal(err)
 	}
 
-	noExt := filepath.Join(tmpDir, "mytool")
-	p, ok := resolveBinaryPath(noExt)
-	// 在 Linux 上无 .exe 文件不存在返回 false；若在 Windows 下应能匹配到 mytool.exe
-	if runtime.GOOS == "windows" {
-		if !ok || p != exePath {
-			t.Fatalf("Windows 下未匹配到带 .exe 的文件: p=%s, ok=%v", p, ok)
-		}
-	} else {
-		if ok {
-			t.Fatalf("非 Windows 环境不应误匹配不存在的无后缀文件")
+	// 1. 若传入绝对路径，应当命中
+	if p, ok := resolveBinaryPath(myTool); !ok || p != myTool {
+		t.Fatalf("绝对路径解析失败: got p=%s, ok=%v", p, ok)
+	}
+
+	// 2. 将临时目录设为 PATH，测试环境变量查找
+	oldPath := os.Getenv("PATH")
+	defer os.Setenv("PATH", oldPath)
+	os.Setenv("PATH", tmpDir)
+
+	if p, ok := resolveBinaryPath("custom-probe"); !ok || !strings.Contains(p, "custom-probe") {
+		t.Fatalf("PATH 中未命中 custom-probe: got p=%s, ok=%v", p, ok)
+	}
+
+	// 3. 清空 PATH，确保 exec.LookPath 无法直接命中，验证 fallbackDirs 仍能找到常用工具
+	os.Setenv("PATH", "")
+	if runtime.GOOS != "windows" {
+		if p, ok := resolveBinaryPath("sh"); !ok || !strings.HasSuffix(p, "/sh") {
+			t.Fatalf("清空 PATH 后兜底发现常用目录中的 sh 失败: got p=%s, ok=%v", p, ok)
 		}
 	}
 }

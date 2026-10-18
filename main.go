@@ -226,17 +226,21 @@ func parseConfig(args []string) (*config, error) {
 	}
 	var path string
 	if !isUpdateCLI {
-		var err error
-		path, err = exec.LookPath(*binary)
-		if err != nil {
-			return nil, fmt.Errorf("找不到 nexttrace 可执行文件 %q：%w", *binary, err)
+		if p, ok := resolveBinaryPath(*binary); ok {
+			path = p
+		} else {
+			var err error
+			path, err = exec.LookPath(*binary)
+			if err != nil {
+				return nil, fmt.Errorf("找不到 nexttrace 可执行文件 %q：%w", *binary, err)
+			}
 		}
 	} else {
 		path = *binary
 	}
 
 	var miaoPath string
-	if p, err := exec.LookPath(*miaospeed); err == nil {
+	if p, ok := resolveBinaryPath(*miaospeed); ok {
 		miaoPath = p
 	} else {
 		miaoPath = *miaospeed
