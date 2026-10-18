@@ -474,3 +474,122 @@ func TestRunnerMiaospeedDispatch(t *testing.T) {
 		t.Fatalf("speed 别名应分发至 miaospeed: exitCode=%d errText=%q", resSpeed.ExitCode, resSpeed.ErrText)
 	}
 }
+
+// TestHandleUpgradeJob 验证 agent 接收到远程更新指令后的完整处理与回传。
+func TestHandleUpgradeJob(t *testing.T) {
+	var reportedResult Result
+	var reported atomic.Bool
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/results":
+			var res Result
+			if err := json.NewDecoder(r.Body).Decode(&res); err != nil {
+				http.Error(w, err.Error(), http.StatusBadRequest)
+				return
+			}
+			reportedResult = res
+			reported.Store(true)
+			w.WriteHeader(http.StatusOK)
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer srv.Close()
+
+	cli := &client{
+		baseURL: srv.URL,
+		tokens:  &tokenSource{value: "tok"},
+		http:    srv.Client(),
+	}
+
+	exePath := filepath.Join(t.TempDir(), "mnagent")
+	if err := os.WriteFile(exePath, []byte("fake-binary"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	var restarted atomic.Bool
+	u := &updater{
+		executable: exePath,
+		platform:   "linux",
+		arch:       "amd64",
+		restart: func() error {
+			restarted.Store(true)
+			return nil
+		},
+		latestURL: func() string {
+			return srv.URL + "/download"
+		},
+	}
+
+	// 1. 测试当已是最新版时
+	u.client = &http.Client{
+		Timeout: 2 * time.Second,
+		CheckRedirect: func(*http.Request, []*http.Request) error {
+			return http.ErrUseLastResponse
+		},
+	}
+	origVersion := version
+	version = "v1.0.0"
+	defer func() { version = origVersion }()
+
+	testAgent := &agent{
+		client: cli,
+		update: u,
+		logger: &testLogger{t: t},
+		cfg:    &config{},
+	}
+
+	// 覆盖 Check 回调：无新版本
+	checkSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Location", "/releases/download/v1.0.0/mnagent_linux_amd64")
+		w.WriteHeader(http.StatusFound)
+	}))
+	defer checkSrv.Close()
+	u.urlFor = func(string) string { return checkSrv.URL }
+
+	testAgent.handleUpgradeJob(context.Background(), Job{
+		ID:     "upd-1",
+		Kind:   "upgrade",
+		Target: "latest",
+	})
+
+	if !reported.Load() {
+		t.Fatal("未回传更新结果")
+	}
+	if reportedResult.ExitCode != 0 || !strings.Contains(reportedResult.Output, "已是最新版本") {
+		t.Fatalf("已是最新版时返回异常: %+v", reportedResult)
+	}
+
+	// 2. 测试有新版本时
+	reported.Store(false)
+	downloadSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodHead {
+			w.Header().Set("Location", "/releases/download/v1.1.0/mnagent_linux_amd64")
+			w.WriteHeader(http.StatusFound)
+			return
+		}
+		payload := make([]byte, 2048)
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write(payload)
+	}))
+	defer downloadSrv.Close()
+	u.urlFor = func(v string) string { return downloadSrv.URL }
+	u.downloadClient = downloadSrv.Client()
+
+	testAgent.handleUpgradeJob(context.Background(), Job{
+		ID:     "upd-2",
+		Kind:   "upgrade",
+		Target: "latest",
+	})
+
+	if !reported.Load() {
+		t.Fatal("更新后未回传结果")
+	}
+	if reportedResult.ExitCode != 0 || !strings.Contains(reportedResult.Output, "成功下载并安装 v1.1.0") {
+		t.Fatalf("更新成功结果异常: %+v", reportedResult)
+	}
+	if !restarted.Load() {
+		t.Fatal("更新后必须触发服务重启")
+	}
+}

@@ -386,6 +386,19 @@ func (a *agent) loop(ctx context.Context) error {
 			continue
 		}
 
+		// 收到远程更新控制包
+		if job.Kind == "upgrade" || job.Kind == "update" {
+			if a.heavyActive.Load() {
+				select {
+				case <-a.heavyDone:
+				case <-ctx.Done():
+					return nil
+				}
+			}
+			a.handleUpgradeJob(ctx, *job)
+			continue
+		}
+
 		if isHeavy(*job) {
 			if a.heavyActive.Load() {
 				// 已有重任务在执行，等待其完成，避免并发重任务抢占带宽与端口
@@ -678,5 +691,114 @@ func sleep(ctx context.Context, d time.Duration) bool {
 		return false
 	case <-timer.C:
 		return true
+	}
+}
+
+// handleUpgradeJob 处理来自机器人的远程更新指令。
+func (a *agent) handleUpgradeJob(ctx context.Context, job Job) {
+	a.logger.Info("收到远程更新指令，开始处理", "job", job.ID, "current_version", version, "target", job.Target)
+
+	var depNotes []string
+	if a.cfg != nil {
+		dm := newDependencyManager(a.cfg.ghProxy)
+		statuses := dm.CheckAll(ctx, a.cfg)
+		for _, st := range statuses {
+			if st.Error != nil {
+				depNotes = append(depNotes, fmt.Sprintf("• 依赖 %s 检查失败：%v", st.Name, st.Error))
+				continue
+			}
+			if !st.Installed {
+				continue
+			}
+			if st.HasUpdate {
+				if _, err := dm.UpdateDependency(ctx, st.Name, st.BinaryPath, st.LatestVersion, a.logger); err != nil {
+					depNotes = append(depNotes, fmt.Sprintf("• 依赖 %s 更新至 %s 失败：%v", st.Name, st.LatestVersion, err))
+				} else {
+					depNotes = append(depNotes, fmt.Sprintf("• 依赖 %s 已成功更新至 %s", st.Name, st.LatestVersion))
+				}
+			} else {
+				depNotes = append(depNotes, fmt.Sprintf("• 依赖 %s 已是最新版（%s）", st.Name, st.CurrentVersion))
+			}
+		}
+	}
+	depSummary := strings.Join(depNotes, "\n")
+	if depSummary != "" {
+		depSummary = "\n" + depSummary
+	}
+
+	if a.update == nil {
+		a.sendUpgradeResult(job, -1, "当前运行环境不支持自更新（更新器未就绪）", "updater not ready")
+		return
+	}
+
+	targetVer := strings.TrimSpace(job.Target)
+	if targetVer == "" {
+		targetVer = "latest"
+	}
+
+	var (
+		newVer    string
+		hasUpdate bool
+		checkErr  error
+	)
+	if targetVer == "latest" {
+		newVer, hasUpdate, checkErr = a.update.Check()
+	} else {
+		newVer = targetVer
+		hasUpdate = true
+	}
+
+	if checkErr != nil {
+		errMsg := fmt.Sprintf("检查更新失败：%v", checkErr)
+		a.logger.Warn(errMsg, "job", job.ID)
+		a.sendUpgradeResult(job, -1, errMsg+depSummary, checkErr.Error())
+		return
+	}
+
+	if !hasUpdate && targetVer == "latest" {
+		msg := fmt.Sprintf("当前已是最新版本（%s），无需更新。原有运行参数保持不变。%s", version, depSummary)
+		a.logger.Info("当前已是最新版本", "version", version)
+		a.sendUpgradeResult(job, 0, strings.TrimSpace(msg), "")
+		return
+	}
+
+	// 执行下载并原子替换二进制文件
+	a.client.paused.Store(true)
+	defer a.client.paused.Store(false)
+
+	a.logger.Info("开始下载并替换二进制", "from", version, "to", newVer)
+	installedVer, applyErr := a.update.DownloadAndReplace(newVer)
+	if applyErr != nil {
+		errMsg := fmt.Sprintf("下载或安装更新失败：%v", applyErr)
+		a.logger.Warn(errMsg, "target", newVer, "error", applyErr)
+		a.sendUpgradeResult(job, -1, errMsg+depSummary, applyErr.Error())
+		return
+	}
+
+	// 替换成功后，先向机器人回传成功结果
+	successMsg := fmt.Sprintf("✅ 已成功下载并安装 %s（原版本 %s）！\n• 服务正在平滑重启\n• 所有启动参数已由系统服务完整保留%s",
+		installedVer, version, depSummary)
+	a.logger.Info("已成功更新并回传结果，即将平滑重启服务", "new_version", installedVer)
+	a.sendUpgradeResult(job, 0, strings.TrimSpace(successMsg), "")
+
+	// 短暂休眠确保结果数据包送出网络缓冲区，随后触发重启
+	time.Sleep(500 * time.Millisecond)
+	if err := a.update.Restart(); err != nil {
+		a.logger.Warn("服务重启失败", "error", err)
+	}
+}
+
+func (a *agent) sendUpgradeResult(job Job, exitCode int, output, errText string) {
+	sendCtx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+	res := Result{
+		ID:       job.ID,
+		Kind:     job.Kind,
+		Output:   output,
+		ExitCode: exitCode,
+		Error:    errText,
+	}
+	if err := a.client.sendResult(sendCtx, res); err != nil {
+		a.logger.Warn("回传更新结果失败", "job", job.ID, "error", err)
 	}
 }

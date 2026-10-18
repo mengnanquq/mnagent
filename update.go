@@ -251,47 +251,61 @@ func (u *updater) Check() (string, bool, error) {
 	return latest, true, nil
 }
 
-// Apply 下载并安装指定版本，然后重启服务。
-// 安装是原子的：先下载到同目录临时文件并校验长度/可执行性，再改名覆盖。
-// version 可以是具体版本（v0.1.8）或 latest（自动解析成最新版本号）。
-func (u *updater) Apply(version string) error {
+// DownloadAndReplace 下载并原子替换二进制文件，返回目标版本号，但不触发重启。
+func (u *updater) DownloadAndReplace(version string) (string, error) {
 	if version == "" || version == "latest" {
 		l, _, err := u.latestVersion()
 		if err != nil {
-			return err
+			return "", err
 		}
 		version = l
 	}
 	if _, ok := parseVersion(version); !ok {
-		return fmt.Errorf("版本号格式非法：%q", version)
+		return "", fmt.Errorf("版本号格式非法：%q", version)
 	}
 	url := u.urlForOrFallback(version)
 	tmp, err := os.CreateTemp(filepath.Dir(u.executable), ".mnagent-update-*")
 	if err != nil {
-		return err
+		return "", err
 	}
 	tmpName := tmp.Name()
 	defer os.Remove(tmpName)
 	if err := u.downloadTo(url, tmp); err != nil {
 		tmp.Close()
-		return err
+		return "", err
 	}
 	if err := tmp.Close(); err != nil {
-		return err
+		return "", err
 	}
 	if err := os.Chmod(tmpName, 0o755); err != nil {
-		return err
+		return "", err
 	}
 	// 覆盖正在运行的二进制：Linux 下进程持有的是已打开的文件描述符，
 	// Windows 下正在运行的 exe 无法直接覆盖，但允许重命名为 .old 后写入新文件。
 	if err := replaceExecutable(tmpName, u.executable); err != nil {
+		return "", err
+	}
+	return version, nil
+}
+
+// Restart 重启服务（若注入了 restart 回调）。
+func (u *updater) Restart() error {
+	if u.restart != nil {
+		return u.restart()
+	}
+	return nil
+}
+
+// Apply 下载并安装指定版本，然后重启服务。
+// 安装是原子的：先下载到同目录临时文件并校验长度/可执行性，再改名覆盖。
+// version 可以是具体版本（v0.1.8）或 latest（自动解析成最新版本号）。
+func (u *updater) Apply(version string) error {
+	targetVer, err := u.DownloadAndReplace(version)
+	if err != nil {
 		return err
 	}
-	// 校验新二进制能启动（-version 由 systemd/procd 重启后的新进程打印）。
-	if u.restart != nil {
-		if err := u.restart(); err != nil {
-			return fmt.Errorf("二进制已更新，但重启服务失败：%w", err)
-		}
+	if err := u.Restart(); err != nil {
+		return fmt.Errorf("二进制已更新至 %s，但重启服务失败：%w", targetVer, err)
 	}
 	return nil
 }

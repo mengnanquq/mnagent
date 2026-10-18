@@ -317,6 +317,50 @@ fi
 
 # ---------- 参数校验 ----------
 
+# 自动继承已有服务参数（保留原有配置）
+existing_cmd=""
+if [ "$PLATFORM" = "systemd" ] && [ -f "$INIT_DIR/$SERVICE_NAME.service" ]; then
+	existing_cmd="$(grep -E '^ExecStart=' "$INIT_DIR/$SERVICE_NAME.service" | head -n1 | sed 's/^ExecStart=//' || true)"
+elif [ "$PLATFORM" = "openwrt" ] && [ -f "$INIT_DIR/$SERVICE_NAME" ]; then
+	existing_cmd="$(grep -A 10 'procd_set_param command' "$INIT_DIR/$SERVICE_NAME" | tr '\\\n' ' ' || true)"
+fi
+
+if [ -n "$existing_cmd" ]; then
+	if [ -z "$BOT_URL" ]; then
+		extracted_bot="$(printf '%s' "$existing_cmd" | grep -o -- '-bot [^ ]*' | head -n1 | awk '{print $2}' || true)"
+		if [ -n "$extracted_bot" ]; then
+			BOT_URL="$extracted_bot"
+			log "已从现有服务配置继承 --bot 地址: $BOT_URL"
+		fi
+	fi
+	if [ -z "$TOKEN" ] && [ ! -s "$TOKEN_FILE" ]; then
+		extracted_token_file="$(printf '%s' "$existing_cmd" | grep -o -- '-token-file [^ ]*' | head -n1 | awk '{print $2}' || true)"
+		if [ -n "$extracted_token_file" ] && [ -f "$extracted_token_file" ]; then
+			TOKEN_FILE="$extracted_token_file"
+			log "已从现有服务配置继承 --token-file 路径: $TOKEN_FILE"
+		fi
+	fi
+	if [ -z "$GH_PROXY" ]; then
+		extracted_proxy="$(printf '%s' "$existing_cmd" | grep -o -- '-gh-proxy [^ ]*' | head -n1 | awk '{print $2}' || true)"
+		if [ -n "$extracted_proxy" ]; then
+			GH_PROXY="$extracted_proxy"
+			log "已从现有服务配置继承 --gh-proxy 代理: $GH_PROXY"
+		fi
+	fi
+	if [ "$NEXTTRACE_BIN" = "nexttrace" ]; then
+		extracted_nt="$(printf '%s' "$existing_cmd" | grep -o -- '-nexttrace [^ ]*' | head -n1 | awk '{print $2}' || true)"
+		if [ -n "$extracted_nt" ]; then
+			NEXTTRACE_BIN="$extracted_nt"
+		fi
+	fi
+	if [ "$MIAOSPEED_BIN" = "miaospeed" ]; then
+		extracted_miao="$(printf '%s' "$existing_cmd" | grep -o -- '-miaospeed [^ ]*' | head -n1 | awk '{print $2}' || true)"
+		if [ -n "$extracted_miao" ]; then
+			MIAOSPEED_BIN="$extracted_miao"
+		fi
+	fi
+fi
+
 [ -n "$BOT_URL" ] || die "缺少 --bot"
 case "$BOT_URL" in
 	http://*|https://*) ;;
