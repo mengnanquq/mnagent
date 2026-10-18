@@ -322,7 +322,7 @@ existing_cmd=""
 if [ "$PLATFORM" = "systemd" ] && [ -f "$INIT_DIR/$SERVICE_NAME.service" ]; then
 	existing_cmd="$(grep -E '^ExecStart=' "$INIT_DIR/$SERVICE_NAME.service" | head -n1 | sed 's/^ExecStart=//' || true)"
 elif [ "$PLATFORM" = "openwrt" ] && [ -f "$INIT_DIR/$SERVICE_NAME" ]; then
-	existing_cmd="$(grep -A 10 'procd_set_param command' "$INIT_DIR/$SERVICE_NAME" | tr '\\\n' ' ' || true)"
+	existing_cmd="$(grep -A 10 'procd_set_param command' "$INIT_DIR/$SERVICE_NAME" | sed -e 's/\\$//' | tr '\n' ' ' || true)"
 fi
 
 if [ -n "$existing_cmd" ]; then
