@@ -11,6 +11,8 @@ import (
 	"flag"
 	"fmt"
 	"log/slog"
+	"net"
+	"net/http"
 	"net/url"
 	"os"
 	"os/exec"
@@ -62,6 +64,9 @@ type config struct {
 	skipUpdate         string
 	ghProxy            string
 	diagJob            string
+	runDiag            bool
+	probeTarget        string
+	probeKind          string
 	allowPrivateProbes bool
 }
 
@@ -101,6 +106,14 @@ func runWithContext(ctx context.Context, args []string) error {
 	// CLI 模式：检查/应用/跳过更新（不进入常驻循环）。
 	if handled, err := handleUpdateCLI(cfg, log); handled {
 		return err
+	}
+
+	if cfg.runDiag {
+		return handleDiagCLI(cfg, log)
+	}
+
+	if cfg.probeTarget != "" {
+		return handleProbeCLI(ctx, cfg, log)
 	}
 
 	if cfg.diagJob != "" {
@@ -186,18 +199,21 @@ func parseConfig(args []string) (*config, error) {
 		ghProxy      = fs.String("gh-proxy", "", "GitHub 代理加速前缀，例如 https://gh-proxy.com/")
 		logLevel     = fs.String("log-level", "info", "日志级别：debug / info / warn / error")
 		showVer      = fs.Bool("version", false, "输出版本后退出")
-		diagJob      = fs.String("diag-job", "", "本地直接执行一次测速任务并输出调试信息后退出")
-		allowPrivate = fs.Bool("allow-private-probes", false, "允许探测内网私有地址与链路本地地址（默认禁止，防范 SSRF/云元数据盗取）")
-	)
-	if err := fs.Parse(args); err != nil {
-		return nil, err
-	}
-	if *showVer {
-		fmt.Printf("mnagent %s (%s/%s, %s)\n", version, runtime.GOOS, runtime.GOARCH, runtime.Version())
-		os.Exit(0)
-	}
+			diagJob      = fs.String("diag-job", "", "本地直接执行一次测速任务并输出调试信息后退出")
+			runDiag      = fs.Bool("diag", false, "执行本地环境与系统依赖健康自检并输出诊断看板后退出")
+			probeTarget  = fs.String("probe-target", "", "本地直接执行一次探针网络测试的目标（域名或 IP）")
+			probeKind    = fs.String("probe-kind", "ping", "本地探针类型：ping / tcping / trace / http / dns")
+			allowPrivate = fs.Bool("allow-private-probes", false, "允许探测内网私有地址与链路本地地址（默认禁止，防范 SSRF/云元数据盗取）")
+		)
+		if err := fs.Parse(args); err != nil {
+			return nil, err
+		}
+		if *showVer {
+			fmt.Printf("mnagent %s (%s/%s, %s)\n", version, runtime.GOOS, runtime.GOARCH, runtime.Version())
+			os.Exit(0)
+		}
 
-	isUpdateCLI := *checkUpd || strings.TrimSpace(*applyUpd) != "" || strings.TrimSpace(*skipUpd) != "" || strings.TrimSpace(*diagJob) != ""
+		isUpdateCLI := *checkUpd || strings.TrimSpace(*applyUpd) != "" || strings.TrimSpace(*skipUpd) != "" || strings.TrimSpace(*diagJob) != "" || *runDiag || strings.TrimSpace(*probeTarget) != ""
 
 	endpoint := strings.TrimRight(strings.TrimSpace(*botURL), "/")
 	if endpoint == "" && !isUpdateCLI {
@@ -223,6 +239,9 @@ func parseConfig(args []string) (*config, error) {
 		if err != nil {
 			return nil, err
 		}
+	} else if *runDiag {
+		// 诊断模式下如果存在令牌文件，尝试读取以供诊断看板展示状态
+		tokens, _ = newTokenSource(*tokenValue, *tokenFile)
 	}
 	var path string
 	if !isUpdateCLI {
@@ -273,6 +292,9 @@ func parseConfig(args []string) (*config, error) {
 		skipUpdate:         strings.TrimSpace(*skipUpd),
 		ghProxy:            proxyVal,
 		diagJob:            strings.TrimSpace(*diagJob),
+		runDiag:            *runDiag,
+		probeTarget:        strings.TrimSpace(*probeTarget),
+		probeKind:          strings.ToLower(strings.TrimSpace(*probeKind)),
 		allowPrivateProbes: *allowPrivate,
 	}, nil
 }
@@ -338,4 +360,145 @@ func (t *tokenSource) get() (string, error) {
 		return "", fmt.Errorf("令牌文件 %s 内容为空", t.path)
 	}
 	return token, nil
+}
+
+// handleDiagCLI 运行本地系统、依赖与网络连通性自检，输出规整的高对比度终端看板。
+func handleDiagCLI(cfg *config, log *slog.Logger) error {
+	fmt.Println("================================================================")
+	fmt.Printf("  ⚡ mnagent %s 本地环境与系统依赖健康自检 (System Diagnostics)\n", version)
+	fmt.Println("================================================================")
+
+	// 1. 系统与架构
+	hostname, _ := os.Hostname()
+	if hostname == "" {
+		hostname = "unknown"
+	}
+	fmt.Printf("  • 主机名称: %s\n", hostname)
+	fmt.Printf("  • 操作系统: %s (%s, %d CPUs)\n", runtime.GOOS, runtime.GOARCH, runtime.NumCPU())
+	fmt.Printf("  • Go 版本:  %s\n", runtime.Version())
+
+	// 2. 依赖二进制检查：NextTrace
+	fmt.Println("----------------------------------------------------------------")
+	ntPath, ntOk := resolveBinaryPath(cfg.binary)
+	if ntOk {
+		out, _ := exec.Command(ntPath, "-V").CombinedOutput()
+		vStr := stripANSI(strings.TrimSpace(string(out)))
+		if idx := strings.Index(vStr, "\n"); idx != -1 {
+			vStr = vStr[:idx]
+		}
+		if vStr == "" {
+			vStr = "可用 (未返回版本)"
+		}
+		fmt.Printf("  • NextTrace: 🟢 正常 -> %s (%s)\n", ntPath, vStr)
+	} else {
+		fmt.Printf("  • NextTrace: 🟡 未就绪 (未在 PATH 中检测到 %s)\n", cfg.binary)
+	}
+
+	// 3. 依赖二进制检查：MiaoSpeed
+	miaoPath, miaoOk := resolveBinaryPath(cfg.miaospeedBinary)
+	if miaoOk {
+		out, _ := exec.Command(miaoPath, "-v").CombinedOutput()
+		vStr := stripANSI(strings.TrimSpace(string(out)))
+		if idx := strings.Index(vStr, "\n"); idx != -1 {
+			vStr = vStr[:idx]
+		}
+		if vStr == "" {
+			vStr = "可用 (未返回版本)"
+		}
+		fmt.Printf("  • MiaoSpeed: 🟢 正常 -> %s (%s)\n", miaoPath, vStr)
+	} else {
+		fmt.Printf("  • MiaoSpeed: ⚪️ 未检测到 (仅测速任务需要: %s)\n", cfg.miaospeedBinary)
+	}
+
+	// 4. 网络特权 / Raw Socket 检测
+	fmt.Println("----------------------------------------------------------------")
+	conn, rawErr := net.ListenPacket("ip4:icmp", "0.0.0.0")
+	if rawErr == nil {
+		conn.Close()
+		fmt.Println("  • ICMP 套接字: 🟢 原生套接字权限正常 (CAP_NET_RAW / root 具备)")
+	} else {
+		uconn, uerr := net.ListenPacket("udp4", "0.0.0.0:0")
+		if uerr == nil {
+			uconn.Close()
+			fmt.Printf("  • ICMP 套接字: 🟡 Raw Socket 受限 (%v)，回退非特权探针模式\n", rawErr)
+		} else {
+			fmt.Printf("  • ICMP 套接字: 🔴 套接字创建失败: %v\n", rawErr)
+		}
+	}
+
+	// 5. 接入凭据状态
+	if cfg.tokens != nil {
+		if tok, err := cfg.tokens.get(); err == nil && tok != "" {
+			masked := tok
+			if len(masked) > 8 {
+				masked = masked[:4] + "...." + masked[len(masked)-4:]
+			}
+			fmt.Printf("  • 接入凭据: 🟢 已加载 (来自 %s: %s)\n", cfg.tokens.from, masked)
+		} else {
+			fmt.Printf("  • 接入凭据: 🟡 令牌读取失败 (来源 %s: %v)\n", cfg.tokens.from, err)
+		}
+	} else {
+		fmt.Println("  • 接入凭据: ⚪️ 未配置令牌 (非守护进程运行模式)")
+	}
+
+	// 6. 机器人端点连通性测试
+	if cfg.botURL != "" {
+		fmt.Println("----------------------------------------------------------------")
+		fmt.Printf("  • 机器人连接: 正在测试出站握手 -> %s\n", cfg.botURL)
+		start := time.Now()
+		client := &http.Client{Timeout: 5 * time.Second}
+		resp, err := client.Get(cfg.botURL + "/heartbeat")
+		dur := time.Since(start)
+		if err == nil {
+			resp.Body.Close()
+			fmt.Printf("  • 连通结果:   🟢 握手成功 (耗时 %v, HTTP %s)\n", dur.Round(time.Millisecond), resp.Status)
+		} else {
+			fmt.Printf("  • 连通结果:   🔴 访问失败 (%v)\n", err)
+		}
+	}
+	fmt.Println("================================================================")
+	return nil
+}
+
+// handleProbeCLI 本地执行探针任务，直接在终端打印结构化诊断结果。
+func handleProbeCLI(ctx context.Context, cfg *config, log *slog.Logger) error {
+	runner := newRunnerFull(cfg.binary, cfg.miaospeedBinary, cfg.ghProxy, cfg.allowPrivateProbes, log)
+	kind := cfg.probeKind
+	if kind == "" {
+		kind = "ping"
+	}
+
+	fmt.Println("================================================================")
+	fmt.Printf("  ⚡ mnagent 本地网络探针执行: [%s] -> %s\n", strings.ToUpper(kind), cfg.probeTarget)
+	fmt.Println("================================================================")
+
+	res := runner.run(ctx, Job{
+		ID:        "cli-probe",
+		Kind:      kind,
+		Target:    cfg.probeTarget,
+		Query:     "full",
+		TimeoutMS: 30000,
+	})
+
+	if res.ExitCode != 0 {
+		fmt.Printf("  ❌ 执行失败 (Exit Code %d)\n", res.ExitCode)
+		if res.ErrText != "" {
+			fmt.Printf("  • 错误信息: %s\n", res.ErrText)
+		}
+		if res.Output != "" {
+			fmt.Printf("  • 详细输出: %s\n", res.Output)
+		}
+		fmt.Println("================================================================")
+		return nil
+	}
+
+	fmt.Println("  ✅ 执行成功 (OK)")
+	fmt.Println("----------------------------------------------------------------")
+	if res.Output != "" {
+		fmt.Println(res.Output)
+	} else {
+		fmt.Println("  (探测完成，无标准输出)")
+	}
+	fmt.Println("================================================================")
+	return nil
 }
