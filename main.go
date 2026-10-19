@@ -199,21 +199,21 @@ func parseConfig(args []string) (*config, error) {
 		ghProxy      = fs.String("gh-proxy", "", "GitHub 代理加速前缀，例如 https://gh-proxy.com/")
 		logLevel     = fs.String("log-level", "info", "日志级别：debug / info / warn / error")
 		showVer      = fs.Bool("version", false, "输出版本后退出")
-			diagJob      = fs.String("diag-job", "", "本地直接执行一次测速任务并输出调试信息后退出")
-			runDiag      = fs.Bool("diag", false, "执行本地环境与系统依赖健康自检并输出诊断看板后退出")
-			probeTarget  = fs.String("probe-target", "", "本地直接执行一次探针网络测试的目标（域名或 IP）")
-			probeKind    = fs.String("probe-kind", "ping", "本地探针类型：ping / tcping / trace / http / dns")
-			allowPrivate = fs.Bool("allow-private-probes", false, "允许探测内网私有地址与链路本地地址（默认禁止，防范 SSRF/云元数据盗取）")
-		)
-		if err := fs.Parse(args); err != nil {
-			return nil, err
-		}
-		if *showVer {
-			fmt.Printf("mnagent %s (%s/%s, %s)\n", version, runtime.GOOS, runtime.GOARCH, runtime.Version())
-			os.Exit(0)
-		}
+		diagJob      = fs.String("diag-job", "", "本地直接执行一次测速任务并输出调试信息后退出")
+		runDiag      = fs.Bool("diag", false, "执行本地环境与系统依赖健康自检并输出诊断看板后退出")
+		probeTarget  = fs.String("probe-target", "", "本地直接执行一次探针网络测试的目标（域名或 IP）")
+		probeKind    = fs.String("probe-kind", "ping", "本地探针类型：ping / tcping / trace / http / dns")
+		allowPrivate = fs.Bool("allow-private-probes", false, "允许探测内网私有地址与链路本地地址（默认禁止，防范 SSRF/云元数据盗取）")
+	)
+	if err := fs.Parse(args); err != nil {
+		return nil, err
+	}
+	if *showVer {
+		fmt.Printf("mnagent %s (%s/%s, %s)\n", version, runtime.GOOS, runtime.GOARCH, runtime.Version())
+		os.Exit(0)
+	}
 
-		isUpdateCLI := *checkUpd || strings.TrimSpace(*applyUpd) != "" || strings.TrimSpace(*skipUpd) != "" || strings.TrimSpace(*diagJob) != "" || *runDiag || strings.TrimSpace(*probeTarget) != ""
+	isUpdateCLI := *checkUpd || strings.TrimSpace(*applyUpd) != "" || strings.TrimSpace(*skipUpd) != "" || strings.TrimSpace(*diagJob) != "" || *runDiag || strings.TrimSpace(*probeTarget) != ""
 
 	endpoint := strings.TrimRight(strings.TrimSpace(*botURL), "/")
 	if endpoint == "" && !isUpdateCLI {
