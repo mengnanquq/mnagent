@@ -372,6 +372,14 @@ func tcpingProbe(ctx context.Context, job Job, allowPrivate bool) (LatencyReport
 	timeout := probeTimeout(ctx, job.TimeoutMS)
 	host := strings.TrimSpace(job.Target)
 	port := job.Port
+	if strings.Contains(host, ":") {
+		if h, p, err := net.SplitHostPort(host); err == nil {
+			host = h
+			if portNum, pErr := strconv.Atoi(p); pErr == nil && portNum > 0 {
+				port = portNum
+			}
+		}
+	}
 	if port == 0 {
 		port = 443
 	}
