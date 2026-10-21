@@ -175,11 +175,12 @@ func (c *client) sendResult(ctx context.Context, res Result) error {
 
 // Progress 是任务执行中的实时进度。
 type Progress struct {
-	ID       string `json:"id"`
-	Current  int    `json:"current"`
-	Total    int    `json:"total"`
-	NodeName string `json:"node_name,omitempty"`
-	Stage    string `json:"stage,omitempty"`
+	ID       string          `json:"id"`
+	Current  int             `json:"current"`
+	Total    int             `json:"total"`
+	NodeName string          `json:"node_name,omitempty"`
+	Stage    string          `json:"stage,omitempty"`
+	NodeData json.RawMessage `json:"node_data,omitempty"`
 }
 
 // progressResponse 机器人侧针对进度上报的可选控制返回。
