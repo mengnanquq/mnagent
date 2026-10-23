@@ -135,6 +135,8 @@ func TestHTTPProbeOK(t *testing.T) {
 		if r.Header.Get("User-Agent") == "" {
 			t.Error("应带上 User-Agent")
 		}
+		w.Header().Set("Server", "test-server")
+		w.Header().Set("Content-Type", "text/plain; charset=utf-8")
 		w.WriteHeader(http.StatusTeapot)
 		_, _ = w.Write([]byte("hello\nworld"))
 	}))
@@ -152,6 +154,12 @@ func TestHTTPProbeOK(t *testing.T) {
 	}
 	if report.RemoteIP == "" {
 		t.Fatalf("应记录远端 IP: %+v", report)
+	}
+	if report.Proto == "" {
+		t.Fatalf("应记录协议版本: %+v", report)
+	}
+	if report.Headers["server"] != "test-server" || report.Headers["content-type"] != "text/plain; charset=utf-8" {
+		t.Fatalf("响应标头采集异常: %+v", report.Headers)
 	}
 	if report.BodySnippet != "hello world" {
 		t.Fatalf("正文摘要 = %q", report.BodySnippet)

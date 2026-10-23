@@ -66,19 +66,23 @@ type LatencyReport struct {
 
 // HTTPReport 是 HTTP 拨测的结构化结果（各阶段耗时便于定位瓶颈）。
 type HTTPReport struct {
-	URL         string  `json:"url"`
-	Status      int     `json:"status"`
-	StatusText  string  `json:"status_text,omitempty"`
-	RemoteIP    string  `json:"remote_ip,omitempty"`
-	TLS         bool    `json:"tls"`
-	CertExpiry  string  `json:"cert_expiry,omitempty"`
-	Redirects   int     `json:"redirects"`
-	DNSMs       float64 `json:"dns_ms"`
-	ConnectMs   float64 `json:"connect_ms"`
-	TLSHandMs   float64 `json:"tls_ms"`
-	TTFBMs      float64 `json:"ttfb_ms"`
-	TotalMs     float64 `json:"total_ms"`
-	BodySnippet string  `json:"body_snippet,omitempty"`
+	URL         string            `json:"url"`
+	Status      int               `json:"status"`
+	StatusText  string            `json:"status_text,omitempty"`
+	RemoteIP    string            `json:"remote_ip,omitempty"`
+	TLS         bool              `json:"tls"`
+	CertExpiry  string            `json:"cert_expiry,omitempty"`
+	Redirects   int               `json:"redirects"`
+	DNSMs       float64           `json:"dns_ms"`
+	ConnectMs   float64           `json:"connect_ms"`
+	TLSHandMs   float64           `json:"tls_ms"`
+	TTFBMs      float64           `json:"ttfb_ms"`
+	TotalMs     float64           `json:"total_ms"`
+	BodySnippet string            `json:"body_snippet,omitempty"`
+	Proto       string            `json:"proto,omitempty"`
+	TLSVersion  string            `json:"tls_version,omitempty"`
+	CertIssuer  string            `json:"cert_issuer,omitempty"`
+	Headers     map[string]string `json:"headers,omitempty"`
 }
 
 // DNSReport 是 DNS 查询的结构化结果。
@@ -586,10 +590,38 @@ func httpProbe(ctx context.Context, job Job, allowPrivate bool) (HTTPReport, err
 	report.StatusText = resp.Status
 	report.Redirects = redirects
 	report.RemoteIP = remoteAddr
+	report.Proto = resp.Proto
 	report.DNSMs, report.ConnectMs, report.TLSHandMs, report.TTFBMs = dnsMs, connMs, tlsMs, ttfbMs
 	report.TotalMs = sinceMs(start)
-	if resp.TLS != nil && len(resp.TLS.PeerCertificates) > 0 {
-		report.CertExpiry = resp.TLS.PeerCertificates[0].NotAfter.Format("2006-01-02")
+	if resp.TLS != nil {
+		switch resp.TLS.Version {
+		case tls.VersionTLS13:
+			report.TLSVersion = "TLS 1.3"
+		case tls.VersionTLS12:
+			report.TLSVersion = "TLS 1.2"
+		case tls.VersionTLS11:
+			report.TLSVersion = "TLS 1.1"
+		default:
+			report.TLSVersion = "TLS"
+		}
+		if len(resp.TLS.PeerCertificates) > 0 {
+			cert := resp.TLS.PeerCertificates[0]
+			report.CertExpiry = cert.NotAfter.Format("2006-01-02")
+			if cert.Issuer.CommonName != "" {
+				report.CertIssuer = cert.Issuer.CommonName
+			} else if len(cert.Issuer.Organization) > 0 {
+				report.CertIssuer = cert.Issuer.Organization[0]
+			}
+		}
+	}
+	headers := make(map[string]string)
+	for _, k := range []string{"server", "cf-ray", "content-type", "cache-control", "content-encoding", "date", "strict-transport-security"} {
+		if val := resp.Header.Get(k); val != "" {
+			headers[k] = val
+		}
+	}
+	if len(headers) > 0 {
+		report.Headers = headers
 	}
 	if snippet := strings.TrimSpace(string(body)); snippet != "" {
 		report.BodySnippet = strings.TrimSpace(collapseWhitespace(snippet, 120))
