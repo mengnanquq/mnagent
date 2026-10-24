@@ -141,7 +141,8 @@ func (u *updater) latestVersionByAPI() (string, error) {
 	if u.apiURL != nil {
 		targetURL = u.apiURL()
 	} else {
-		targetURL = u.proxyURL("https://api.github.com/repos/" + u.repo + "/releases/latest")
+		// api.github.com 必须直连，绝不能走 gh-proxy
+		targetURL = "https://api.github.com/repos/" + u.repo + "/releases/latest"
 	}
 
 	req, err := http.NewRequest(http.MethodGet, targetURL, nil)

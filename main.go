@@ -7,7 +7,6 @@ package main
 
 import (
 	"context"
-	"encoding/json"
 	"errors"
 	"flag"
 	"fmt"
@@ -113,7 +112,7 @@ func runWithContext(ctx context.Context, args []string) error {
 		return handleDiagCLI(cfg, log)
 	}
 
-	if cfg.probeTarget != "" || cfg.probeKind == "unlock" || cfg.probeKind == "media" {
+	if cfg.probeTarget != "" {
 		return handleProbeCLI(ctx, cfg, log)
 	}
 
@@ -208,8 +207,8 @@ func parseConfig(args []string) (*config, error) {
 		showVer      = fs.Bool("version", false, "输出版本后退出")
 		diagJob      = fs.String("diag-job", "", "本地直接执行一次测速任务并输出调试信息后退出")
 		runDiag      = fs.Bool("diag", false, "执行本地环境与系统依赖健康自检并输出诊断看板后退出")
-		probeTarget  = fs.String("probe-target", "", "本地直接执行一次探针网络测试的目标（域名或 IP，unlock 时可留空或 all）")
-		probeKind    = fs.String("probe-kind", "ping", "本地探针类型：ping / tcping / trace / http / dns / unlock")
+		probeTarget  = fs.String("probe-target", "", "本地直接执行一次探针网络测试的目标（域名或 IP）")
+		probeKind    = fs.String("probe-kind", "ping", "本地探针类型：ping / tcping / trace / http / dns")
 		allowPrivate = fs.Bool("allow-private-probes", false, "允许探测内网私有地址与链路本地地址（默认禁止，防范 SSRF/云元数据盗取）")
 	)
 	if err := fs.Parse(args); err != nil {
@@ -220,8 +219,7 @@ func parseConfig(args []string) (*config, error) {
 		os.Exit(0)
 	}
 
-	pKind := strings.ToLower(strings.TrimSpace(*probeKind))
-	isUpdateCLI := *checkUpd || strings.TrimSpace(*applyUpd) != "" || strings.TrimSpace(*skipUpd) != "" || strings.TrimSpace(*diagJob) != "" || *runDiag || strings.TrimSpace(*probeTarget) != "" || pKind == "unlock" || pKind == "media"
+	isUpdateCLI := *checkUpd || strings.TrimSpace(*applyUpd) != "" || strings.TrimSpace(*skipUpd) != "" || strings.TrimSpace(*diagJob) != "" || *runDiag || strings.TrimSpace(*probeTarget) != ""
 
 	endpoint := strings.TrimRight(strings.TrimSpace(*botURL), "/")
 	if endpoint == "" && !isUpdateCLI {
@@ -523,19 +521,14 @@ func handleProbeCLI(ctx context.Context, cfg *config, log *slog.Logger) error {
 		kind = "ping"
 	}
 
-	targetDisplay := cfg.probeTarget
-	if targetDisplay == "" {
-		targetDisplay = "all"
-	}
-
 	fmt.Println("================================================================")
-	fmt.Printf("  ⚡ mnagent 本地网络探针执行: [%s] -> %s\n", strings.ToUpper(kind), targetDisplay)
+	fmt.Printf("  ⚡ mnagent 本地网络探针执行: [%s] -> %s\n", strings.ToUpper(kind), cfg.probeTarget)
 	fmt.Println("================================================================")
 
 	res := runner.run(ctx, Job{
 		ID:        "cli-probe",
 		Kind:      kind,
-		Target:    targetDisplay,
+		Target:    cfg.probeTarget,
 		Query:     "full",
 		TimeoutMS: 30000,
 	})
@@ -550,14 +543,6 @@ func handleProbeCLI(ctx context.Context, cfg *config, log *slog.Logger) error {
 		}
 		fmt.Println("================================================================")
 		return nil
-	}
-
-	if kind == "unlock" || kind == "media" {
-		var unrep UnlockReport
-		if err := json.Unmarshal(res.Data, &unrep); err == nil {
-			fmt.Println(unrep.Format())
-			return nil
-		}
 	}
 
 	fmt.Println("  ✅ 执行成功 (OK)")

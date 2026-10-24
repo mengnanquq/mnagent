@@ -246,13 +246,9 @@ func (dm *DependencyManager) fetchLatestTagByRedirect(ctx context.Context, repo 
 	return "", errors.New("无法从重定向获取版本 tag")
 }
 
-// fetchLatestTagByAPI 通过 GitHub API 获取最新发布 tag（支持 ghProxy 代理）。
+// fetchLatestTagByAPI 通过 GitHub API 获取最新发布 tag（注意：api.github.com 必须直连，绝不能走 gh-proxy）。
 func (dm *DependencyManager) fetchLatestTagByAPI(ctx context.Context, repo string) (string, error) {
-	rawURL := fmt.Sprintf("%s/repos/%s/releases/latest", strings.TrimRight(dm.apiBaseURL, "/"), repo)
-	targetURL := rawURL
-	if dm.ghProxy != "" && (dm.apiBaseURL == "" || dm.apiBaseURL == "https://api.github.com") {
-		targetURL = applyGHProxy(rawURL, dm.ghProxy)
-	}
+	targetURL := fmt.Sprintf("%s/repos/%s/releases/latest", strings.TrimRight(dm.apiBaseURL, "/"), repo)
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, targetURL, nil)
 	if err != nil {
 		return "", err

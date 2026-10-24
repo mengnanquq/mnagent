@@ -73,7 +73,6 @@ opkg install nexttrace           # 若未安装 nexttrace（或使用 --nexttrac
 | `tcping` | TCP 握手延迟 | 无 |
 | `http` | HTTP(S) 请求：状态码、服务端 IP、证书到期、DNS/连接/TLS/首字节分段耗时 | 无 |
 | `dns` | 用主机自身解析器查 A/AAAA/CNAME/MX/NS/TXT/PTR | 无 |
-| `unlock` / `media` | 基于 [RegionRestrictionCheck](https://github.com/lmc999/RegionRestrictionCheck) 规范的流媒体与 AI 原生并发解锁检测（Netflix、Disney+、YouTube、Spotify、ChatGPT、Claude、Gemini、动画疯、哔哩哔哩、Wikipedia 等） | 无（进程内原生并发实现） |
 
 #### MiaoSpeed 测速支持的测试模式
 
