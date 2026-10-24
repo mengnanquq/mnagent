@@ -8,6 +8,7 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -1576,5 +1577,25 @@ func TestIPv6InboundGeoFallback(t *testing.T) {
 	}
 	if !strings.Contains(rep.InboundGeo, "2406:da18:1:1::1") {
 		t.Fatalf("入站信息应包含节点的 IPv6 地址，实际: %q", rep.InboundGeo)
+	}
+}
+
+// TestWaitForPortReady 验证端口连通探测与超时/取消机制。
+func TestWaitForPortReady(t *testing.T) {
+	l, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer l.Close()
+
+	addr := l.Addr().String()
+	if err := waitForPortReady(context.Background(), addr, 1*time.Second); err != nil {
+		t.Fatalf("探测活动端口失败: %v", err)
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	if err := waitForPortReady(ctx, "127.0.0.1:9", 100*time.Millisecond); err == nil {
+		t.Fatal("已取消上下文应报错")
 	}
 }

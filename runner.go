@@ -300,6 +300,9 @@ func looksLikeUnknownFlag(out string) bool {
 	return false
 }
 
+// 调度器并发参数。
+const defaultMaxConcurrentLight = 8
+
 // agent 把客户端与执行器串成“领取 → 执行 → 回传”的主循环。
 type agent struct {
 	cfg     *config
@@ -311,6 +314,9 @@ type agent struct {
 
 	heavyActive atomic.Bool
 	heavyDone   chan struct{}
+	heavyMu     sync.Mutex
+	heavyQueue  chan Job
+	lightSem    chan struct{}
 	tasksWG     sync.WaitGroup
 }
 
@@ -330,6 +336,18 @@ func isHeavy(job Job) bool {
 func (a *agent) loop(ctx context.Context) error {
 	defer a.tasksWG.Wait()
 	a.startHeartbeat(ctx)
+
+	if a.heavyQueue == nil {
+		a.heavyQueue = make(chan Job, 32)
+	}
+	if a.lightSem == nil {
+		a.lightSem = make(chan struct{}, defaultMaxConcurrentLight)
+	}
+
+	// 启动重任务专用消费协程：串行化重任务与更新指令，并与主长轮询解耦
+	a.tasksWG.Add(1)
+	go a.heavyWorker(ctx)
+
 	backoff := a.cfg.minBackoff
 	var nextCheck time.Time
 	for {
@@ -376,56 +394,82 @@ func (a *agent) loop(ctx context.Context) error {
 			continue // 空响应：立刻再轮询。
 		}
 
-		// 收到任务取消控制包
+		// 收到任务取消控制包：立即在 tracker 中取消，无论其在排队还是正在运行
 		if job.Kind == "cancel" {
 			if a.tracker != nil {
 				if a.tracker.Cancel(job.ID) {
 					a.logger.Info("已按指令中止正在执行的任务", "job", job.ID)
+				} else {
+					a.logger.Info("已登记任务取消标记（若在排队将跳过执行）", "job", job.ID)
 				}
 			}
 			continue
 		}
 
-		// 收到远程更新控制包
-		if job.Kind == "upgrade" || job.Kind == "update" {
-			if a.heavyActive.Load() {
-				select {
-				case <-a.heavyDone:
-				case <-ctx.Done():
-					return nil
-				}
+		// 收到远程更新控制包或重任务（trace / miaospeed / speed）：投入串行调度队列，不阻塞主循环长轮询
+		if isHeavy(*job) || job.Kind == "upgrade" || job.Kind == "update" {
+			select {
+			case a.heavyQueue <- *job:
+			case <-ctx.Done():
+				return nil
 			}
-			a.handleUpgradeJob(ctx, *job)
 			continue
 		}
 
-		if isHeavy(*job) {
-			if a.heavyActive.Load() {
-				// 已有重任务在执行，等待其完成，避免并发重任务抢占带宽与端口
-				select {
-				case <-a.heavyDone:
-				case <-ctx.Done():
-					return nil
-				}
+		// 轻任务（ping / tcping / http / dns）：
+		// 派发至轻任务 worker pool 并发执行，主循环绝不阻塞挂起，秒级处理后续长轮询
+		a.tasksWG.Add(1)
+		go func(j Job) {
+			defer a.tasksWG.Done()
+			select {
+			case a.lightSem <- struct{}{}:
+				defer func() { <-a.lightSem }()
+			case <-ctx.Done():
+				return
 			}
+			a.execute(ctx, j)
+		}(*job)
+	}
+}
 
-			a.heavyActive.Store(true)
+// heavyWorker 串行处理重任务与远程更新，避免多重任务争抢带宽与端口，
+// 并与主长轮询完全解耦，使长轮询与轻任务始终保持秒级响应。
+func (a *agent) heavyWorker(ctx context.Context) {
+	defer a.tasksWG.Done()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case j, ok := <-a.heavyQueue:
+			if !ok {
+				return
+			}
 			doneCh := make(chan struct{})
+			a.heavyMu.Lock()
+			a.heavyActive.Store(true)
 			a.heavyDone = doneCh
-			a.tasksWG.Add(1)
-			go func(j Job) {
-				defer func() {
-					a.heavyActive.Store(false)
-					close(doneCh)
-					a.tasksWG.Done()
-				}()
+			a.heavyMu.Unlock()
+
+			// 检查任务在排队期间是否已被 cancel
+			if a.tracker != nil && a.tracker.IsCancelled(j.ID) {
+				a.logger.Info("任务在排队期间已被取消，跳过执行", "job", j.ID, "kind", j.Kind)
+				a.heavyMu.Lock()
+				a.heavyActive.Store(false)
+				close(doneCh)
+				a.heavyMu.Unlock()
+				continue
+			}
+
+			if j.Kind == "upgrade" || j.Kind == "update" {
+				a.handleUpgradeJob(ctx, j)
+			} else {
 				a.execute(ctx, j)
-			}(*job)
-		} else {
-			// 轻任务（ping / tcping / http / dns）：
-			// 当重任务在跑时，主循环继续长轮询收到轻任务并直接执行，秒级返回结果，
-			// 不再受前序耗时测速阻塞。
-			a.execute(ctx, *job)
+			}
+
+			a.heavyMu.Lock()
+			a.heavyActive.Store(false)
+			close(doneCh)
+			a.heavyMu.Unlock()
 		}
 	}
 }

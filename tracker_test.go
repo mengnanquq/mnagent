@@ -50,6 +50,17 @@ func TestJobTracker(t *testing.T) {
 		t.Fatal("ctx2 不应该被取消")
 	}
 	cancel2()
+
+	// 4. 提前取消尚未 Register 的任务 j3
+	tracker.Cancel("j3")
+	if !tracker.IsCancelled("j3") {
+		t.Fatal("j3 应该已被标记为取消")
+	}
+	ctx3, cancel3 := context.WithCancel(context.Background())
+	tracker.Register("j3", cancel3)
+	if ctx3.Err() == nil {
+		t.Fatal("已标记取消的任务在 Register 时应立即触发取消")
+	}
 }
 
 func TestConcurrentLightExecutionDuringHeavyJob(t *testing.T) {

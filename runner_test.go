@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -381,7 +382,7 @@ func TestAgentLoopProbeJobEndToEnd(t *testing.T) {
 		Data     json.RawMessage `json:"data"`
 	}
 	results := make(chan posted, 1)
-	served := make(chan struct{})
+	var servedJob atomic.Bool
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.Header.Get("Authorization") != "Bearer tok" {
 			w.WriteHeader(http.StatusUnauthorized)
@@ -389,21 +390,18 @@ func TestAgentLoopProbeJobEndToEnd(t *testing.T) {
 		}
 		switch r.URL.Path {
 		case "/jobs":
-			select {
-			case <-served:
-				w.WriteHeader(http.StatusNoContent)
+			if servedJob.CompareAndSwap(false, true) {
+				w.Header().Set("Content-Type", "application/json")
+				_, _ = w.Write([]byte(`{"id":"j1","kind":"ping","target":"127.0.0.1","count":2,"timeout_ms":5000}`))
 				return
-			default:
 			}
-			w.Header().Set("Content-Type", "application/json")
-			_, _ = w.Write([]byte(`{"id":"j1","kind":"ping","target":"127.0.0.1","count":2,"timeout_ms":5000}`))
+			w.WriteHeader(http.StatusNoContent)
 		case "/results":
 			var got posted
 			body, _ := io.ReadAll(r.Body)
 			if err := json.Unmarshal(body, &got); err != nil {
 				t.Errorf("结果不是合法 JSON: %v", err)
 			}
-			close(served)
 			results <- got
 			w.WriteHeader(http.StatusNoContent)
 		default:
@@ -592,4 +590,207 @@ func TestHandleUpgradeJob(t *testing.T) {
 	if !restarted.Load() {
 		t.Fatal("更新后必须触发服务重启")
 	}
+}
+
+// TestAgentLoopNonBlockingLightAndCancelQueue 验证重任务在后台排队或执行时，
+// 主循环完全非阻塞：可并发执行轻任务，且可即刻响应 cancel 信号打断重任务。
+func TestAgentLoopNonBlockingLightAndCancelQueue(t *testing.T) {
+	var pollCount atomic.Int32
+	var completedResults sync.Map
+	tracker := newJobTracker()
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/jobs":
+			c := pollCount.Add(1)
+			w.Header().Set("Content-Type", "application/json")
+			switch c {
+			case 1:
+				// 先派发一个耗时重任务
+				_, _ = w.Write([]byte(`{"id":"heavy-long","kind":"trace","target":"1.1.1.1","hops":5,"timeout_ms":10000}`))
+			case 2:
+				// 主循环未阻塞，第 2 次长轮询立即收到轻任务并并发执行
+				_, _ = w.Write([]byte(`{"id":"light-quick","kind":"tcping","target":"127.0.0.1","port":9,"count":1,"timeout_ms":2000}`))
+			case 3:
+				// 主循环继续轮询，第 3 次收到对 heavy-long 的取消指令
+				_, _ = w.Write([]byte(`{"id":"heavy-long","kind":"cancel"}`))
+			default:
+				w.WriteHeader(http.StatusNoContent)
+			}
+		case "/results":
+			var res Result
+			_ = json.NewDecoder(r.Body).Decode(&res)
+			completedResults.Store(res.ID, res)
+			w.WriteHeader(http.StatusNoContent)
+		case "/heartbeat":
+			w.WriteHeader(http.StatusNoContent)
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer srv.Close()
+
+	// 模拟需要运行数秒的 nexttrace
+	scriptPath := writeScript(t, `sleep 5; echo "trace done"`)
+
+	cfg := &config{
+		botURL:             srv.URL,
+		tokens:             &tokenSource{value: "tok"},
+		binary:             scriptPath,
+		minBackoff:         5 * time.Millisecond,
+		maxBackoff:         20 * time.Millisecond,
+		pollTimeout:        1 * time.Second,
+		allowPrivateProbes: true,
+	}
+	rnr := newRunner(cfg.binary, nil)
+	rnr.allowPrivateProbes = true
+	a := &agent{
+		cfg:     cfg,
+		logger:  testLogger{t},
+		client:  newClient(cfg),
+		runner:  rnr,
+		tracker: tracker,
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	done := make(chan error, 1)
+	go func() { done <- a.loop(ctx) }()
+
+	// light-quick 应当在 1 秒内完成回传（证明重任务未阻塞轻任务）
+	deadline := time.Now().Add(2 * time.Second)
+	var lightOK bool
+	for time.Now().Before(deadline) {
+		if _, ok := completedResults.Load("light-quick"); ok {
+			lightOK = true
+			break
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	if !lightOK {
+		t.Fatal("轻任务未能在重任务运行期间并发完成并回传")
+	}
+
+	// heavy-long 应当被 cancel 打断，而不需要等待完整的 5 秒 sleep
+	deadlineHeavy := time.Now().Add(2 * time.Second)
+	var heavyDone bool
+	for time.Now().Before(deadlineHeavy) {
+		if _, ok := completedResults.Load("heavy-long"); ok {
+			heavyDone = true
+			break
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	if !heavyDone {
+		t.Fatal("heavy-long 未能被 cancel 及时中止")
+	}
+
+	cancel()
+	_ = <-done
+}
+
+// TestAgentLoopConcurrentLightTasks 验证多个轻任务能够并发拉取并执行。
+func TestAgentLoopConcurrentLightTasks(t *testing.T) {
+	var pollCount atomic.Int32
+	var completedResults sync.Map
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/jobs":
+			c := pollCount.Add(1)
+			if c <= 4 {
+				w.Header().Set("Content-Type", "application/json")
+				_, _ = w.Write([]byte(fmt.Sprintf(`{"id":"light-%d","kind":"tcping","target":"127.0.0.1","port":9,"count":1,"timeout_ms":2000}`, c)))
+				return
+			}
+			w.WriteHeader(http.StatusNoContent)
+		case "/results":
+			var res Result
+			_ = json.NewDecoder(r.Body).Decode(&res)
+			completedResults.Store(res.ID, res)
+			w.WriteHeader(http.StatusNoContent)
+		case "/heartbeat":
+			w.WriteHeader(http.StatusNoContent)
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer srv.Close()
+
+	cfg := &config{
+		botURL:             srv.URL,
+		tokens:             &tokenSource{value: "tok"},
+		binary:             "nexttrace",
+		minBackoff:         5 * time.Millisecond,
+		maxBackoff:         20 * time.Millisecond,
+		pollTimeout:        1 * time.Second,
+		allowPrivateProbes: true,
+	}
+	rnr := newRunner(cfg.binary, nil)
+	rnr.allowPrivateProbes = true
+	a := &agent{
+		cfg:     cfg,
+		logger:  testLogger{t},
+		client:  newClient(cfg),
+		runner:  rnr,
+		tracker: newJobTracker(),
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	done := make(chan error, 1)
+	go func() { done <- a.loop(ctx) }()
+
+	deadline := time.Now().Add(2 * time.Second)
+	allDone := false
+	for time.Now().Before(deadline) {
+		count := 0
+		for i := 1; i <= 4; i++ {
+			if _, ok := completedResults.Load(fmt.Sprintf("light-%d", i)); ok {
+				count++
+			}
+		}
+		if count == 4 {
+			allDone = true
+			break
+		}
+		time.Sleep(15 * time.Millisecond)
+	}
+
+	if !allDone {
+		t.Fatal("4 个轻任务未能并发全部完成")
+	}
+
+	cancel()
+	_ = <-done
+}
+
+// TestRunTraceMissingBinary 验证未安装 nexttrace 时 runTrace 会优雅返回错误，退出码为 -1。
+func TestRunTraceMissingBinary(t *testing.T) {
+	r := newRunner("nonexistent-nexttrace-xyz", nil)
+	job := Job{
+		ID:     "trace-missing",
+		Kind:   "trace",
+		Target: "1.1.1.1",
+	}
+	res := r.run(context.Background(), job)
+	if res.ExitCode != -1 || !strings.Contains(res.ErrText, "无法启动 nexttrace") {
+		t.Fatalf("缺失 nexttrace 时未返回预期错误: exitCode=%d errText=%q", res.ExitCode, res.ErrText)
+	}
+}
+
+// TestKillProcessGroup 验证进程组杀死函数的边界与执行情况。
+func TestKillProcessGroup(t *testing.T) {
+	// 1. 空参数或空进程不应崩溃
+	killProcessGroup(nil)
+	killProcessGroup(&exec.Cmd{})
+
+	// 2. 正常进程杀死
+	cmd := exec.CommandContext(context.Background(), "sleep", "10")
+	setupCmdProcessGroup(cmd)
+	if err := cmd.Start(); err != nil {
+		t.Skipf("无法启动测试进程: %v", err)
+	}
+	killProcessGroup(cmd)
+	_ = cmd.Wait()
 }

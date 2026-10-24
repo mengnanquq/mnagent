@@ -152,6 +152,9 @@ func TestHTTPProbeOK(t *testing.T) {
 	if report.TotalMs <= 0 || report.TTFBMs < 0 {
 		t.Fatalf("耗时字段异常: %+v", report)
 	}
+	if report.DNSMs != 0 {
+		t.Fatalf("纯 IP 目标 DNS 耗时应为 0: %f", report.DNSMs)
+	}
 	if report.RemoteIP == "" {
 		t.Fatalf("应记录远端 IP: %+v", report)
 	}
@@ -163,6 +166,19 @@ func TestHTTPProbeOK(t *testing.T) {
 	}
 	if report.BodySnippet != "hello world" {
 		t.Fatalf("正文摘要 = %q", report.BodySnippet)
+	}
+
+	// 验证域名目标的 DNS 阶段分离与耗时采集
+	domainURL := strings.Replace(srv.URL, "127.0.0.1", "localhost", 1)
+	domainReport, err := httpProbe(context.Background(), Job{Target: domainURL, TimeoutMS: 5000}, true)
+	if err != nil {
+		t.Fatalf("域名 http 探针失败: %v", err)
+	}
+	if domainReport.Status != http.StatusTeapot {
+		t.Fatalf("域名请求状态码异常: %d", domainReport.Status)
+	}
+	if domainReport.ConnectMs < 0 || domainReport.TotalMs <= 0 {
+		t.Fatalf("域名请求耗时异常: %+v", domainReport)
 	}
 }
 

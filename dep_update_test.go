@@ -440,3 +440,56 @@ func TestResolveBinaryPathFallback(t *testing.T) {
 		}
 	}
 }
+
+// TestFetchLatestTagRedirectAndFallback 验证免配额的 302 重定向解析与 API 兜底流程。
+func TestFetchLatestTagRedirectAndFallback(t *testing.T) {
+	// 1. 模拟 HEAD 302 重定向
+	redirectSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodHead && strings.Contains(r.URL.Path, "releases/latest") {
+			w.Header().Set("Location", "https://github.com/nxtrace/NTrace-core/releases/tag/v1.7.4")
+			w.WriteHeader(http.StatusFound)
+			return
+		}
+		http.NotFound(w, r)
+	}))
+	defer redirectSrv.Close()
+
+	dm := newDependencyManager(redirectSrv.URL)
+	tag, err := dm.fetchLatestTagByRedirect(context.Background(), "nxtrace/NTrace-core")
+	if err != nil {
+		t.Fatalf("fetchLatestTagByRedirect 失败: %v", err)
+	}
+	if tag != "v1.7.4" {
+		t.Fatalf("解析重定向 tag 不匹配: got=%s, want=v1.7.4", tag)
+	}
+
+	// 2. 模拟 HEAD 失败后平滑走 API 兜底
+	apiSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if strings.Contains(r.URL.Path, "releases/latest") {
+			w.Header().Set("Content-Type", "application/json")
+			w.Write([]byte(`{"tag_name":"v2.0.0"}`))
+			return
+		}
+		http.NotFound(w, r)
+	}))
+	defer apiSrv.Close()
+
+	dmAPI := newDependencyManager("")
+	dmAPI.apiBaseURL = apiSrv.URL
+	apiTag, err := dmAPI.fetchLatestTag(context.Background(), "test/repo")
+	if err != nil {
+		t.Fatalf("fetchLatestTagByAPI 失败: %v", err)
+	}
+	if apiTag != "v2.0.0" {
+		t.Fatalf("API tag 不匹配: got=%s, want=v2.0.0", apiTag)
+	}
+}
+
+// TestUpdateDependencyDispatch 验证统一更新接口分发与未知依赖报错。
+func TestUpdateDependencyDispatch(t *testing.T) {
+	dm := newDependencyManager("")
+	_, err := dm.UpdateDependency(context.Background(), "unknown-dep", "target", "latest", nil)
+	if err == nil || !strings.Contains(err.Error(), "未知的依赖") {
+		t.Fatalf("期望未知依赖报错，实际: %v", err)
+	}
+}

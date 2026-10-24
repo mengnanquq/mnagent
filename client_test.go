@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"net/http"
 	"net/http/httptest"
@@ -226,6 +227,15 @@ func TestParseConfigValidation(t *testing.T) {
 	if cfg.tokens == nil {
 		t.Fatal("令牌来源应已解析")
 	}
+
+	// 验证未显式传 -nexttrace 时，即使系统未安装，也允许启动降级运行
+	cfgMissingNT, err := parseConfig([]string{"-bot", "https://x/agent", "-token", "t", "-nexttrace", "nonexistent-cmd-nt"})
+	if err != nil {
+		t.Fatalf("默认命令未安装时应当允许启动降级: %v", err)
+	}
+	if cfgMissingNT.binary != "nonexistent-cmd-nt" {
+		t.Fatalf("binary 不匹配: %s", cfgMissingNT.binary)
+	}
 }
 
 // TestParseConfigRejectsHostFlag 验证 -host 选项已被移除：令牌即身份，
@@ -261,5 +271,56 @@ func TestClientHeartbeat(t *testing.T) {
 	}
 	if got := count.Load(); got != 1 {
 		t.Fatalf("心跳请求次数 = %d, want 1", got)
+	}
+}
+
+// TestClientSendProgress 验证实时流式进度上报及服务端的 cancel 反向取消控制。
+func TestClientSendProgress(t *testing.T) {
+	var cancelTrigger atomic.Bool
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/progress" && r.Method == http.MethodPost {
+			var p Progress
+			if err := json.NewDecoder(r.Body).Decode(&p); err != nil {
+				t.Errorf("解析进度 payload 失败: %v", err)
+			}
+			w.Header().Set("Content-Type", "application/json")
+			if cancelTrigger.Load() {
+				_, _ = w.Write([]byte(`{"cancel":true}`))
+			} else {
+				w.WriteHeader(http.StatusOK)
+			}
+			return
+		}
+		http.NotFound(w, r)
+	}))
+	defer srv.Close()
+
+	cli := newClient(testConfig(srv.URL, nil))
+
+	// 1. 正常上报进度
+	cancelled, err := cli.sendProgress(context.Background(), Progress{
+		ID:      "test-p1",
+		Current: 1,
+		Total:   10,
+	})
+	if err != nil {
+		t.Fatalf("sendProgress 失败: %v", err)
+	}
+	if cancelled {
+		t.Fatal("期望 cancelled 为 false")
+	}
+
+	// 2. 服务端要求取消任务
+	cancelTrigger.Store(true)
+	cancelled, err = cli.sendProgress(context.Background(), Progress{
+		ID:      "test-p1",
+		Current: 2,
+		Total:   10,
+	})
+	if err != nil {
+		t.Fatalf("sendProgress 失败: %v", err)
+	}
+	if !cancelled {
+		t.Fatal("期望 cancelled 为 true")
 	}
 }

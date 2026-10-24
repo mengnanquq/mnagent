@@ -517,10 +517,18 @@ func httpProbe(ctx context.Context, job Job, allowPrivate bool) (HTTPReport, err
 	)
 	start := time.Now()
 	trace := &httptrace.ClientTrace{
-		DNSStart:          func(httptrace.DNSStartInfo) { dnsStart = time.Now() },
-		DNSDone:           func(httptrace.DNSDoneInfo) { dnsMs = sinceMs(dnsStart) },
-		ConnectStart:      func(_, _ string) { connStart = time.Now() },
-		ConnectDone:       func(_, _ string, _ error) { connMs = sinceMs(connStart) },
+		DNSStart: func(httptrace.DNSStartInfo) { dnsStart = time.Now() },
+		DNSDone: func(httptrace.DNSDoneInfo) {
+			if dnsMs == 0 {
+				dnsMs = sinceMs(dnsStart)
+			}
+		},
+		ConnectStart: func(_, _ string) { connStart = time.Now() },
+		ConnectDone: func(_, _ string, _ error) {
+			if connMs == 0 {
+				connMs = sinceMs(connStart)
+			}
+		},
 		TLSHandshakeStart: func() { tlsStart = time.Now() },
 		TLSHandshakeDone:  func(tls.ConnectionState, error) { tlsMs = sinceMs(tlsStart) },
 		GotConn: func(info httptrace.GotConnInfo) {
@@ -550,10 +558,20 @@ func httpProbe(ctx context.Context, job Job, allowPrivate bool) (HTTPReport, err
 			if err != nil {
 				return nil, err
 			}
-			ips, err := net.DefaultResolver.LookupIP(ctx, "ip", host)
-			if err != nil {
-				return nil, err
+
+			var ips []net.IP
+			if ip := net.ParseIP(host); ip != nil {
+				ips = []net.IP{ip}
+			} else {
+				dnsT0 := time.Now()
+				resolved, lookupErr := net.DefaultResolver.LookupIP(ctx, "ip", host)
+				if lookupErr != nil {
+					return nil, lookupErr
+				}
+				dnsMs = float64(time.Since(dnsT0).Microseconds()) / 1000
+				ips = resolved
 			}
+
 			if len(ips) == 0 {
 				return nil, fmt.Errorf("无法解析目标主机: %s", host)
 			}
@@ -564,7 +582,19 @@ func httpProbe(ctx context.Context, job Job, allowPrivate bool) (HTTPReport, err
 					}
 				}
 			}
-			return dialer.DialContext(ctx, network, net.JoinHostPort(ips[0].String(), port))
+
+			targetIP := ips[0]
+			for _, ip := range ips {
+				if ip.To4() != nil {
+					targetIP = ip
+					break
+				}
+			}
+
+			connT0 := time.Now()
+			c, dialErr := dialer.DialContext(ctx, network, net.JoinHostPort(targetIP.String(), port))
+			connMs = float64(time.Since(connT0).Microseconds()) / 1000
+			return c, dialErr
 		},
 	}
 	defer transport.CloseIdleConnections()

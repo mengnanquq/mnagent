@@ -128,8 +128,11 @@ func (c *client) poll(ctx context.Context) (*Job, error) {
 		if err := json.NewDecoder(io.LimitReader(resp.Body, maxResponseBytes)).Decode(&job); err != nil {
 			return nil, fmt.Errorf("解析任务失败: %w", err)
 		}
-		if strings.TrimSpace(job.ID) == "" || strings.TrimSpace(job.Target) == "" {
-			return nil, errors.New("任务缺少必需字段")
+		if strings.TrimSpace(job.ID) == "" {
+			return nil, errors.New("任务缺少必需字段 ID")
+		}
+		if job.Kind != "cancel" && strings.TrimSpace(job.Target) == "" {
+			return nil, errors.New("任务缺少必需字段 Target")
 		}
 		return &job, nil
 	case http.StatusUnauthorized:

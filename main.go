@@ -164,6 +164,12 @@ func runWithContext(ctx context.Context, args []string) error {
 		update:  newUpdater(cfg, log),
 		tracker: tracker,
 	}
+	if _, ok := resolveBinaryPath(cfg.binary); !ok {
+		log.Warn("未检测到 nexttrace 可执行文件，路由追踪任务将暂不可用（其它探针与测速正常）", "nexttrace", cfg.binary)
+	}
+	if _, ok := resolveBinaryPath(cfg.miaospeedBinary); !ok {
+		log.Debug("未检测到 miaospeed 可执行文件（仅测速任务需要）", "miaospeed", cfg.miaospeedBinary)
+	}
 	log.Info("mnagent 已启动",
 		"version", version, "bot", cfg.botURL,
 		"nexttrace", cfg.binary, "miaospeed", cfg.miaospeedBinary,
@@ -247,12 +253,10 @@ func parseConfig(args []string) (*config, error) {
 	if !isUpdateCLI {
 		if p, ok := resolveBinaryPath(*binary); ok {
 			path = p
+		} else if filepath.IsAbs(*binary) || strings.Contains(*binary, string(filepath.Separator)) {
+			return nil, fmt.Errorf("找不到指定的 nexttrace 可执行文件 %q", *binary)
 		} else {
-			var err error
-			path, err = exec.LookPath(*binary)
-			if err != nil {
-				return nil, fmt.Errorf("找不到 nexttrace 可执行文件 %q：%w", *binary, err)
-			}
+			path = *binary
 		}
 	} else {
 		path = *binary
@@ -426,22 +430,71 @@ func handleDiagCLI(cfg *config, log *slog.Logger) error {
 		}
 	}
 
-	// 5. 接入凭据状态
+	// 5. IPv6 双栈与系统 DNS 解析
+	fmt.Println("----------------------------------------------------------------")
+	dnsStart := time.Now()
+	dnsCtx, dnsCancel := context.WithTimeout(context.Background(), 2*time.Second)
+	addrs, dnsErr := net.DefaultResolver.LookupIP(dnsCtx, "ip", "one.one.one.one")
+	dnsCancel()
+	if dnsErr == nil && len(addrs) > 0 {
+		fmt.Printf("  • 系统 DNS:    🟢 解析正常 (耗时 %v, 目标 one.one.one.one -> %s)\n",
+			time.Since(dnsStart).Round(time.Millisecond), addrs[0].String())
+	} else {
+		fmt.Printf("  • 系统 DNS:    🟡 域名解析异常 (%v)\n", dnsErr)
+	}
+
+	v6Conn, v6Err := net.DialTimeout("udp6", "[2606:4700:4700::1111]:53", 1500*time.Millisecond)
+	if v6Err == nil {
+		v6Conn.Close()
+		fmt.Println("  • IPv6 双栈:   🟢 原生 IPv6 出站连通正常 (具备全局单播路由)")
+	} else {
+		fmt.Println("  • IPv6 双栈:   ⚪️ 仅 IPv4 单栈（无全局 IPv6 出站路由）")
+	}
+
+	// 6. 自动更新与 GitHub 下载源连通性
+	fmt.Println("----------------------------------------------------------------")
+	if cfg.ghProxy != "" {
+		fmt.Printf("  • 更新加速源: 🟢 已启用加速代理 -> %s\n", cfg.ghProxy)
+	} else {
+		fmt.Println("  • 更新加速源: ⚪️ 直连模式 (未配置 --gh-proxy 代理)")
+	}
+	testGHURL := "https://github.com/mengnanquq/mnagent/releases/latest"
+	if cfg.ghProxy != "" {
+		testGHURL = applyGHProxy(testGHURL, cfg.ghProxy)
+	}
+	ghStart := time.Now()
+	ghClient := &http.Client{
+		Timeout: 3 * time.Second,
+		CheckRedirect: func(*http.Request, []*http.Request) error {
+			return http.ErrUseLastResponse
+		},
+	}
+	ghResp, ghErr := ghClient.Head(testGHURL)
+	ghDur := time.Since(ghStart)
+	if ghErr == nil {
+		ghResp.Body.Close()
+		fmt.Printf("  • Release 源: 🟢 访问正常 (耗时 %v, HTTP %s)\n", ghDur.Round(time.Millisecond), ghResp.Status)
+	} else {
+		fmt.Printf("  • Release 源: 🟡 访问受限 (%v，建议配置 --gh-proxy 加速)\n", ghErr)
+	}
+
+	// 7. 接入凭据状态
+	fmt.Println("----------------------------------------------------------------")
 	if cfg.tokens != nil {
 		if tok, err := cfg.tokens.get(); err == nil && tok != "" {
 			masked := tok
 			if len(masked) > 8 {
 				masked = masked[:4] + "...." + masked[len(masked)-4:]
 			}
-			fmt.Printf("  • 接入凭据: 🟢 已加载 (来自 %s: %s)\n", cfg.tokens.from, masked)
+			fmt.Printf("  • 接入凭据:   🟢 已加载 (来自 %s: %s)\n", cfg.tokens.from, masked)
 		} else {
-			fmt.Printf("  • 接入凭据: 🟡 令牌读取失败 (来源 %s: %v)\n", cfg.tokens.from, err)
+			fmt.Printf("  • 接入凭据:   🟡 令牌读取失败 (来源 %s: %v)\n", cfg.tokens.from, err)
 		}
 	} else {
-		fmt.Println("  • 接入凭据: ⚪️ 未配置令牌 (非守护进程运行模式)")
+		fmt.Println("  • 接入凭据:   ⚪️ 未配置令牌 (非守护进程运行模式)")
 	}
 
-	// 6. 机器人端点连通性测试
+	// 8. 机器人端点连通性测试
 	if cfg.botURL != "" {
 		fmt.Println("----------------------------------------------------------------")
 		fmt.Printf("  • 机器人连接: 正在测试出站握手 -> %s\n", cfg.botURL)

@@ -196,10 +196,64 @@ func (dm *DependencyManager) detectLocalMiaospeed(ctx context.Context, binPath s
 }
 
 // fetchLatestTag 查询 GitHub 仓库的最新 Release tag。
-// 注意：api.github.com 直连，不拼接 ghProxy。
+// 优先使用免 API 配额的 HEAD 重定向方式（Location: /tag/<version>），
+// 若失败或在自定义 apiBaseURL 环境下，则平滑回退至通过 API 获取（支持代理）。
 func (dm *DependencyManager) fetchLatestTag(ctx context.Context, repo string) (string, error) {
-	url := fmt.Sprintf("%s/repos/%s/releases/latest", strings.TrimRight(dm.apiBaseURL, "/"), repo)
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
+	if dm.apiBaseURL != "" && dm.apiBaseURL != "https://api.github.com" {
+		return dm.fetchLatestTagByAPI(ctx, repo)
+	}
+
+	tag, headErr := dm.fetchLatestTagByRedirect(ctx, repo)
+	if headErr == nil && tag != "" {
+		return tag, nil
+	}
+
+	return dm.fetchLatestTagByAPI(ctx, repo)
+}
+
+// fetchLatestTagByRedirect 通过 HEAD 请求 releases/latest 读取 302 重定向里的 tag，完全免除 API 配额。
+func (dm *DependencyManager) fetchLatestTagByRedirect(ctx context.Context, repo string) (string, error) {
+	// 直连 GitHub releases/latest 探测 302 重定向，避免将普通网页请求发送给仅支持资产下载的反向代理
+	targetURL := fmt.Sprintf("https://github.com/%s/releases/latest", repo)
+	req, err := http.NewRequestWithContext(ctx, http.MethodHead, targetURL, nil)
+	if err != nil {
+		return "", err
+	}
+	req.Header.Set("User-Agent", "mnagent")
+
+	client := &http.Client{
+		Timeout: 10 * time.Second,
+		CheckRedirect: func(*http.Request, []*http.Request) error {
+			return http.ErrUseLastResponse
+		},
+	}
+	resp, err := client.Do(req)
+	if err != nil {
+		return "", err
+	}
+	defer resp.Body.Close()
+
+	loc := resp.Header.Get("Location")
+	if loc != "" {
+		parts := strings.Split(strings.TrimRight(loc, "/"), "/")
+		if len(parts) > 0 {
+			tag := parts[len(parts)-1]
+			if _, ok := parseVersion(tag); ok {
+				return tag, nil
+			}
+		}
+	}
+	return "", errors.New("无法从重定向获取版本 tag")
+}
+
+// fetchLatestTagByAPI 通过 GitHub API 获取最新发布 tag（支持 ghProxy 代理）。
+func (dm *DependencyManager) fetchLatestTagByAPI(ctx context.Context, repo string) (string, error) {
+	rawURL := fmt.Sprintf("%s/repos/%s/releases/latest", strings.TrimRight(dm.apiBaseURL, "/"), repo)
+	targetURL := rawURL
+	if dm.ghProxy != "" && (dm.apiBaseURL == "" || dm.apiBaseURL == "https://api.github.com") {
+		targetURL = applyGHProxy(rawURL, dm.ghProxy)
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, targetURL, nil)
 	if err != nil {
 		return "", err
 	}
