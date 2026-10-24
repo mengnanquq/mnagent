@@ -392,11 +392,14 @@ func buildMiaospeedTestPlan(job Job, nodeCount ...int) miaospeedTestPlan {
 			slaveRequestMatrixEntry{Type: "TEST_SCRIPT", Params: "youtube"},
 			slaveRequestMatrixEntry{Type: "TEST_SCRIPT", Params: "netflix"},
 			slaveRequestMatrixEntry{Type: "TEST_SCRIPT", Params: "disney"},
+			slaveRequestMatrixEntry{Type: "TEST_SCRIPT", Params: "primevideo"},
+			slaveRequestMatrixEntry{Type: "TEST_SCRIPT", Params: "spotify"},
 			slaveRequestMatrixEntry{Type: "TEST_SCRIPT", Params: "openai"},
 			slaveRequestMatrixEntry{Type: "TEST_SCRIPT", Params: "claude"},
-			slaveRequestMatrixEntry{Type: "TEST_SCRIPT", Params: "spotify"},
-			slaveRequestMatrixEntry{Type: "TEST_SCRIPT", Params: "tiktok"},
+			slaveRequestMatrixEntry{Type: "TEST_SCRIPT", Params: "gemini"},
+			slaveRequestMatrixEntry{Type: "TEST_SCRIPT", Params: "bahamut"},
 			slaveRequestMatrixEntry{Type: "TEST_SCRIPT", Params: "bilibili"},
+			slaveRequestMatrixEntry{Type: "TEST_SCRIPT", Params: "tiktok"},
 			slaveRequestMatrixEntry{Type: "TEST_SCRIPT", Params: "wikipedia"},
 		)
 		return miaospeedTestPlan{
@@ -462,7 +465,7 @@ func buildMiaospeedTestPlan(job Job, nodeCount ...int) miaospeedTestPlan {
 		matrixSet[matrixOutboundGeoIP] = true
 		plan.Scripts = buildDefaultMediaScripts()
 		for _, platform := range []string{
-			"youtube", "netflix", "disney", "openai", "claude", "spotify", "tiktok", "bilibili", "wikipedia",
+			"youtube", "netflix", "disney", "primevideo", "spotify", "openai", "claude", "gemini", "bahamut", "bilibili", "tiktok", "wikipedia",
 		} {
 			plan.Matrices = append(plan.Matrices, slaveRequestMatrixEntry{Type: "TEST_SCRIPT", Params: platform})
 		}

@@ -119,7 +119,7 @@ func (r MiaospeedReport) Format() string {
 
 	if len(r.MediaUnlock) > 0 {
 		b.WriteString("流媒体解锁:\n")
-		for _, name := range []string{"YouTube", "Netflix", "Disney+", "OpenAI", "Claude", "Spotify", "TikTok", "Bilibili", "维基百科"} {
+		for _, name := range []string{"YouTube", "Netflix", "Disney+", "Prime Video", "Spotify", "OpenAI", "Claude", "Google Gemini", "动画疯", "Bilibili", "TikTok", "维基百科"} {
 			if status, ok := r.MediaUnlock[name]; ok && status != "" {
 				b.WriteString(fmt.Sprintf("  - %s: %s\n", name, status))
 			}
