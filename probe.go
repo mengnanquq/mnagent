@@ -28,6 +28,8 @@ const (
 	kindTCPing = "tcping"
 	kindHTTP   = "http"
 	kindDNS    = "dns"
+	kindUnlock = "unlock" // 流媒体与 AI 解锁检测 (基于 RegionRestrictionCheck)
+	kindMedia  = "media"  // 别名
 )
 
 // 探针默认参数与上限。
@@ -111,7 +113,7 @@ func probeKind(job Job) string {
 // isProbeKind 判断是否为进程内探针（非 nexttrace）。
 func isProbeKind(kind string) bool {
 	switch kind {
-	case kindPing, kindTCPing, kindHTTP, kindDNS:
+	case kindPing, kindTCPing, kindHTTP, kindDNS, kindUnlock, kindMedia:
 		return true
 	default:
 		return false
@@ -165,6 +167,9 @@ func runProbe(ctx context.Context, job Job, allowPrivate bool) (probeOutcome, er
 	case kindDNS:
 		report, err := dnsProbe(ctx, job)
 		return marshalProbe(report, err)
+	case kindUnlock, kindMedia:
+		report, err := checkRegionRestrictions(ctx)
+		return marshalProbe(report, err)
 	default:
 		return probeOutcome{}, fmt.Errorf("未知探针类型：%s", job.Kind)
 	}
@@ -194,6 +199,15 @@ func summarizeProbe(report any) string {
 		return fmt.Sprintf("http %s：%d，总耗时 %.0f ms", r.URL, r.Status, r.TotalMs)
 	case DNSReport:
 		return fmt.Sprintf("dns %s %s：%d 条记录", r.Host, r.Type, len(r.Records))
+	case UnlockReport:
+		var unlocked, total int
+		for _, it := range r.Items {
+			total++
+			if it.Status == "Yes" || it.Status == "Originals Only" {
+				unlocked++
+			}
+		}
+		return fmt.Sprintf("流媒体与 AI 解锁测试完成：%d/%d 项支持 (耗时 %.1f s)", unlocked, total, r.Duration/1000)
 	default:
 		return ""
 	}
