@@ -653,7 +653,10 @@ func executeMiaospeedTask(ctx context.Context, wsURL, origin, token string, node
 		if resp.Progress != nil && resp.Progress.Record != nil {
 			progressSlots = append(progressSlots, *resp.Progress.Record)
 			if onProgress != nil {
-				curIdx := resp.Progress.Index + 1
+				curIdx := len(progressSlots)
+				if curIdx > len(nodes) {
+					curIdx = len(nodes)
+				}
 				curName := ""
 				var curNode *MiaospeedNode
 				if resp.Progress.Index >= 0 && resp.Progress.Index < len(nodes) {
@@ -663,12 +666,17 @@ func executeMiaospeedTask(ctx context.Context, wsURL, origin, token string, node
 				singleReport := parseSingleSlot(*resp.Progress.Record, curNode, plan)
 				nodeRawBytes, _ := json.Marshal(singleReport)
 
+				stageDesc := "测速中"
+				if plan.ModeDescription != "" {
+					stageDesc = plan.ModeDescription + "中"
+				}
+
 				onProgress(Progress{
 					ID:       job.ID,
 					Current:  curIdx,
 					Total:    len(nodes),
 					NodeName: curName,
-					Stage:    "全量测速中",
+					Stage:    stageDesc,
 					NodeData: nodeRawBytes,
 				})
 			}
