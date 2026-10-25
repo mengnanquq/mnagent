@@ -1,19 +1,51 @@
 # mnagent
 
-运行在拨测主机上的轻量 agent，配合 Telegram 机器人 [@mengnan_dedicated_bot](https://t.me/mengnan_dedicated_bot) 使用：
-机器人下发探测任务，agent 在本机执行并回传结果（`/nexttrace`、`/ping`、`/tcping`、`/http`、`/dns`、`/miaospeed`）。
+运行在拨测与探测主机上的轻量化高性能 agent，配合 Telegram 机器人 [@mengnan_dedicated_bot](https://t.me/mengnan_dedicated_bot) 使用：
+机器人统一调度下发探测与测速任务，agent 在本机高效执行并回传结构化结果，支持路由追踪（`nexttrace`）、网络探针（`ping`、`tcping`、`http`、`dns`）以及代理节点/订阅测速（`miaospeed`）。
 
-它主动向机器人**长轮询**领取任务、在本机执行 `nexttrace`、再回传结果。因此：
+它主动向机器人**长轮询**领取任务、在本机执行并回传。因此：
 
-- 主机**不需要公网地址**，不需要端口映射、反向隧道或 VPN——只要能在出站方向访问机器人；
-- 接入只需一个令牌（`--token`）：机器人按令牌识别是哪台主机，主机上不需要填名称；
-- 主机**不需要 SSH**，不需要开放任何入站端口，机器人也不持有登录这些主机的密钥；
-- 机器人下发的只是**已校验的追踪参数**（目标/跳数/端口/协议），执行哪个程序由本机的 `-nexttrace` 参数决定，网络侧无法指定命令；
-- 长轮询本身就是心跳，机器人的主机选择键盘可以显示 🟢 在线 / ⚪️ 离线。
+- 主机**不需要公网地址**，不需要端口映射、反向隧道或 VPN——只要主机出站能访问机器人即可；
+- 接入只需一个令牌（`--token` 或 `--token-file`）：机器人按令牌识别是哪台主机，主机端不需要（也不接受）名称；
+- 主机**不需要开通 SSH**，不需要开放任何入站端口，网络侧完全无监听暴露；
+- 机器人下发的只是**已校验的标准化参数**，网络侧无法指定任意系统命令，执行路径由本机配置严格白名单锁定；
+- **独立保活心跳**与长轮询协同运作，在大批量节点长时间测速时依然保持心跳刷新，机器人端时刻精准呈现 🟢 在线 / ⚪️ 离线。
 
-## 安装
+---
 
-推荐用机器人生成的**一键命令**（管理员在 Telegram 里执行 `/host add 香港节点`，机器人会根据平台需要提供接入命令）：
+## 核心特性一览
+
+- ⚡ **多元化网络探针体系**
+  - **路由追踪（NextTrace）**：调用 NextTrace 快速探测链路骨干网、AS 信息及逐跳延迟，支持原生 `-j` JSON 结构化解析与自动平滑降级兼容；
+  - **ICMP Ping**：原生进程内实现，支持非特权 UDP Ping 与特权 Raw Socket（`CAP_NET_RAW`）双模切换，输出精确丢包率、延迟极值与抖动（Jitter），支持秒级取消；
+  - **TCPing**：高精度 TCP 握手延迟测试，**支持目标地址自动安全剥离端口**（如 `example.com:443` 或 IPv6 `[::1]:80`），直连解析后 IP 消除 DNS 抖动干扰；
+  - **HTTP/HTTPS 拨测**：深度采集响应状态码、服务端 IP、协议版本（HTTP/1.1、HTTP/2 等）、TLS 握手版本与证书有效期/颁发者，细分 **DNS 解析、TCP 建连、TLS 握手、TTFB 首字节与总耗时**，并采集关键响应标头；
+  - **DNS 诊断**：调用系统底层解析器批量查询 A/AAAA/CNAME/MX/NS/TXT/PTR 记录，精确度量域名解析耗时。
+- 🚀 **强大的 MiaoSpeed 代理测速引擎**
+  - **全协议兼容**：支持单节点 URI（`ss://`, `vmess://`, `trojan://`, `vless://`, `hysteria2://`, `tuic://`, `anytls://`）、订阅链接（HTTP/HTTPS）、Clash YAML、Sing-box JSON、Base64 订阅文本与多行节点清单；
+  - **8 大测试模式**：代理连通性、链路拓扑、多线程测速、单线程测速、延迟测试、UDP NAT 类型探测、**流媒体专测（`media`）** 以及全量综合测试；
+  - **12 大主流流媒体与 AI 服务原生解锁检测**：全面基于开源 [RegionRestrictionCheck](https://github.com/oneclickvirt/RegionRestrictionCheck) 规则重构，支持 YouTube (Premium 防送中)、Netflix (双片源原生/自制剧识别)、Disney+、Amazon Prime Video、Spotify、TikTok、巴哈姆特动画疯、哔哩哔哩 (港澳台/台限定)、OpenAI (ChatGPT)、Claude、Google Gemini 与维基百科可编辑性检测；
+  - **逐节点实时流式上报**：测试进行中，每个切片/节点完成即通过 `/progress` 接口向机器人流式上报结构化数据，前端可实时更新动态卡片，并支持机器人在响应中下发 `cancel: true` 随时中止长任务；
+  - **版本自检与动态超时**：自动探测底层 miaospeed 引擎版本并附带于测试报告中；根据订阅节点规模动态计算安全超时，避免长任务被提前截断。
+- 🛡️ **企业级安全防御（防范 SSRF 与云元数据盗取）**
+  - 探针任务默认严格拦截回环地址（127.0.0.0/8）、内网私有网段（10/8, 172.16/12, 192.168/16）、运营商级 NAT（100.64.0.0/10）、链路本地地址及云服务商实例元数据地址（`169.254.169.254` 等），杜绝利用拨测探针窃取主机与云实例凭证；
+  - 针对自建内网探测需求，提供 `--allow-private-probes` 参数按需放行。
+- 🔄 **全生命周期多依赖协同自更新与远程升级**
+  - **依赖统一管理（DependencyManager）**：自动探测、定期比对与静默更新外部依赖工具（`nexttrace` 与 `miaospeed`），自动清除终端彩色转义字符（ANSI）；
+  - **远程一键升级（Update Job）**：支持从机器人后台一键下发远程升级指令，自动更新依赖与 mnagent 二进制，向机器人回传成功结果后平滑重启，**完整继承原有启动参数与服务配置**；
+  - **全链路代理加速**：安装脚本、agent 自身及所有外部依赖的更新均深度支持 `--gh-proxy`（如 `https://gh-proxy.com/`）加速代理。
+- 💻 **全平台支持与轻量化构建**
+  - 支持 Linux（systemd/init）、OpenWrt（procd 原生守护，sysupgrade 升级固件保留配置）、Windows（原生 SCM 系统服务，无需任何三方包装器）与 macOS；
+  - 支持 amd64、arm64、armv7l、mips/mipsle、riscv64 等主流硬件架构，支持 UPX 极限压缩，低内存设备无负担运行。
+- 🩺 **强大的本地诊断看板与 CLI 工具**
+  - 提供 `-diag` 一键体检看板，秒级检测主机信息、NextTrace / MiaoSpeed 状态、ICMP Raw Socket 权限、系统 DNS、IPv6 双栈连通性、GitHub 代理源及机器人连通性；
+  - 提供 `-probe-target` 与 `-probe-kind` 命令行快捷探针测试，无需机器人端即可在终端本地复现网络测试。
+
+---
+
+## 快速安装
+
+推荐使用机器人自动生成的**一键安装命令**（管理员在 Telegram 机器人中执行 `/host add <名称>` 即可获取对应系统预填好的安装命令）：
 
 ### Linux / OpenWrt / macOS
 
@@ -26,265 +58,354 @@
 ### Windows (PowerShell 管理员)
 
 ```powershell
-irm https://raw.githubusercontent.com/mengnanquq/mnagent/main/install.ps1 | iex -args -Bot "https://<机器人地址>/agent" -Token "<令牌>"
-```
-
-命令里只有令牌：**令牌即身份**，机器人按令牌识别是哪台主机，主机上不需要（也不接受）名称参数。
-
-Linux 下脚本会自动：从本仓库的 Release 下载预编译二进制（`mnagent_<os>_<arch>`，没有 Release 或网络受限时回退到源码编译）、创建专用用户、写入令牌（0600）、写入 systemd 单元并**重启服务**（因此重复执行即为升级，会真正换上并运行新版本）。原始套接字能力由单元的 `AmbientCapabilities` 提供，并给服务准备了可写的主目录（`StateDirectory=mnagent`）供 `nexttrace` 存放配置与 IP 库。
-
-> 如果主机访问 GitHub 受限：
-> 1. 可以使用 GitHub 加速代理（如 `https://gh-proxy.com/`），在安装命令中添加 `--gh-proxy https://gh-proxy.com/`（Windows 为 `-GhProxy "https://gh-proxy.com/"`，或设置环境变量 `GH_PROXY=https://gh-proxy.com/`）。安装脚本以及后续 agent 后台自更新都会自动通过代理下载 Release 资产与源码包。
-> 2. 或者把安装脚本与对应架构的二进制放到内网镜像，用 `--binary https://内网镜像/mnagent_linux_amd64` 指定二进制即可；机器人侧也可用 `MNAGENT_INSTALL_URL` 把生成的脚本地址指向你的镜像。
-
-### 发布
-
-项目配置了自动构建与发布流水线（GitHub Actions）：
-- **推送 `main` 分支**：自动根据最新版本计算并递增生成语义化版本号（如 `v0.3.5-main.<时间戳>.<sha>`），自动编译全平台二进制并发布 Release。
-- **打 `v*` 标签**：推送指定 Tag（例如 `git tag v0.4.0 && git push origin v0.4.0`）会自动发布正式 Release。
-
-构建产物涵盖 Linux、Windows（amd64/arm64）、macOS (darwin) 各主流系统及 amd64/arm64/arm/mips/mipsle/riscv64 等架构。
-
-### OpenWrt
-
-同一串命令即可在 OpenWrt 上安装，脚本会自动按 procd 方式部署：
-
-- 二进制装到 `/usr/bin/mnagent`，服务脚本写到 `/etc/init.d/mnagent`（`USE_PROCD=1`，`respawn` 自动重启，日志进 syslog）；
-- **以 root 运行**：OpenWrt 上没有 `setcap` 与系统用户体系，而 `nexttrace` 需要 `CAP_NET_RAW`（服务脚本里也可通过 `--user` 指定其他用户，若你的系统支持）；
-- 不依赖 `curl`/`install`/`useradd`：分别回退到 `uclient-fetch`/`wget`、`cp+chmod`、BusyBox `adduser`；
-- 会把二进制与 `/etc/mnagent` 写进 `/etc/sysupgrade.conf`，固件升级后配置与脚本仍在；若服务未随升级恢复，重跑一次安装命令即可；
-- 支持的架构（静态二进制，musl 通用）：`armv7l`/`armv6l`/`armv5`（含 OpenWrt 常见路由）、`aarch64`、`x86_64`、`mips`/`mipsle`（大小端由 ELF 头自动识别）、`mips64`/`mips64le`、`riscv64`。
-
-常用排查：
-
-```sh
-logread -e mnagent              # 查看 agent 日志
-/etc/init.d/mnagent restart      # 重启服务
-opkg install nexttrace           # 若未安装 nexttrace（或使用 --nexttrace 指定路径）
-```
-
-### 支持的探测类型
-
-| `kind` | 说明 | 依赖 |
-| --- | --- | --- |
-| `trace`（默认） | 执行 `nexttrace -j` 路由追踪 | 需要 nexttrace 可执行文件（自动检测与更新） |
-| `miaospeed` / `speed` | 调用 [AirportR/miaospeed](https://github.com/AirportR/miaospeed) 执行代理节点或订阅测速（支持 7 种测试模式与 9 大流媒体/AI原生解锁检测） | 需要 miaospeed 可执行文件（自动检测与更新） |
-| `ping` | ICMP echo，输出丢包与延迟（min/avg/max/抖动） | 无（进程内实现；非特权 ping socket 或 CAP_NET_RAW） |
-| `tcping` | TCP 握手延迟 | 无 |
-| `http` | HTTP(S) 请求：状态码、服务端 IP、证书到期、DNS/连接/TLS/首字节分段耗时 | 无 |
-| `dns` | 用主机自身解析器查 A/AAAA/CNAME/MX/NS/TXT/PTR | 无 |
-
-#### MiaoSpeed 测速支持的测试模式
-
-`miaospeed` 任务支持单节点链接（`ss://`, `vmess://`, `trojan://`, `vless://`, `hysteria2://`, `tuic://`, `anytls://`）、订阅地址（`http(s)://`）或代理配置文件内容（Clash YAML、Sing-box JSON、Base64 订阅文本与多行节点列表）。任务的 `query` 或 `protocol` 可指定以下测试类型（未指定默认执行**全量测试**，也支持以英文逗号拼接多个模式）：
-
-1. **代理连通性测试**（`connectivity` / `conn` / `连通性`）：测试代理可用性、HTTP 响应状态码及 RTT 延迟；
-2. **拓扑测试**（`topology` / `topo` / `拓扑`）：测试链路入站/出站国家地区、落地 IP 及 DNS 劫持检测；
-3. **多线程测速**（`multithread` / `multi` / `多线程` / `下载`）：多连接并行下行带宽测速（可通过 `count` 自定义线程数，默认 4）；
-4. **单线程测速**（`singlethread` / `single` / `单线程`）：单连接下行带宽测速；
-5. **延迟测试**（`latency` / `ping` / `延迟`）：精确测量 TCP RTT 延迟、HTTP Ping 延迟、丢包率与抖动；
-6. **UDP 类型测试**（`udp` / `nat` / `stun` / `udp类型`）：通过 STUN 服务器探测代理节点的 UDP 支持与 NAT 类型（FullCone / Symmetric / RestrictedCone 等）；
-7. **全量测试**（`full` / `all` / `全量`）：综合执行连通性、拓扑、延迟、UDP 类型、下行测速，并默认包含九大主流流媒体与 AI 服务原生解锁检测。
-
-#### 九大主流流媒体与 AI 服务原生解锁检测
-
-全量模式或解锁测试中，agent 内置了对 9 大主流流媒体与 AI 服务的原生解锁检测脚本：
-
-- **流媒体服务**：
-  - **YouTube**：检测 YouTube 区域解锁及 YouTube Premium 支持；
-  - **Netflix**：精确识别是原生完整解锁、仅支持自制剧（Originals Only）还是不可用；
-  - **Disney+**：检测 Disney+ 区域可用性；
-  - **Spotify**：检测落地节点区域注册及音源播放限制；
-  - **TikTok**：检测 TikTok 落地国家/区域访问支持；
-  - **Bilibili**：检测港澳台及东南亚限定影视番剧的解锁情况；
-- **AI 与知识服务**：
-  - **OpenAI (ChatGPT)**：检测 ChatGPT 网页端/API 访问权限与国家封锁状态；
-  - **Claude**：检测 Anthropic Claude 的区域支持与可用性；
-  - **Wikipedia**：检测维基百科访问连通性与重定向状态。
-
-探测结果在回传后将以结构化格式直接呈现在 Telegram 机器人测速报告中。
-
-### 自动更新与多依赖管理
-
-mnagent **默认开启自动更新与多依赖协同管理**：每 6 小时（带随机抖动，避免所有主机同时请求）检查一次版本，发现新版本即无缝静默升级并重启服务。
-
-除了 mnagent 自身外，agent 还内置了统一的外部依赖生命周期管理器（`DependencyManager`），全面支持外部依赖 **nexttrace** 与 **miaospeed** 的版本检测与自动更新：
-
-1. **版本自动探测**：自动识别本地已安装的 `nexttrace` 与 `miaospeed` 实际版本，精准剔除 ANSI 终端彩色转义字符；
-2. **多依赖远程比对**：定期请求 GitHub Releases 检索官方最新稳定版本；
-3. **静默并行升级**：
-   - 当检测到新版依赖时，后台会自动下载对应系统与架构的发布资产、解压并安全替换二进制；
-   - 通过配置 `--gh-proxy` 加速代理后，agent 自身及所有外部依赖的更新下载均会自动走加速代理；
-4. **手动运维管理**：
-   - 检查状态：`mnagent -check-update` 会同时输出 mnagent 自身及 `nexttrace`、`miaospeed` 的当前版本与最新版本状态；
-   - 立即升级：`mnagent -apply-update latest` 会先并行拉取更新过期的外部依赖，再更新 mnagent 自身并平滑重启服务；
-   - 跳过版本：`mnagent -skip-update v0.1.8`（跳过某个版本 24 小时，避免问题版本反复触发更新）。
-
-### 脚本参数
-
-| 参数 | 默认值 | 说明 |
-| --- | --- | --- |
-| `--bot` / `--token` | 必填 | 由 `/host add` 生成的命令已带全 |
-| `--token-file` | `/etc/mnagent/token` | 令牌文件路径；省略 `--token` 时要求该文件已存在 |
-| `--version` | `latest` | 安装的 Release 标签；也可用 `--from-source` 从源码编译 |
-| `--binary <path\|url>` | — | 使用自备的 mnagent（内网镜像时很有用） |
-| `--nexttrace` | `nexttrace` | nexttrace 路径或名称 |
-| `--miaospeed` | `miaospeed` | miaospeed 路径或名称 |
-| `--miaospeed-version` | `latest` | 安装的 miaospeed 版本，默认 `latest`（取官方最新 Release） |
-| `--user` / `--prefix` | 默认 `root` / `/usr/local/bin`（OpenWrt 为 `/usr/bin`） | 运行用户与安装目录 |
-| `--auto-update` | `yes` | 是否启用自动更新（支持 `yes`/`no`） |
-| `--no-auto-update` | — | 关闭自动更新（等同于 `--auto-update no`） |
-| `--update-interval` | `6h` | 自动更新检查间隔（如 `2h`、`12h`） |
-| `--gh-proxy <url>` | — | GitHub 代理前缀（如 `https://gh-proxy.com/`），安装脚本与 agent 自更新均生效 |
-| `--install-nexttrace` | `yes` | 缺少 nexttrace 时是否按官方规范自动安装（默认开启） |
-| `--no-install-nexttrace` | — | 缺少 nexttrace 时不自动安装（等同于 `--install-nexttrace no`） |
-| `--install-miaospeed` | `yes` | 缺少 miaospeed 时是否从 Release 自动下载安装（默认开启） |
-| `--no-install-miaospeed` | — | 缺少 miaospeed 时不自动安装（等同于 `--install-miaospeed no`） |
-| `--uninstall` | — | 卸载服务与二进制（保留令牌与用户） |
-
-### 手动安装
-
-不使用脚本时（例如没有 systemd 的系统），可自行编译并按 `deploy/mnagent.service`
-的写法启动：
-
-```bash
-go build -trimpath -ldflags "-s -w -X main.version=$(git describe --tags --always)" -o mnagent .
-install -m 0755 mnagent /usr/local/bin/mnagent
-install -d -m 0750 /etc/mnagent
-printf '%s\n' '<令牌>' > /etc/mnagent/token && chmod 0600 /etc/mnagent/token
-# 手工非 root 运行时需要自己给 nexttrace 授权（用 systemd 且以 root 运行或由单元的 AmbientCapabilities 提供）
-setcap cap_net_raw,cap_net_admin+eip "$(command -v nexttrace)"
-```
-
-### Windows
-
-mnagent 原生支持 Windows（x86_64 及 ARM64），并内置 Windows 服务控制管理器（SCM）协议，无需任何第三方包装器即可作为原生系统服务后台运行。
-
-在 PowerShell 中执行以下**一键安装命令**（自动提权并注册开机自启系统服务）：
-
-```powershell
-irm https://raw.githubusercontent.com/mengnanquq/mnagent/main/install.ps1 | iex -args -Bot "https://<机器人地址>/agent" -Token "<令牌>"
+& ([scriptblock]::Create((irm https://raw.githubusercontent.com/mengnanquq/mnagent/main/install.ps1))) -Bot "https://<机器人地址>/agent" -Token "<令牌>"
 ```
 
 若网络访问 GitHub 受限，可附加 `-GhProxy` 参数使用加速代理：
 
 ```powershell
-irm https://gh-proxy.com/https://raw.githubusercontent.com/mengnanquq/mnagent/main/install.ps1 | iex -args -Bot "https://<机器人地址>/agent" -Token "<令牌>" -GhProxy "https://gh-proxy.com/"
+& ([scriptblock]::Create((irm https://gh-proxy.com/https://raw.githubusercontent.com/mengnanquq/mnagent/main/install.ps1))) -Bot "https://<机器人地址>/agent" -Token "<令牌>" -GhProxy "https://gh-proxy.com/"
 ```
 
-脚本将自动执行以下操作：
-1. 检测操作系统架构（amd64 或 arm64），从 Release 下载对应版本的 `mnagent_windows_<arch>.exe`；
-2. 自动检测并下载配置 `nexttrace.exe` 与 `miaospeed.exe`（自动解压 Windows zip 包）；
-3. 写入接入令牌至安装目录（默认 `C:\Program Files\mnagent`）；
-4. 注册名为 `mnagent` 的原生 Windows 系统服务，配置崩溃后自动重启与开机自启，并立即启动服务。
+> **网络受限环境说明：**
+> 1. **GitHub 代理加速**：在安装命令中附加 `--gh-proxy https://gh-proxy.com/`（Windows 安装命令附加 `-GhProxy "https://gh-proxy.com/"`，或设置环境变量 `GH_PROXY=https://gh-proxy.com/`）。安装脚本、agent 自身自更新以及后台下载 nexttrace 与 miaospeed 均会自动经由加速代理下载。
+> 2. **自建内网镜像**：可将预编译二进制放在内网镜像源，通过 `--binary https://内网镜像/mnagent_linux_amd64` 指定；机器人侧也可通过 `MNAGENT_INSTALL_URL` 环境变量将生成命令中的脚本地址直接指向私有源。
 
-#### `install.ps1` 脚本参数
+### 自动化构建发布
 
-| 参数 | 默认值 | 说明 |
-| --- | --- | --- |
-| `-Bot` | 必填 | 机器人 agent 接口地址（如 `https://mnbot.example.org/agent`） |
-| `-Token` | 必填（或 `-TokenFile`） | 接入令牌 |
-| `-TokenFile` | — | 现存令牌文件路径 |
-| `-InstallDir` | `C:\Program Files\mnagent` | agent 及依赖的安装目录 |
-| `-Version` | `latest` | mnagent 安装版本（默认最新 Release） |
-| `-GhProxy` | — | GitHub 代理加速前缀（如 `https://gh-proxy.com/`） |
-| `-AutoUpdate` / `-NoAutoUpdate` | 开启 | 是否开启后台定时自动更新（默认开启） |
-| `-UpdateInterval` | `6h` | 自动检查更新的周期（默认 6 小时） |
-| `-InstallNextTrace` / `-NoInstallNextTrace` | 开启 | 是否自动下载并安装 Windows 版 `nexttrace.exe` |
-| `-InstallMiaoSpeed` / `-NoInstallMiaoSpeed` | 开启 | 是否自动下载并安装 Windows 版 `miaospeed.exe` |
-| `-MiaoSpeedVersion` | `latest` | 指定 miaospeed 版本（默认最新 Release） |
-| `-Uninstall` | — | 停止并卸载 Windows 服务，清理服务注册 |
+本仓库已深度集成 GitHub Actions 流水线：
+- **推送 `main` 分支**：自动根据最新版本生成语义化预发布版本号（如 `v0.4.0-main.<时间戳>.<sha>`），自动交叉编译各平台二进制、压缩打包并发布 Release；
+- **打 `v*` 标签**：推送指定 Tag（例如 `git tag v0.5.0 && git push origin v0.5.0`）会自动发布正式 Release。
+
+---
+
+## 平台特定说明
+
+### Linux (systemd)
+
+脚本会自动完成：
+1. 从 Release 下载匹配系统与架构的二进制文件（若网络受限或无对应产物则自动回退至源码编译）；
+2. 自动检测并安装缺失的 `nexttrace` 与 `miaospeed` 核心依赖；
+3. 创建专用系统用户、持久化接入令牌至 `/etc/mnagent/token`（权限 `0600`）；
+4. 注册并启动 `/etc/systemd/system/mnagent.service` 系统服务，原始套接字权限由单元的 `AmbientCapabilities=CAP_NET_RAW CAP_NET_ADMIN` 提供，准备专用数据目录（`StateDirectory=mnagent`）；
+5. 重复执行安装脚本即为安全更新升级，会自动平滑重启服务。
 
 常用管理命令：
-- **查看服务状态**：`Get-Service mnagent`
-- **停止服务**：`Stop-Service mnagent` （或 `net stop mnagent`）
-- **启动服务**：`Start-Service mnagent` （或 `net start mnagent`）
-- **重启服务**：`Restart-Service mnagent`
-- **一键卸载服务**：`powershell .\install.ps1 -Uninstall`
-
-若需在前台控制台直接调试运行：
-```powershell
-.\mnagent.exe -bot https://mnbot.example.org/agent -token "<令牌>" -auto-update
+```sh
+systemctl status mnagent         # 查看服务运行状态
+journalctl -u mnagent -f         # 实时追踪日志输出
+systemctl restart mnagent        # 重启服务
 ```
 
-## 机器人侧配置
+### OpenWrt (procd)
 
-主机与令牌都由机器人管理（存放在状态数据库里，不再使用配置文件）：
+同一条 Linux 安装命令可无缝在 OpenWrt 路由器与网关上执行，脚本会自动识别并采用 procd 原生守护进程方案：
+- 二进制安装至 `/usr/bin/mnagent`，服务管理脚本写入 `/etc/init.d/mnagent`（`USE_PROCD=1`，开启 `respawn` 异常退出自动拉起，日志自动进 syslog）；
+- **以 root 身份运行**：OpenWrt 通常没有非特权系统用户及 `setcap` 支持，而网络底层探测与 `nexttrace` 需要 `CAP_NET_RAW` 权限；
+- 兼容极简环境：不依赖 `curl`、`install`、`useradd` 等工具，自动安全回退至 `uclient-fetch`/`wget`、`cp+chmod` 与 BusyBox 指令；
+- **固件升级保留**：自动将二进制文件与 `/etc/mnagent` 目录写入 `/etc/sysupgrade.conf`，系统升级固件后配置与程序依然保留；
+- 广泛适配主流路由器架构：`armv7l`/`armv6l`/`armv5`、`aarch64`、`x86_64`、`mips`/`mipsle`（ELF 头自动识别大小端）、`mips64`/`mips64le` 与 `riscv64`。
 
-- `/host add <名称> [备注]`：添加主机并生成一键接入命令
-- `/host list`：查看主机与 🟢/⚪️ 在线状态
-- `/host show <名称>`：重新显示接入命令
-- `/host rotate <名称>`：轮换令牌（旧令牌立即失效，主机需重新接入）
-- `/host remove <名称>`：删除主机
+常用排查命令：
+```sh
+logread -e mnagent              # 查看 agent 运行日志
+/etc/init.d/mnagent restart      # 重启服务
+/etc/init.d/mnagent status       # 查看运行状态
+```
 
-名称只用于展示与 `/nexttrace @名称` 选择；令牌等同该主机的任务接受权，泄露时用 `rotate` 轮换。
+### Windows (原生 SCM 系统服务)
 
-## 参数
+mnagent 原生支持 Windows（x86_64 及 ARM64），并内置 Windows 服务控制管理器（SCM）协议，无需依赖 NSSM 或 WinSW 等三方包装器：
+- 脚本自动检测系统架构并下载 `mnagent_windows_<arch>.exe`；
+- 自动检测、下载并解压 Windows 版 `nexttrace.exe` 与 `miaospeed.exe` 压缩包并放置于安装目录；
+- 写入令牌至安装目录（默认 `C:\Program Files\mnagent`）；
+- 注册名为 `mnagent` 的原生 Windows 服务，设置异常崩溃自动重启并随系统开机自启。
+
+常用管理命令（在管理员权限 PowerShell 中执行）：
+```powershell
+Get-Service mnagent             # 查看服务状态
+Restart-Service mnagent         # 重启服务
+Stop-Service mnagent            # 停止服务
+Start-Service mnagent           # 启动服务
+powershell .\install.ps1 -Uninstall # 一键卸载清理服务
+```
+
+在前台控制台直接启动调试：
+```powershell
+.\mnagent.exe -bot https://<机器人地址>/agent -token "<令牌>" -auto-update
+```
+
+---
+
+## 支持的探测与测试类型
+
+| 类型 (`kind`) | 说明 | 核心依赖与实现方式 | 详细输出与关键指标 |
+| :--- | :--- | :--- | :--- |
+| **`trace`**（默认） | 链路路由追踪 | 需要 `nexttrace`（自动探测、下载与更新） | 沿途逐跳 IP、所属 AS 机构、物理地理位置、单跳延迟与链路丢包 |
+| **`miaospeed`** / **`speed`** | 节点或订阅测速 | 需要 `miaospeed`（自动探测、下载与更新） | 8 种测试模式，12 大主流流媒体与 AI 原生解锁，下行带宽、RTT 延迟、UDP NAT 类型 |
+| **`ping`** | ICMP Echo 延迟与丢包探测 | 进程内原生实现（无外部依赖，特权/非特权双模） | 丢包率（%）、最小/平均/最大延迟（ms）、网络抖动（Jitter）、逐次尝试结果 |
+| **`tcping`** | TCP 握手连通性与延迟探测 | 进程内原生实现（无外部依赖） | 支持目标自带端口自动拆分，输出握手延迟极值、平均 RTT、丢包率与抖动 |
+| **`http`** | HTTP/HTTPS 拨测与阶段耗时分析 | 进程内原生实现（无外部依赖） | 状态码、协议版本、TLS 版本、证书过期时间/颁发者、DNS/连接/TLS/TTFB 分段耗时、响应标头 |
+| **`dns`** | 底层域名解析诊断 | 进程内原生实现（无外部依赖） | 支持查询 A/AAAA/CNAME/MX/NS/TXT/PTR，解析总耗时与完整解析记录清单 |
+
+### 网络安全拦截（SSRF 与云元数据保护）
+
+为防止探测客户端被恶意下发目标针对内网或云基础设施发起攻击，mnagent 在进程内探针层内置了严格的安全校验：
+- **默认拦截范围**：
+  - 本地回环地址（`127.0.0.0/8`, `::1`）；
+  - 私有局域网网段（`10.0.0.0/8`, `172.16.0.0/12`, `192.168.0.0/16`）；
+  - 运营商级 NAT 网段（CGNAT `100.64.0.0/10`）；
+  - 链路本地与组播地址（`169.254.0.0/16`, `fe80::/10` 等）；
+  - **各大公有云实例元数据服务**（如 AWS / GCP / 阿里云 / 腾讯云常见的 `169.254.169.254` 等），有效防范云端凭证（IAM Role Token）失窃。
+- **内网环境放行**：若确有内网拨测需求，可在启动参数中添加 `--allow-private-probes` 放行私有 IP 探测。
+
+---
+
+## MiaoSpeed 测速引擎深度解析
+
+`miaospeed` 任务支持测试单个节点链接、订阅 URL 或完整的代理配置文件。任务的 `query` 或 `protocol` 参数支持指定以下测试模式（支持逗号或斜杠组合，未指定时默认执行**全量测试**）：
+
+### 8 大测试模式
+
+1. **代理连通性测试**（`connectivity` / `conn` / `连通性`）：快速测试代理链路可用性、HTTP 响应状态码及基础 RTT 延迟；
+2. **拓扑测试**（`topology` / `topo` / `拓扑`）：精准探测入站节点 IP、出站落地国家地区与 ISP 信息，检测 DNS 劫持；
+3. **多线程测速**（`multithread` / `multi` / `多线程` / `下载`）：通过并行多连接测定下行峰值带宽与平均速率（可通过 `count` 自定义线程数，默认 4）；
+4. **单线程测速**（`singlethread` / `single` / `单线程`）：测试单连接长连接下行速度，真实反映单流吞吐；
+5. **延迟测试**（`latency` / `ping` / `延迟`）：精确统计 TCP RTT 握手耗时、HTTP Ping 延迟、丢包率与网络抖动；
+6. **UDP 类型测试**（`udp` / `nat` / `stun` / `udp类型`）：通过专用 STUN 服务探测节点的 UDP 转发支持与 NAT 类型（FullCone / Symmetric / RestrictedCone 等）；
+7. **流媒体专测**（`media` / `unlock` / `流媒体`）：**仅测试基础出站拓扑并完整跑满 12 大流媒体与 AI 解锁脚本**，极速反馈，不跑下载测速，极其节省服务器流量；
+8. **全量测试**（`full` / `all` / `全量`）：综合执行连通性、拓扑、延迟、UDP 类型、带宽测速，并默认执行 12 大主流流媒体与 AI 服务解锁检测。
+
+### 12 大主流流媒体与 AI 服务原生解锁检测
+
+基于开源项目 [RegionRestrictionCheck](https://github.com/oneclickvirt/RegionRestrictionCheck) 深度重构，在每一个代理节点建立的网络连接隧道中运行独立轻量 JavaScript 沙箱：
+
+| 服务分类 | 平台 / 服务 | 解锁探测与判定规则 |
+| :--- | :--- | :--- |
+| **主流流媒体** | **YouTube** | 探测 YouTube Premium 支持情况，精准识别并拦截 `www.google.cn` 送中状态，输出支持地区代码 |
+| | **Netflix** | 双片源探测机制，精准区分原生完整解锁（附带区域代码）、仅支持自制剧（Originals Only）或不可用 |
+| | **Disney+** | 探测区域服务可用性，根据重定向路径精确提取支持国家地区代码 |
+| | **Amazon Prime Video** | 探测区域访问限制（`isServiceRestricted`），识别所属 Territory 区域 |
+| | **Spotify** | 探测账号注册 API 连通性，识别落地国家是否已开放注册 |
+| | **TikTok** | 探测落地国家/区域访问支持，精准解析返回的 `region` 地区属性 |
+| | **巴哈姆特动画疯** | 设备鉴权与播放 Token 获取，精准识别台湾地区（TW）限定动画播放支持 |
+| | **哔哩哔哩 (Bilibili)** | 探测港澳台限定番剧与台湾地区独播剧集解锁状态，精确区分仅大陆/港澳台/台湾支持 |
+| **AI 与知识服务** | **OpenAI (ChatGPT)** | 探测网页端与 API 合规端点，精准识别地区受限（Unsupported Country）与数据中心 VPN 封锁 |
+| | **Claude** | 探测 Anthropic Claude 登录端点，识别区域不可用（`app-unavailable-in-region`）状态 |
+| | **Google Gemini** | 探测 Gemini 核心接口，提取可用国家代码与服务开通状态 |
+| | **维基百科 (Wikipedia)** | 探测开放代理与 IP 封禁状态，检测该节点出口 IP 是否具备维基百科自由编辑权限 |
+
+- **前置高速 Geo 探测**：优先经由 Cloudflare trace 双栈端点获取出口 IP，并智能推导落地国家地区；
+- **逐节点实时流式上报**：每个节点测试完成瞬间，立即将该节点的结构化结果（延迟、丢包、上下行速率、各流媒体状态、出口信息）通过 `/progress` 接口推送给机器人，避免大订阅等待过久；
+- **长任务中途秒级取消**：长轮询支持接收 `cancel` 指令，且在进度推送返回中携带 `cancel: true` 时瞬时中止后序节点测试并回收资源。
+
+---
+
+## 双队列并发调度与保活心跳架构
+
+mnagent 内部采用高效的并发调度架构，兼顾任务处理性能与网络稳定性：
+
+```
+                    ┌────────────────────────────────────────────────────────┐
+                    │               Telegram Bot / Backend                   │
+                    └────────────────────────────────────────────────────────┘
+                                ▲                     ▲            ▲
+                      /jobs 轮询 │           /heartbeat│    /results│ /progress
+                                │                     │            │ (流式上报)
+                    ┌───────────┴─────────────────────┴────────────┴────────┐
+                    │                        mnagent                        │
+                    │                                                       │
+                    │  [独立心跳协程] ──每 20 秒──> 保活心跳 (防长任务误判离线)   │
+                    │                                                       │
+                    │  [长轮询主调度] ──收到任务──────────────────────────────┐ │
+                    │                                                       │ │
+                    │       ┌───────────────────┐                           │ │
+                    │       │   JobTracker 追踪  │ <──秒级取消 (cancel 指令)     │ │
+                    │       └───────────────────┘                           │ │
+                    │                 │                                     │ │
+                    │        任务类型分类判定                                 │ │
+                    │        ╱                ╲                             │ │
+                    │  重任务 (Heavy)       轻任务 (Light)                   │ │
+                    │       │                        │                      │ │
+                    │  [串行队列 heavyQueue]    [并发协程池 lightSem]          │ │
+                    │  • NextTrace 路由追踪     • ICMP Ping 探针             │ │
+                    │  • MiaoSpeed 代理测速     • TCPing 握手探针            │ │
+                    │  • Remote Upgrade 升级    • HTTP 拨测探针              │ │
+                    │                           • DNS 诊断探针               │ │
+                    │  (避免带宽争抢测速失真)      (默认 8 并发，秒级响应)      │ │
+                    └───────────────────────────────────────────────────────┘
+```
+
+1. **重任务串行队列（`heavyQueue`）**：NextTrace 路由追踪、MiaoSpeed 节点测速与远程升级任务投入专用串行队列，严格保证单节点下网络带宽不被多任务争抢，确保测速与链路追踪结果精准可靠；
+2. **轻任务高并发池（`lightSem`）**：Ping、TCPing、HTTP 与 DNS 探针由轻任务协程池并发处理（默认上限 8），主轮询循环永不挂起阻塞；
+3. **独立保活心跳协程**：每 20 秒独立向 `/heartbeat` 发送轻量脉冲，无论重任务执行耗时多长，机器人后台的主机在线状态始终常青；
+4. **任务追踪与取消（JobTracker）**：支持外部取消正在执行或排队中的任务，瞬时断开网络连接或关闭子进程。
+
+---
+
+## 依赖管理与自动更新
+
+mnagent 内置了全套外部依赖生命周期管理器（`DependencyManager`），协同管理自身与核心依赖组件：
+
+1. **版本自动探测**：自动识别本地系统已安装的 `nexttrace` 与 `miaospeed` 实际版本，精准过滤 ANSI 彩色字符；
+2. **静默并行升级**：
+   - 自动更新循环（默认每 6 小时触发）自动检查 GitHub Releases；
+   - 发现新版时，后台自动并行拉取对应系统与架构的发布资产、安全校验、解压并原子替换可执行文件；
+3. **远程升级任务（Remote Upgrade）**：
+   - 机器人可直接下发 `update` 或 `upgrade` 任务；
+   - agent 接收到任务后，优先更新过期的外部依赖，再下载替换自身，并向机器人回传带有版本变化与依赖升级明细的成功报告；
+   - 回传完成后平滑重启服务，**自动继承并保持现有的全部服务参数与配置**；
+4. **本地 CLI 运维管理**：
+   - **检查更新状态**：`mnagent -check-update` 输出 agent 及依赖的当前版本与最新版本状态矩阵；
+   - **立即执行升级**：`mnagent -apply-update latest`（或指定具体版本号如 `v0.4.0`），自动完成依赖更新与自身升级并平滑重启；
+   - **临时跳过版本**：`mnagent -skip-update v0.4.1`（24 小时内不再提醒或自动更新该版本）。
+
+---
+
+## 命令行参数一览
 
 | 参数 | 默认值 | 说明 |
-| --- | --- | --- |
-| `-bot` | 必填 | 机器人 agent 端点基地址，如 `https://mnbot.example.org/agent` |
-| `-token` | — | 直接给出令牌（不推荐：会出现在进程列表里） |
-| `-token-file` | Linux 默认为 `/etc/mnagent/token`<br>Windows 默认为 `%ProgramData%\mnagent\token` | 令牌文件路径；每次请求都重新读取，**轮换令牌无需重启** |
-| `-nexttrace` | `nexttrace` | nexttrace 可执行文件路径或 PATH 中的名称 |
-| `-miaospeed` | `miaospeed` | miaospeed 可执行文件路径或 PATH 中的名称 |
-| `-min-backoff` / `-max-backoff` | `1s` / `1m` | 轮询失败后的重试退避区间（带抖动） |
-| `-poll-timeout` | `40s` | 单次长轮询的客户端超时（机器人侧最多保持 20 秒） |
-| `-auto-update` | `false` | 是否开启后台定期自动更新（通过 `install.sh` / `install.ps1` 安装时默认开启，协同更新依赖） |
-| `-update-interval` | `6h` | 自动更新检查间隔 |
-| `-gh-proxy` | — | GitHub 代理前缀（如 `https://gh-proxy.com/`，环境变量 `GH_PROXY` / `MNAGENT_GH_PROXY` 同效） |
-| `-check-update` | — | 单次检查 mnagent 及核心依赖（nexttrace、miaospeed）是否有新版本并输出状态矩阵，不执行下载 |
-| `-apply-update <tag\|latest>` | — | 手动下载并安装指定版本或最新版（自动并行更新过期依赖），安装完成后退出并重启服务 |
-| `-skip-update <tag>` | — | 跳过指定版本 24 小时（自动更新不再提示或应用） |
-| `-log-level` | `info` | `debug` / `info` / `warn` / `error` |
-| `-version` | — | 输出版本后退出 |
+| :--- | :--- | :--- |
+| **`-bot <url>`** | 必填 | 机器人 agent 接口基地址，如 `https://mnbot.example.org/agent` |
+| **`-token <value>`** | — | 直接传入接入令牌（不推荐：可能暴露在进程列表） |
+| **`-token-file <path>`** | Linux: `/etc/mnagent/token`<br>Windows: `%ProgramData%\mnagent\token` | 令牌文件路径；每次请求动态读取，**在线轮换令牌无需重启 agent** |
+| **`-nexttrace <path>`** | `nexttrace` | `nexttrace` 可执行文件路径或系统 PATH 中的名称 |
+| **`-miaospeed <path>`** | `miaospeed` | `miaospeed` 可执行文件路径或系统 PATH 中的名称 |
+| **`-auto-update`** | `false` | 是否开启后台定时自动更新（使用一键安装脚本安装时默认开启） |
+| **`-update-interval`** | `6h` | 自动检查更新的周期（支持 `2h`、`12h` 等格式） |
+| **`-gh-proxy <url>`** | — | GitHub 代理加速前缀（如 `https://gh-proxy.com/`，支持环境变量 `GH_PROXY` / `MNAGENT_GH_PROXY`） |
+| **`-allow-private-probes`**| `false` | 是否放行针对内网私有地址、回环及云元数据的探测（默认严格拦截防范 SSRF） |
+| **`-diag`** | — | **执行本地环境、系统依赖、套接字特权与网络连通性自检看板后退出** |
+| **`-probe-target <target>`**| — | **本地直接执行一次探针网络测试的目标（域名或 IP），快速自测** |
+| **`-probe-kind <kind>`** | `ping` | 本地自测探针类型：`ping` / `tcping` / `trace` / `http` / `dns` |
+| **`-diag-job <target>`** | — | 本地直接对指定单节点或订阅执行一次全量 MiaoSpeed 测速并打印输出 |
+| **`-check-update`** | — | 单次检查 agent 及所有外部依赖是否有更新并输出状态，不执行下载 |
+| **`-apply-update <tag\|latest>`** | — | 手动下载并安装指定版本或最新版（自动并行更新依赖）并平滑重启 |
+| **`-skip-update <tag>`** | — | 跳过指定版本 24 小时 |
+| **`-min-backoff` / `-max-backoff`** | `1s` / `1m` | 轮询失败后的重试退避区间（带随机抖动） |
+| **`-poll-timeout`** | `40s` | 单次长轮询客户端超时（服务端通常保持 20 秒） |
+| **`-log-level`** | `info` | 日志输出级别：`debug` / `info` / `warn` / `error` |
+| **`-version`** | — | 输出版本与平台架构信息后退出 |
 
-令牌也可以放在环境变量 `MNAGENT_TOKEN` 中（优先级：`-token` > `MNAGENT_TOKEN` > `-token-file`）。
+> 环境变量优先级：命令行参数 `-token` > 环境变量 `MNAGENT_TOKEN` > 参数 `-token-file`。
 
-## 协议
+---
 
-机器人侧提供两个端点（均在机器人的公网 HTTPS 服务上）：
+## 本地健康自检与 CLI 探针调试
+
+### 本地环境诊断看板 (`-diag`)
+
+执行 `mnagent -diag`，系统将在终端直观输出系统依赖与连通性看板：
+
+```text
+================================================================
+  ⚡ mnagent v0.4.0 本地环境与系统依赖健康自检 (System Diagnostics)
+================================================================
+  • 主机名称: hk-node-01
+  • 操作系统: linux (amd64, 4 CPUs)
+  • Go 版本:  go1.23.2
+----------------------------------------------------------------
+  • NextTrace: 🟢 正常 -> /usr/local/bin/nexttrace (NextTrace v1.3.1)
+  • MiaoSpeed: 🟢 正常 -> /usr/local/bin/miaospeed (version: v4.7.7)
+----------------------------------------------------------------
+  • ICMP 套接字: 🟢 原生套接字权限正常 (CAP_NET_RAW / root 具备)
+----------------------------------------------------------------
+  • 系统 DNS:    🟢 解析正常 (耗时 12ms, 目标 one.one.one.one -> 1.1.1.1)
+  • IPv6 双栈:   🟢 原生 IPv6 出站连通正常 (具备全局单播路由)
+----------------------------------------------------------------
+  • 更新加速源: 🟢 已启用加速代理 -> https://gh-proxy.com/
+  • Release 源: 🟢 访问正常 (耗时 320ms, HTTP 302 Found)
+----------------------------------------------------------------
+  • 接入凭据:   🟢 已加载 (来自 /etc/mnagent/token: ab12....ef56)
+----------------------------------------------------------------
+  • 机器人连接: 正在测试出站握手 -> https://bot.example.org/agent
+  • 连通结果:   🟢 握手成功 (耗时 86ms, HTTP 200 OK)
+================================================================
+```
+
+### 快捷本地探针测试 (`-probe-target`)
+
+无需借助 Telegram 机器人，运维人员可直接在主机终端调用内置探针测试目标：
+
+```sh
+# 快速执行一次 ICMP Ping 测试
+mnagent -probe-target 1.1.1.1 -probe-kind ping
+
+# 快速测试 TCP 端口握手延迟（支持自动拆分端口）
+mnagent -probe-target 1.1.1.1:443 -probe-kind tcping
+
+# 快速测试 HTTP 阶段耗时与标头采集
+mnagent -probe-target https://www.cloudflare.com -probe-kind http
+
+# 快速测试域名 DNS 解析
+mnagent -probe-target google.com -probe-kind dns
+
+# 快速执行一次 NextTrace 路由追踪
+mnagent -probe-target 8.8.8.8 -probe-kind trace
+```
+
+---
+
+## 通信协议规范
+
+agent 与服务端之间采用标准 HTTPS 通信协议，无需任何反向代理隧道：
 
 ```
 POST /agent/jobs                    Authorization: Bearer <token>
-   → 200 {"id":"…","target":"1.1.1.1","hops":20,"port":443,"protocol":"tcp","timeout_ms":120000}
-   → 204（本次没有任务，agent 立刻重新轮询）
+                                    X-Agent-Version: <version>
+   → 200 {"id":"...","kind":"trace","target":"1.1.1.1","hops":20,"port":443,"protocol":"tcp","timeout_ms":120000}
+   → 204 (无等待任务，agent 立即发起下一轮长轮询)
 
-POST /agent/results                 {"id":"…","output":"…","exit_code":0,"error":""}
-   → 204
+POST /agent/progress                Authorization: Bearer <token>
+                                    {"id":"...","current":3,"total":10,"node_name":"香港 01","stage":"测速中","node_data":{...}}
+   → 200 {"cancel":false}           (若返回 {"cancel":true}，agent 立即中止该任务)
+
+POST /agent/results                 Authorization: Bearer <token>
+                                    {"id":"...","kind":"trace","output":"...","exit_code":0,"data":{...}}
+   → 204 / 200
+
+POST /agent/heartbeat               Authorization: Bearer <token>
+   → 204 / 200 (独立协程周期保活)
 ```
 
-约定与限制：
+- **任务状态幂等**：回传结果携带唯一任务 ID，网络抖动失败时自动按指数退避重试 3 次；
+- **动态版本感知**：每次长轮询与请求均上报 `X-Agent-Version` 头，机器人侧在 `/host list` 中实时显示各主机当前运行版本；
+- **传输限额保护**：输出内容在 agent 侧做了 1 MiB 缓冲区安全封顶截断，防止海量输出撑爆内存。
 
-- 单台主机同一时刻只会被下发一个任务（机器人侧另有全局并发上限）；
-- 每次长轮询都会带上自身版本：`X-Agent-Version: <tag>` 头（同时保留 `User-Agent: mnagent/<tag>`），机器人用它把版本显示在 `/host list` 里，便于确认各主机是否已升级；
-- `timeout_ms` 会被 agent 夹到 5 秒 ~ 10 分钟之间；超时会杀掉命令，并把部分输出一起回传；
-- 输出在 agent 侧最多 1 MiB（超出丢弃），机器人侧再做一次上限与展示截断；
-- 结果按任务 ID 幂等，回传失败会退避重试 3 次；
-- 鉴权失败时 agent 用最大退避间隔重试并打印错误，不会退出。
+---
 
-## 安全模型
+## 安全防御架构
 
-| 面向 | 说明 |
-| --- | --- |
-| 入站暴露 | 无：agent 只发起出站 HTTPS 请求 |
-| 令牌 | 每台主机独立令牌，机器人侧用常量时间比较；令牌等同该主机的"任务接受权"，泄露后应立刻轮换 |
-| 命令执行 | agent 侧重新校验参数（目标字符集、跳数/端口区间、协议枚举），以 argv 方式直接 `exec`，**不经 shell**；`target` 不允许以 `-` 开头，因此无法注入额外参数 |
-| 程序路径 | 由本机 `-nexttrace` 决定，机器人无法指定要执行的程序 |
-| 权限 | systemd 平台：专用低权限用户运行，原始套接字能力由单元的 `AmbientCapabilities=CAP_NET_RAW CAP_NET_ADMIN` 携带并传给 nexttrace（无需 setcap，二进制被替换也不会失效）。OpenWrt：设备上没有 setcap/用户体系，服务以 root 运行（与 OpenWrt 上同类工具的做法一致），请把设备本身当作受信边界 |
-| TLS | 默认校验服务器证书；仅在本地联调时可对机器人使用 `http://` |
+| 安全维度 | 防御设计与实现策略 |
+| :--- | :--- |
+| **入站零暴露** | agent 仅发起出站 HTTPS 请求，不需要映射端口、开通公网 IP 或配置 SSH，从根源消除端口扫描威胁 |
+| **令牌与鉴权** | 每台主机具备独立随机令牌，服务端使用常量时间比对（Constant-Time Compare）防止时序攻击；支持在线热轮换 |
+| **命令防注入** | 机器人仅下发严格校验后的目标与参数；agent 重新执行白名单校验，使用 `exec.Command` 直接传递参数数组（`argv`），**完全不经过 Shell 解释器**，禁止目标携带 `-` 前缀参数注入 |
+| **SSRF 防护** | 默认封锁私有地址、回环地址、链路本地与云服务商实例元数据接口（`169.254.169.254` 等），防御内网横向穿透 |
+| **权限最小化** | systemd 模式下使用独立低权限专用系统用户，由单元的 `AmbientCapabilities` 精确授予 `CAP_NET_RAW` 与 `CAP_NET_ADMIN` 能力，无需对二进制设置 SUID/setcap |
+| **传输层加密** | 默认强制校验 TLS/HTTPS 证书，拒绝非安全明文传输 |
 
-## 故障排查
+---
 
-| 现象 | 排查方向 |
-| --- | --- |
-| 日志反复 `鉴权失败` | 令牌与机器人不一致或已被轮换：用 `/host rotate <名称>` 生成新命令重跑安装（或对比 `/etc/mnagent/token` / Windows 下 `%ProgramData%\mnagent\token`） |
-| 机器人显示 ⚪️ 离线 | agent 未运行、`-bot` 地址不可达（出站 443 被拦？）、或机器人的 `/agent/jobs` 未对外暴露 |
-| 任务报 `执行超时` | 主机到目标网络不通，或需要更长超时；也可在命令里减少跳数 |
-| 任务报 `执行失败（退出码 N）` | 手动在该主机执行同参数命令复现；注意 `nexttrace -j` 需要 v1.7+，旧版本 agent 会自动去掉 `-j` 重试 |
-| 任务报 `无法启动 nexttrace/miaospeed（…）` | 检查二进制路径与架构匹配；执行 `mnagent -check-update` 查看依赖状态，或使用 `mnagent -apply-update latest` 自动补全/更新依赖 |
-| Windows 下管理服务报拒绝访问 | Windows 服务注册与启停需要系统管理员权限，请右键选择“以管理员身份运行”PowerShell 窗口 |
-| Windows 下缺少依赖或报防病毒拦截 | 检查安装目录（默认 `C:\Program Files\mnagent`）下是否存在对应可执行文件；排查 Windows Defender 或杀毒软件拦截隔离日志并添加排除项 |
-| 任务报 `进程被信号终止（…）` | 二进制启动后被信号杀死，按提示的信号名排查（内存不足、平台不兼容等） |
-| 任务报权限/原始套接字错误 | 用 systemd 运行时应由单元的 `AmbientCapabilities` 提供 `CAP_NET_RAW`；检查单元是否被旧版本覆盖（重跑安装脚本会重新生成） |
-| 输出为空且无报错 | 检查 `nexttrace` 能否直接运行：`sudo -u mnagent $(command -v nexttrace) -j 1.1.1.1 \| head -3` |
+## 机器人管理指令与故障排查
+
+### Telegram 管理命令
+
+- `/host add <名称> [备注]`：添加主机并生成对应系统的一键安装命令；
+- `/host list`：查看全网主机列表、版本号与 🟢 在线 / ⚪️ 离线状态；
+- `/host show <名称>`：重新展示该主机的接入命令与配置详情；
+- `/host rotate <名称>`：立即轮换主机令牌（旧令牌瞬时失效，主机重新写入新令牌即可恢复）；
+- `/host remove <名称>`：解绑并移除指定主机。
+
+### 常见故障排查表
+
+| 现象 | 排查方向与解决方案 |
+| :--- | :--- |
+| **日志反复提示 `鉴权失败`** | 令牌与服务端不一致或已被轮换：执行 `/host rotate <名称>` 获取新接入命令，或直接编辑更新 `/etc/mnagent/token`（Windows 下编辑安装目录的 `token` 文件） |
+| **机器人显示 ⚪️ 离线** | 1. 运行 `mnagent -diag` 检查机器人端点连通性；<br>2. 检查主机出站 443 端口是否受限；<br>3. 检查系统服务是否处于活跃状态（`systemctl status mnagent` 或 `Get-Service mnagent`） |
+| **任务提示 `执行失败：无法启动 nexttrace/miaospeed`** | 1. 执行 `mnagent -diag` 排查依赖就绪情况；<br>2. 执行 `mnagent -check-update` 查看依赖状态；<br>3. 执行 `mnagent -apply-update latest` 自动补全并下载对应架构二进制 |
+| **任务报 `目标地址属于受限私有/元数据地址`** | 探针触发了 SSRF 防护规则；若确需拨测内网目标，请在启动参数中添加 `--allow-private-probes` |
+| **Windows 提示权限拒绝或服务无法注册** | Windows 注册系统服务需要管理员特权，请右键选择“以管理员身份运行”PowerShell 窗口重新执行安装命令 |
+| **Windows 缺少依赖或报安全软件拦截** | 检查安装目录（`C:\Program Files\mnagent`）是否存在对应文件；检查 Windows Defender 或杀毒软件告警日志，将安装目录加入排除信任项 |
+| **Ping 探针报权限错误或 Raw Socket 失败** | systemd 下确认单元包含 `AmbientCapabilities=CAP_NET_RAW CAP_NET_ADMIN`（重跑安装脚本即可自动修复）；OpenWrt 下确认以 root 运行 |
+| **测速过程进度不更新** | 节点网络异常或订阅节点无法连通；miaospeed 内部针对死节点已设置 3.5s 快速超时与零重试机制，若需中途退出可在 Telegram 机器人侧点击取消 |

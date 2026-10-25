@@ -7,7 +7,7 @@
     可选下载 nexttrace.exe 与 miaospeed.exe、写入令牌并注册为原生自启的 Windows 服务。
 
 .EXAMPLE
-    irm https://github.com/mengnanquq/mnagent/releases/latest/download/install.ps1 | iex -args -Bot "https://mnbot.example.org/agent" -Token "your_token"
+    & ([scriptblock]::Create((irm https://raw.githubusercontent.com/mengnanquq/mnagent/main/install.ps1))) -Bot "https://mnbot.example.org/agent" -Token "your_token"
 
 .EXAMPLE
     .\install.ps1 -Bot "https://mnbot.example.org/agent" -Token "your_token" -AutoUpdate
@@ -148,8 +148,13 @@ $arch = if ($is64) {
 }
 Write-Host "检测到系统平台: Windows ($arch)" -ForegroundColor Cyan
 
-# 5. 安全协议配置 (启用 TLS 1.2 / 1.3)
-[Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12 -bor [Net.SecurityProtocolType]::Tls13
+# 5. 安全协议配置 (启用 TLS 1.2，若环境支持则额外启用 TLS 1.3)
+[Net.ServicePointManager]::SecurityProtocol = [Net.ServicePointManager]::SecurityProtocol -bor [Net.SecurityProtocolType]::Tls12
+try {
+    [Net.ServicePointManager]::SecurityProtocol = [Net.ServicePointManager]::SecurityProtocol -bor [Enum]::Parse([Net.SecurityProtocolType], "Tls13")
+} catch {
+    # 忽略不支持 Tls13 的旧版 .NET Framework
+}
 
 function Get-ProxiedUrl([string]$rawUrl) {
     if ([string]::IsNullOrWhiteSpace($GhProxy)) { return $rawUrl }
