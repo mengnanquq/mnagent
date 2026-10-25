@@ -582,6 +582,38 @@ func TestParseSingleSlotFiltersDummyGeo(t *testing.T) {
 	}
 }
 
+// TestInferOutboundGeoFromMedia 验证当 OutboundGeo 为空时自动从流媒体测试结果中推导出落地地域。
+func TestInferOutboundGeoFromMedia(t *testing.T) {
+	node := &MiaospeedNode{
+		Name:     "专享-橘子-域名优选01",
+		Protocol: "vless",
+		Server:   "cf.blogluo.eu.org:443",
+	}
+	slot := slaveEntrySlot{
+		Matrices: []matrixResponse{
+			{Type: "TEST_SCRIPT", Payload: `{"Key":"youtube","Text":"支持 (JP)"}`},
+			{Type: "TEST_SCRIPT", Payload: `{"Key":"netflix","Text":"原生解锁"}`},
+			{Type: "TEST_SCRIPT", Payload: `{"Key":"gemini","Text":"支持 (JPN)"}`},
+		},
+	}
+	rep := parseSingleSlot(slot, node, miaospeedTestPlan{})
+	if rep.OutboundGeo != "日本 (JP)" {
+		t.Fatalf("期望从 YouTube/Gemini 推导出 '日本 (JP)'，实际: %q", rep.OutboundGeo)
+	}
+
+	// 验证带 IP 时的组合格式
+	slotWithIP := slaveEntrySlot{
+		Matrices: []matrixResponse{
+			{Type: matrixOutboundGeoIP, Payload: `{"MainStack":{"ip":"103.1.2.3"}}`},
+			{Type: "TEST_SCRIPT", Payload: `{"Key":"youtube","Text":"支持 (HK)"}`},
+		},
+	}
+	repWithIP := parseSingleSlot(slotWithIP, node, miaospeedTestPlan{})
+	if !strings.Contains(repWithIP.OutboundGeo, "103.1.2.3") || repWithIP.OutboundGeo == "---" {
+		t.Fatalf("期望包含解析或推导地域与 IP，实际: %q", repWithIP.OutboundGeo)
+	}
+}
+
 // TestExtractFieldRobustness 验证加固后的 extractField 对各种复杂 YAML 边界格式的处理能力。
 func TestExtractFieldRobustness(t *testing.T) {
 	cases := []struct {

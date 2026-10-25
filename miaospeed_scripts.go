@@ -7,11 +7,16 @@ import "strings"
 func buildDefaultMediaScripts() []slaveScript {
 	return []slaveScript{
 		{
-			// 快速双栈出口 IP 与 Geo 探测（优先 IPv4，纯 IPv6 快速回退，单次超时收敛为 1500ms）
+			// 快速双栈出口 IP 与 Geo 探测（优先带标准 SNI 的 Cloudflare 域名 trace，纯 IPv6 快速回退，单次超时收敛为 1500ms）
 			ID:   "ip_fast",
 			Type: "ip",
 			Content: `function ip_resolve() {
-    var urls = ["https://1.1.1.1/cdn-cgi/trace", "https://[2606:4700:4700::1111]/cdn-cgi/trace"];
+    var urls = [
+        "https://www.cloudflare.com/cdn-cgi/trace",
+        "https://1.1.1.1/cdn-cgi/trace",
+        "https://api.ipify.org",
+        "https://[2606:4700:4700::1111]/cdn-cgi/trace"
+    ];
     for (var i = 0; i < urls.length; i++) {
         var content = (get(fetch(urls[i], {
             headers: {'User-Agent': 'Mozilla/5.0'},
@@ -20,31 +25,54 @@ func buildDefaultMediaScripts() []slaveScript {
         }), "body") || "").trim();
         var m = content.match(/ip=(\S+)/);
         if (m && m[1]) return [m[1].trim()];
+        var mDirect = content.match(/^(\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3})$/);
+        if (mDirect && mDirect[1]) return [mDirect[1].trim()];
     }
     return [];
 }
 function handler(ip) {
     var isv6 = ip.indexOf(":") >= 0;
+    var country = "";
+    var countryCode = "";
+    var isp = "";
+    var org = "";
+    var city = "";
+    var region = "";
     var url = isv6 ? ("https://ipv6.ipleak.net/json/" + ip) : ("https://ipv4.ipleak.net/json/" + ip);
     var content = fetch(url, {
         headers: {'User-Agent': 'Mozilla/5.0'},
         retry: 1,
-        timeout: 2000
+        timeout: 1800
     });
     var ret = safeParse(get(content, "body"));
+    if (ret) {
+        country = get(ret, "country_name", "");
+        countryCode = get(ret, "country_code", "");
+        isp = get(ret, "isp_name", "");
+        org = get(ret, "organization", isp);
+        city = get(ret, "city_name", "");
+        region = get(ret, "region_name", "");
+    }
+    if (!country && !countryCode) {
+        var trace = fetch("https://www.cloudflare.com/cdn-cgi/trace", {
+            headers: {'User-Agent': 'Mozilla/5.0'},
+            timeout: 1500
+        });
+        var b = (get(trace, "body") || "").trim();
+        var mLoc = b.match(/loc=([A-Z]{2})/);
+        if (mLoc && mLoc[1]) {
+            countryCode = mLoc[1];
+            country = mLoc[1];
+        }
+    }
     return {
-        "ip": get(ret, "ip", ""),
-        "isp": get(ret, "isp_name", ""),
-        "organization": get(ret, "isp_name", ""),
-        "latitude": get(ret, "latitude", 0),
-        "longitude": get(ret, "longitude", 0),
-        "asn": parseInt(get(ret, "as_number", 0), 10) || 0,
-        "asn_organization": get(ret, "isp_name", ""),
-        "timezone": get(ret, "time_zone", ""),
-        "region": get(ret, "region_name", ""),
-        "city": get(ret, "city_name", ""),
-        "country": get(ret, "country_name", ""),
-        "country_code": get(ret, "country_code", "")
+        "ip": ip,
+        "isp": isp || org || countryCode || "Internet",
+        "organization": org || isp,
+        "region": region,
+        "city": city,
+        "country": country || countryCode,
+        "country_code": countryCode
     };
 }`,
 			TimeoutMillis: 2500,

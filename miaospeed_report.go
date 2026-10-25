@@ -7,6 +7,7 @@ import (
 	"io"
 	"net"
 	"net/http"
+	"regexp"
 	"strconv"
 	"strings"
 	"sync"
@@ -238,7 +239,107 @@ func parseSingleSlot(slot slaveEntrySlot, node *MiaospeedNode, plan miaospeedTes
 		}
 	}
 
+	// 出站 GeoIP 兜底 1: 出站 IP 有值但 OutboundGeo 为空时，通过本地 IP 归属地库查询
+	if rep.OutboundGeo == "" && rep.OutboundIP != "" && !isLocalHost(rep.OutboundIP) {
+		if _, resolvedGeo := queryIPGeo(rep.OutboundIP); resolvedGeo != "" && resolvedGeo != "本地直连" {
+			rep.OutboundGeo = resolvedGeo
+		}
+	}
+
+	// 出站 GeoIP 兜底 2: 流媒体专测或普通测速中 OutboundGeo 仍为空时，从流媒体成功探测出的地区代码中智能推导
+	if rep.OutboundGeo == "" && len(rep.MediaUnlock) > 0 {
+		if inferred := inferOutboundGeoFromMedia(rep.MediaUnlock); inferred != "" {
+			rep.OutboundGeo = inferred
+		}
+	}
+
+	if rep.OutboundIP != "" && rep.OutboundGeo != "" && !strings.Contains(rep.OutboundGeo, rep.OutboundIP) && !strings.Contains(rep.OutboundGeo, "(") {
+		rep.OutboundGeo = fmt.Sprintf("%s (%s)", rep.OutboundGeo, rep.OutboundIP)
+	}
+
 	return rep
+}
+
+// inferOutboundGeoFromMedia 从流媒体解锁测试状态文案中智能提取落地国家代码并转换为规范地域。
+func inferOutboundGeoFromMedia(media map[string]string) string {
+	if len(media) == 0 {
+		return ""
+	}
+
+	regionNames := map[string]string{
+		"HK":  "中国香港 (HK)",
+		"HKG": "中国香港 (HK)",
+		"TW":  "中国台湾 (TW)",
+		"TWN": "中国台湾 (TW)",
+		"JP":  "日本 (JP)",
+		"JPN": "日本 (JP)",
+		"SG":  "新加坡 (SG)",
+		"SGP": "新加坡 (SG)",
+		"US":  "美国 (US)",
+		"USA": "美国 (US)",
+		"KR":  "韩国 (KR)",
+		"KOR": "韩国 (KR)",
+		"GB":  "英国 (GB)",
+		"UK":  "英国 (GB)",
+		"DE":  "德国 (DE)",
+		"DEU": "德国 (DE)",
+		"NL":  "荷兰 (NL)",
+		"NLD": "荷兰 (NL)",
+		"FR":  "法国 (FR)",
+		"FRA": "法国 (FR)",
+		"CA":  "加拿大 (CA)",
+		"CAN": "加拿大 (CA)",
+		"AU":  "澳大利亚 (AU)",
+		"AUS": "澳大利亚 (AU)",
+		"MY":  "马来西亚 (MY)",
+		"MYS": "马来西亚 (MY)",
+		"TH":  "泰国 (TH)",
+		"THA": "泰国 (TH)",
+		"VN":  "越南 (VN)",
+		"VNM": "越南 (VN)",
+		"PH":  "菲律宾 (PH)",
+		"PHL": "菲律宾 (PH)",
+		"IN":  "印度 (IN)",
+		"IND": "印度 (IN)",
+		"CN":  "中国 (CN)",
+		"CHN": "中国 (CN)",
+	}
+
+	// 按可信度顺序探测：优先参考 YouTube, Netflix, Prime Video, Gemini, TikTok, 动画疯
+	priorityKeys := []string{"YouTube", "Netflix", "Prime Video", "Google Gemini", "TikTok", "动画疯"}
+	for _, key := range priorityKeys {
+		st, ok := media[key]
+		if !ok || st == "" {
+			continue
+		}
+		// 提取形如 (HK), (JP), (JPN), (United States) 的括号内容
+		re := regexp.MustCompile(`\(([^)]+)\)`)
+		matches := re.FindAllStringSubmatch(st, -1)
+		for _, m := range matches {
+			if len(m) > 1 {
+				code := strings.ToUpper(strings.TrimSpace(m[1]))
+				if name, exists := regionNames[code]; exists {
+					return name
+				}
+				if strings.Contains(strings.ToLower(code), "united states") {
+					return "美国 (US)"
+				}
+			}
+		}
+	}
+
+	// 次优先检查其他所有流媒体平台
+	for _, st := range media {
+		re := regexp.MustCompile(`\(([A-Za-z]{2,4})\)`)
+		if m := re.FindStringSubmatch(st); len(m) > 1 {
+			code := strings.ToUpper(m[1])
+			if name, exists := regionNames[code]; exists {
+				return name
+			}
+		}
+	}
+
+	return ""
 }
 
 // parseSlaveTaskResult 将 miaospeed 任务返回结果整理为 MiaospeedReport。

@@ -462,13 +462,9 @@ func buildMiaospeedTestPlan(job Job, nodeCount ...int) miaospeedTestPlan {
 		matrixSet[matrixHTTPPing] = true
 		matrixSet[matrixPacketLoss] = true
 		matrixSet[matrixHTTPCode] = true
+		matrixSet[matrixInboundGeoIP] = true
 		matrixSet[matrixOutboundGeoIP] = true
 		plan.Scripts = buildDefaultMediaScripts()
-		for _, platform := range []string{
-			"youtube", "netflix", "disney", "primevideo", "spotify", "openai", "claude", "gemini", "bahamut", "bilibili", "tiktok", "wikipedia",
-		} {
-			plan.Matrices = append(plan.Matrices, slaveRequestMatrixEntry{Type: "TEST_SCRIPT", Params: platform})
-		}
 	}
 	if modes[ModeSingleSpeed] {
 		descriptions = append(descriptions, "单线程测速")
@@ -505,6 +501,15 @@ func buildMiaospeedTestPlan(job Job, nodeCount ...int) miaospeedTestPlan {
 	for _, key := range orderedMatrixKeys {
 		if matrixSet[key] {
 			plan.Matrices = append(plan.Matrices, slaveRequestMatrixEntry{Type: key})
+		}
+	}
+
+	// 流媒体测试脚本追加在基础连通性与 GeoIP 探测之后，确保各节点优先获取出站 IP 与地理位置
+	if modes[ModeMedia] {
+		for _, platform := range []string{
+			"youtube", "netflix", "disney", "primevideo", "spotify", "openai", "claude", "gemini", "bahamut", "bilibili", "tiktok", "wikipedia",
+		} {
+			plan.Matrices = append(plan.Matrices, slaveRequestMatrixEntry{Type: "TEST_SCRIPT", Params: platform})
 		}
 	}
 	plan.ModeDescription = strings.Join(descriptions, " + ")
@@ -572,6 +577,9 @@ func executeMiaospeedTask(ctx context.Context, wsURL, origin, token string, node
 	if len(nodes) > 1 {
 		taskRetry = 0
 		taskTimeout = 3500
+		if len(plan.Scripts) > 5 {
+			taskTimeout = 4500
+		}
 	}
 
 	req := slaveRequest{
