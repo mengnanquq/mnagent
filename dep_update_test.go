@@ -160,6 +160,7 @@ func TestNexttraceAsset(t *testing.T) {
 		{"linux", "arm", "nexttrace_linux_armv7"},
 		{"darwin", "arm64", "nexttrace_darwin_arm64"},
 		{"windows", "amd64", "nexttrace_windows_amd64.exe"},
+		{"windows", "arm64", "nexttrace-tiny_windows_arm64.exe"},
 	}
 
 	for _, c := range cases {

@@ -101,6 +101,16 @@ func runWithContext(ctx context.Context, args []string) error {
 	if err != nil {
 		return err
 	}
+	if cfg.binary != "" {
+		if p, ok := resolveBinaryPath(cfg.binary); ok {
+			cleanupOldExecutables(p)
+		}
+	}
+	if cfg.miaospeedBinary != "" {
+		if p, ok := resolveBinaryPath(cfg.miaospeedBinary); ok {
+			cleanupOldExecutables(p)
+		}
+	}
 	log := slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: cfg.logLevel}))
 
 	// CLI 模式：检查/应用/跳过更新（不进入常驻循环）。
@@ -337,7 +347,14 @@ func newTokenSource(value, file string) (*tokenSource, error) {
 		path = defaultTokenFile()
 		if runtime.GOOS == "windows" {
 			if _, err := os.Stat(path); err != nil {
-				if _, err2 := os.Stat("token"); err2 == nil {
+				// 优先检查当前可执行文件同目录下的 token（解决 Windows 服务工作目录默认为 C:\Windows\System32 的问题）
+				if exe, errExe := os.Executable(); errExe == nil {
+					exeToken := filepath.Join(filepath.Dir(exe), "token")
+					if _, errToken := os.Stat(exeToken); errToken == nil {
+						path = exeToken
+					}
+				}
+				if _, err2 := os.Stat("token"); err2 == nil && path == defaultTokenFile() {
 					path = "token"
 				}
 			}
@@ -360,6 +377,8 @@ func (t *tokenSource) get() (string, error) {
 		return "", err
 	}
 	token := strings.TrimSpace(string(data))
+	token = strings.TrimPrefix(token, "\ufeff") // 清除 Windows 记事本/PowerShell 等工具保存时附带的 UTF-8 BOM
+	token = strings.TrimSpace(token)
 	if token == "" {
 		return "", fmt.Errorf("令牌文件 %s 内容为空", t.path)
 	}

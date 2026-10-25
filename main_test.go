@@ -80,3 +80,26 @@ func TestHandleProbeCLI(t *testing.T) {
 		t.Fatalf("handleProbeCLI 失败: %v", err)
 	}
 }
+
+func TestTokenSourceHandlesUTF8BOM(t *testing.T) {
+	tmpDir := t.TempDir()
+	tokFile := filepath.Join(tmpDir, "token")
+	// 模拟 Windows 记事本/PowerShell 保存带 UTF-8 BOM 的文件 (\xef\xbb\xbf)
+	content := []byte("\xef\xbb\xbfmy-secret-token-12345\r\n")
+	if err := os.WriteFile(tokFile, content, 0600); err != nil {
+		t.Fatalf("写入测试文件失败: %v", err)
+	}
+
+	ts, err := newTokenSource("", tokFile)
+	if err != nil {
+		t.Fatalf("newTokenSource 失败: %v", err)
+	}
+
+	val, err := ts.get()
+	if err != nil {
+		t.Fatalf("ts.get() 失败: %v", err)
+	}
+	if val != "my-secret-token-12345" {
+		t.Fatalf("未能正确剔除 UTF-8 BOM，期望 'my-secret-token-12345'，得到 %q (len=%d)", val, len(val))
+	}
+}

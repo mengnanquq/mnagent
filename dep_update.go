@@ -393,6 +393,9 @@ func nexttraceAsset(goos, goarch string) (string, error) {
 		return "", fmt.Errorf("nexttrace 不支持的架构：%s/%s", goos, goarch)
 	}
 
+	if osName == "windows" && archName == "arm64" {
+		return "nexttrace-tiny_windows_arm64.exe", nil
+	}
 	name := fmt.Sprintf("nexttrace_%s_%s", osName, archName)
 	if osName == "windows" {
 		name += ".exe"
@@ -531,7 +534,7 @@ func (dm *DependencyManager) UpdateMiaospeed(ctx context.Context, targetPath, ve
 	if tag == "" || tag == "latest" {
 		latest, err := dm.fetchLatestTag(ctx, "AirportR/miaospeed")
 		if err != nil {
-			tag = "4.7.7" // 兜底
+			tag = "4.7.8" // 兜底
 		} else {
 			tag = strings.TrimPrefix(latest, "v")
 		}
