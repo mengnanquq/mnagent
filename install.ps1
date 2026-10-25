@@ -311,20 +311,46 @@ if (-not [string]::IsNullOrWhiteSpace($GhProxy)) {
 $binPathValue = "`"$mnagentBin`" " + ($serviceArgs -join " ")
 
 if ($existingSvc) {
-    & sc.exe config mnagent binPath= $binPathValue start= auto | Out-Null
-    Write-Host "已更新现有 mnagent 服务配置。" -ForegroundColor Green
+    try {
+        Set-ItemProperty -Path "HKLM:\SYSTEM\CurrentControlSet\Services\mnagent" -Name "ImagePath" -Value $binPathValue -Force -ErrorAction Stop
+        Set-Service -Name "mnagent" -StartupType Automatic -DisplayName "mnagent Service" -ErrorAction SilentlyContinue
+        Write-Host "已更新现有 mnagent 服务配置。" -ForegroundColor Green
+    } catch {
+        & cmd.exe /c "sc.exe config mnagent binPath= `"$binPathValue`" start= auto" | Out-Null
+        Write-Host "已更新现有 mnagent 服务配置。" -ForegroundColor Green
+    }
 } else {
-    & sc.exe create mnagent binPath= $binPathValue start= auto DisplayName= "mnagent Service" | Out-Null
-    Write-Host "已创建 mnagent Windows 服务。" -ForegroundColor Green
+    try {
+        New-Service -Name "mnagent" -BinaryPathName $binPathValue -DisplayName "mnagent Service" -StartupType Automatic -ErrorAction Stop | Out-Null
+        Write-Host "已创建 mnagent Windows 服务。" -ForegroundColor Green
+    } catch {
+        # 回退使用 sc.exe create mnagent
+        $scRes = & cmd.exe /c "sc.exe create mnagent binPath= `"$binPathValue`" start= auto DisplayName= `"mnagent Service`""
+        if ($LASTEXITCODE -eq 0) {
+            Write-Host "已创建 mnagent Windows 服务。" -ForegroundColor Green
+        } else {
+            throw "注册 Windows 服务失败: $scRes"
+        }
+    }
 }
 
 # 设置描述与失败自动重启
-& sc.exe description mnagent "Telegram Bot 测速与网络追踪轻量 Agent" | Out-Null
-& sc.exe failure mnagent reset= 86400 actions= restart/5000/restart/5000/restart/5000 | Out-Null
+try {
+    Set-ItemProperty -Path "HKLM:\SYSTEM\CurrentControlSet\Services\mnagent" -Name "Description" -Value "Telegram Bot 测速与网络追踪轻量 Agent" -Force -ErrorAction SilentlyContinue
+} catch {
+    & cmd.exe /c "sc.exe description mnagent `"Telegram Bot 测速与网络追踪轻量 Agent`"" | Out-Null
+}
+try {
+    & cmd.exe /c "sc.exe failure mnagent reset= 86400 actions= restart/5000/restart/5000/restart/5000" | Out-Null
+} catch {}
 
 # 13. 启动服务
 Write-Host "正在启动 mnagent 服务..." -ForegroundColor Cyan
-& sc.exe start mnagent | Out-Null
+try {
+    Start-Service -Name "mnagent" -ErrorAction Stop
+} catch {
+    & sc.exe start mnagent | Out-Null
+}
 Start-Sleep -Seconds 2
 
 $svcStatus = Get-Service -Name "mnagent" -ErrorAction SilentlyContinue
