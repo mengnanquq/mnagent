@@ -216,7 +216,7 @@ func runMiaospeedJob(ctx context.Context, binary, ghProxy string, job Job, log l
 	// 1. 解析目标节点
 	allNodes, err := parseProxyTarget(ctx, job.Target, allowPriv)
 	if err != nil {
-		return "", nil, fmt.Errorf("解析测速目标失败: %w", err)
+		return "", nil, fmt.Errorf("解析测速目标失败: %s", redactProxyError(err.Error(), job.Target))
 	}
 
 	totalNodes := len(allNodes)

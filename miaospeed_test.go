@@ -1654,3 +1654,50 @@ func TestFetchSubscriptionSSRFBlocked(t *testing.T) {
 		t.Fatalf("allowPrivate=true 时不应被安全策略拦截: %v", err)
 	}
 }
+
+// TestRedactProxyError 验证 mnagent 中对 URL 与代理凭据的脱敏保护。
+func TestRedactProxyError(t *testing.T) {
+	subURL := "https://dy.vistart.art/sbciiol/db00ce5f01c4929eab88541fe3393657"
+	token := "db00ce5f01c4929eab88541fe3393657"
+
+	// 1. url.Error 格式
+	rawErr := fmt.Sprintf(`Get "%s": context deadline exceeded`, subURL)
+	redacted := redactProxyError(rawErr, subURL)
+	if strings.Contains(redacted, token) {
+		t.Fatalf("严重安全漏洞：暴露了敏感 Token: %s", redacted)
+	}
+	if !strings.Contains(redacted, "https://dy.vistart.art/***") {
+		t.Fatalf("期望脱敏为 https://dy.vistart.art/***，实际: %s", redacted)
+	}
+
+	// 2. 单节点 URI
+	vlessURI := "vless://00000000-0000-0000-0000-000000000000@1.2.3.4:443?type=tcp#Node"
+	vlessErr := "invalid config in " + vlessURI
+	redactedVless := redactProxyError(vlessErr, vlessURI)
+	if strings.Contains(redactedVless, "00000000-0000") {
+		t.Fatalf("暴露了 UUID: %s", redactedVless)
+	}
+	if !strings.Contains(redactedVless, "vless://***") {
+		t.Fatalf("期望脱敏为 vless://***，实际: %s", redactedVless)
+	}
+}
+
+// TestFetchSubscriptionRedactsURLOnError 验证拉取不存在或超时的订阅时，返回的错误中不含敏感路径与 Token。
+func TestFetchSubscriptionRedactsURLOnError(t *testing.T) {
+	subURL := "https://nonexistent-airport-sub-domain.xyz/sbciiol/db00ce5f01c4929eab88541fe3393657"
+	token := "db00ce5f01c4929eab88541fe3393657"
+
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+
+	_, err := fetchAndParseSubscription(ctx, subURL)
+	if err == nil {
+		t.Fatal("期望拉取失败")
+	}
+	if strings.Contains(err.Error(), token) {
+		t.Fatalf("严重安全漏洞：fetchAndParseSubscription 错误返回了敏感 Token %q，实际: %v", token, err)
+	}
+	if !strings.Contains(err.Error(), "https://nonexistent-airport-sub-domain.xyz/***") {
+		t.Fatalf("期望错误中包含脱敏域名 https://nonexistent-airport-sub-domain.xyz/***，实际: %v", err)
+	}
+}

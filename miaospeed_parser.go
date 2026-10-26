@@ -10,6 +10,7 @@ import (
 	"net"
 	"net/http"
 	"net/url"
+	"regexp"
 	"strconv"
 	"strings"
 	"time"
@@ -241,9 +242,108 @@ func fetchAndParseSubscription(ctx context.Context, subURL string, allowPrivate 
 	}
 
 	if lastErr != nil {
-		return nil, lastErr
+		return nil, errors.New(redactProxyError(lastErr.Error(), subURL))
 	}
 	return nil, errors.New("订阅中未找到有效代理节点")
+}
+
+var (
+	httpURLRegex  = regexp.MustCompile(`https?://[^\s"'<>\(\)]+`)
+	proxyURIRegex = regexp.MustCompile(`(?i)\b(?:vmess|vless|ss|ssr|trojan|hysteria2|hy2|hysteria|hy|tuic|anytls|clash)://[^\s"'<>\(\)]+`)
+)
+
+// redactURL 对 HTTP/HTTPS 订阅 URL 进行脱敏，保留 scheme 与 host（含非默认端口），
+// 将敏感的 path、query、userinfo 及 fragment 替换为 /***。
+func redactURL(rawURL string) string {
+	rawURL = strings.TrimSpace(rawURL)
+	if rawURL == "" {
+		return ""
+	}
+	u, err := url.Parse(rawURL)
+	if err != nil || u.Host == "" {
+		if idx := strings.Index(rawURL, "://"); idx != -1 {
+			scheme := rawURL[:idx]
+			return scheme + "://***"
+		}
+		return "***"
+	}
+	scheme := strings.ToLower(u.Scheme)
+	if scheme == "" {
+		scheme = "http"
+	}
+	hasSensitiveParts := (u.Path != "" && u.Path != "/") || u.RawQuery != "" || u.User != nil || u.Fragment != ""
+	if hasSensitiveParts {
+		return fmt.Sprintf("%s://%s/***", scheme, u.Host)
+	}
+	if strings.HasSuffix(rawURL, "/") {
+		return fmt.Sprintf("%s://%s/", scheme, u.Host)
+	}
+	return fmt.Sprintf("%s://%s", scheme, u.Host)
+}
+
+func trimTrailingPunct(raw string) (cleaned string, trailing string) {
+	cut := 0
+	for i := len(raw) - 1; i >= 0; i-- {
+		ch := raw[i]
+		if ch == ':' || ch == ',' || ch == '.' || ch == ';' || ch == ')' || ch == ']' || ch == '}' || ch == '?' || ch == '!' {
+			cut++
+		} else {
+			break
+		}
+	}
+	if cut > 0 {
+		return raw[:len(raw)-cut], raw[len(raw)-cut:]
+	}
+	return raw, ""
+}
+
+// redactProxyError 对测速目标解析与执行中的错误文本进行脱敏，防止泄露订阅 URL 或代理密钥凭据。
+func redactProxyError(errText string, targets ...string) string {
+	if strings.TrimSpace(errText) == "" {
+		return errText
+	}
+	result := errText
+	for _, target := range targets {
+		t := strings.TrimSpace(target)
+		if len(t) < 6 {
+			continue
+		}
+		if strings.HasPrefix(strings.ToLower(t), "http://") || strings.HasPrefix(strings.ToLower(t), "https://") {
+			redactedT := redactURL(t)
+			result = strings.ReplaceAll(result, t, redactedT)
+			if u, err := url.Parse(t); err == nil && u != nil {
+				cleanPath := strings.Trim(u.Path, "/")
+				if len(cleanPath) >= 8 && strings.Contains(result, cleanPath) {
+					result = strings.ReplaceAll(result, cleanPath, "***")
+				}
+				if u.RawQuery != "" && len(u.RawQuery) >= 8 && strings.Contains(result, u.RawQuery) {
+					result = strings.ReplaceAll(result, u.RawQuery, "***")
+				}
+			}
+		} else if strings.Contains(t, "://") {
+			schemeEnd := strings.Index(t, "://")
+			scheme := t[:schemeEnd]
+			result = strings.ReplaceAll(result, t, fmt.Sprintf("%s://***", scheme))
+		} else {
+			if strings.Contains(result, t) {
+				result = strings.ReplaceAll(result, t, "[代理配置内容已脱敏]")
+			}
+		}
+	}
+	result = httpURLRegex.ReplaceAllStringFunc(result, func(matched string) string {
+		cleaned, trailing := trimTrailingPunct(matched)
+		return redactURL(cleaned) + trailing
+	})
+	result = proxyURIRegex.ReplaceAllStringFunc(result, func(matched string) string {
+		cleaned, trailing := trimTrailingPunct(matched)
+		schemeEnd := strings.Index(cleaned, "://")
+		if schemeEnd != -1 {
+			scheme := cleaned[:schemeEnd]
+			return fmt.Sprintf("%s://***", scheme) + trailing
+		}
+		return "***" + trailing
+	})
+	return result
 }
 
 // parseClashYAMLProxies 从原生 Clash/Meta 配置文件中提取 proxies 节点。
