@@ -455,7 +455,8 @@ func TestFetchLatestTagRedirectAndFallback(t *testing.T) {
 	}))
 	defer redirectSrv.Close()
 
-	dm := newDependencyManager(redirectSrv.URL)
+	dm := newDependencyManager("")
+	dm.githubBaseURL = redirectSrv.URL
 	tag, err := dm.fetchLatestTagByRedirect(context.Background(), "nxtrace/NTrace-core")
 	if err != nil {
 		t.Fatalf("fetchLatestTagByRedirect 失败: %v", err)

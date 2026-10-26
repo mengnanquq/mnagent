@@ -60,12 +60,13 @@ func (s DependencyStatus) Summary() string {
 
 // DependencyManager 负责检测与更新外部依赖工具。
 type DependencyManager struct {
-	ghProxy    string
-	httpClient *http.Client
-	apiBaseURL string // 默认 "https://api.github.com"
-	cmdRunner  func(ctx context.Context, name string, args ...string) ([]byte, error)
-	goos       string
-	goarch     string
+	ghProxy       string
+	httpClient    *http.Client
+	apiBaseURL    string // 默认 "https://api.github.com"
+	githubBaseURL string // 默认 "https://github.com"
+	cmdRunner     func(ctx context.Context, name string, args ...string) ([]byte, error)
+	goos          string
+	goarch        string
 }
 
 // newDependencyManager 创建依赖管理器实例。
@@ -75,7 +76,8 @@ func newDependencyManager(ghProxy string) *DependencyManager {
 		httpClient: &http.Client{
 			Timeout: 20 * time.Second,
 		},
-		apiBaseURL: "https://api.github.com",
+		apiBaseURL:    "https://api.github.com",
+		githubBaseURL: "https://github.com",
 		cmdRunner: func(ctx context.Context, name string, args ...string) ([]byte, error) {
 			cmd := exec.CommandContext(ctx, name, args...)
 			return cmd.CombinedOutput()
@@ -214,7 +216,11 @@ func (dm *DependencyManager) fetchLatestTag(ctx context.Context, repo string) (s
 // fetchLatestTagByRedirect 通过 HEAD 请求 releases/latest 读取 302 重定向里的 tag，完全免除 API 配额。
 func (dm *DependencyManager) fetchLatestTagByRedirect(ctx context.Context, repo string) (string, error) {
 	// 直连 GitHub releases/latest 探测 302 重定向，避免将普通网页请求发送给仅支持资产下载的反向代理
-	targetURL := fmt.Sprintf("https://github.com/%s/releases/latest", repo)
+	baseURL := dm.githubBaseURL
+	if baseURL == "" {
+		baseURL = "https://github.com"
+	}
+	targetURL := fmt.Sprintf("%s/%s/releases/latest", strings.TrimRight(baseURL, "/"), repo)
 	req, err := http.NewRequestWithContext(ctx, http.MethodHead, targetURL, nil)
 	if err != nil {
 		return "", err
