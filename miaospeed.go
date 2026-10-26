@@ -194,7 +194,7 @@ func CalcMiaospeedTimeout(nodeCount int) time.Duration {
 }
 
 // runMiaospeedJob 执行一次 MiaoSpeed 测速任务：按需拉起进程 -> WebSocket 交互 -> 收集结果 -> 退出清理。
-func runMiaospeedJob(ctx context.Context, binary, ghProxy string, job Job, log logger, onProgress func(Progress)) (string, json.RawMessage, error) {
+func runMiaospeedJob(ctx context.Context, binary, ghProxy string, job Job, log logger, onProgress func(Progress), allowPrivate ...bool) (string, json.RawMessage, error) {
 	if binary == "" {
 		binary = "miaospeed"
 	}
@@ -212,8 +212,9 @@ func runMiaospeedJob(ctx context.Context, binary, ghProxy string, job Job, log l
 		}
 	}
 
+	allowPriv := len(allowPrivate) > 0 && allowPrivate[0]
 	// 1. 解析目标节点
-	allNodes, err := parseProxyTarget(ctx, job.Target)
+	allNodes, err := parseProxyTarget(ctx, job.Target, allowPriv)
 	if err != nil {
 		return "", nil, fmt.Errorf("解析测速目标失败: %w", err)
 	}

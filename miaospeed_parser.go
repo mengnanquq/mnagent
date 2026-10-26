@@ -26,7 +26,7 @@ type MiaospeedNode struct {
 }
 
 // parseProxyTarget 将任务 Target（单节点链接、订阅 URL 或代理配置文件内容）解析为节点列表。
-func parseProxyTarget(ctx context.Context, target string) ([]MiaospeedNode, error) {
+func parseProxyTarget(ctx context.Context, target string, allowPrivate ...bool) ([]MiaospeedNode, error) {
 	target = strings.TrimSpace(target)
 	if target == "" {
 		return nil, errors.New("目标地址不能为空")
@@ -34,7 +34,7 @@ func parseProxyTarget(ctx context.Context, target string) ([]MiaospeedNode, erro
 
 	// 1. 如果是以 http:// 或 https:// 开头的订阅地址，拉取并解析。
 	if strings.HasPrefix(target, "http://") || strings.HasPrefix(target, "https://") {
-		return fetchAndParseSubscription(ctx, target)
+		return fetchAndParseSubscription(ctx, target, allowPrivate...)
 	}
 
 	// 2. 解析本地/直接传入的配置文件或节点文本（支持 Clash YAML、Sing-box JSON、Base64 订阅、多行 URI 及单节点）。
@@ -160,11 +160,51 @@ func isPossibleBase64(s string) bool {
 	return true
 }
 
+// newSafeSubscriptionClient 构建具备 SSRF 防护的 HTTP 客户端，禁止向回环、内网私有与云元数据地址拉取订阅。
+func newSafeSubscriptionClient(allowPrivate bool) *http.Client {
+	dialer := &net.Dialer{Timeout: 8 * time.Second}
+	transport := &http.Transport{
+		Proxy: http.ProxyFromEnvironment,
+		DialContext: func(ctx context.Context, network, addr string) (net.Conn, error) {
+			host, port, err := net.SplitHostPort(addr)
+			if err != nil {
+				return nil, err
+			}
+			ips, err := net.DefaultResolver.LookupIP(ctx, "ip", host)
+			if err != nil {
+				return nil, err
+			}
+			if !allowPrivate {
+				for _, ip := range ips {
+					if isBlockedProbeIP(ip) {
+						return nil, fmt.Errorf("安全拦截：禁止向私有内网或云元数据地址请求订阅 (%s)", ip.String())
+					}
+				}
+			}
+			if len(ips) == 0 {
+				return nil, fmt.Errorf("无法解析目标主机: %s", host)
+			}
+			return dialer.DialContext(ctx, network, net.JoinHostPort(ips[0].String(), port))
+		},
+	}
+	return &http.Client{
+		Transport: transport,
+		Timeout:   15 * time.Second,
+		CheckRedirect: func(req *http.Request, via []*http.Request) error {
+			if len(via) >= 10 {
+				return errors.New("重定向次数过多")
+			}
+			return nil
+		},
+	}
+}
+
 // fetchAndParseSubscription 拉取订阅并提取节点，支持 Base64 URI 列表、Clash YAML 与 Sing-box JSON。
-func fetchAndParseSubscription(ctx context.Context, subURL string) ([]MiaospeedNode, error) {
+func fetchAndParseSubscription(ctx context.Context, subURL string, allowPrivate ...bool) ([]MiaospeedNode, error) {
+	allowPriv := len(allowPrivate) > 0 && allowPrivate[0]
 	// 依次尝试主流订阅客户端 User-Agent，优先获取原生 Clash-Meta 配置（miaospeed 基于 Clash-Meta 核心），避免手动逆向协议丢失 TLS/证书指纹与高级参数
 	userAgents := []string{"ClashMeta", "clash.meta", "Clash.Meta; mihomo", "mihomo", "v2rayng", "clash"}
-	client := &http.Client{Timeout: 15 * time.Second}
+	client := newSafeSubscriptionClient(allowPriv)
 
 	var lastErr error
 	for _, ua := range userAgents {

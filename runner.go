@@ -140,7 +140,7 @@ func (r *runner) runMiaospeed(ctx context.Context, job Job) runResult {
 	runCtx, cancel := context.WithTimeout(ctx, jobMiaospeedMaxTimeout)
 	defer cancel()
 
-	output, data, err := runMiaospeedJob(runCtx, r.miaospeedBinary, r.ghProxy, job, r.logger, r.onProgress)
+	output, data, err := runMiaospeedJob(runCtx, r.miaospeedBinary, r.ghProxy, job, r.logger, r.onProgress, r.allowPrivateProbes)
 	if err != nil {
 		return runResult{
 			Output:   output,

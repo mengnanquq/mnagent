@@ -209,7 +209,7 @@ func TestParseProxyTargetSubscription(t *testing.T) {
 	}))
 	defer server.Close()
 
-	nodes, err := parseProxyTarget(context.Background(), server.URL)
+	nodes, err := parseProxyTarget(context.Background(), server.URL, true)
 	if err != nil {
 		t.Fatalf("解析订阅失败: %v", err)
 	}
@@ -831,7 +831,7 @@ proxies:
 	}))
 	defer server.Close()
 
-	nodes, err := fetchAndParseSubscription(context.Background(), server.URL)
+	nodes, err := fetchAndParseSubscription(context.Background(), server.URL, true)
 	if err != nil {
 		t.Fatalf("拉取订阅失败: %v", err)
 	}
@@ -1629,5 +1629,28 @@ func TestWaitForPortReady(t *testing.T) {
 	cancel()
 	if err := waitForPortReady(ctx, "127.0.0.1:9", 100*time.Millisecond); err == nil {
 		t.Fatal("已取消上下文应报错")
+	}
+}
+
+// TestFetchSubscriptionSSRFBlocked 验证订阅拉取默认严格拦截内网/回环与云元数据地址，防范 SSRF。
+func TestFetchSubscriptionSSRFBlocked(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer srv.Close()
+
+	// 1. 默认 allowPrivate=false，请求回环地址必须被拦截
+	_, err := fetchAndParseSubscription(context.Background(), srv.URL)
+	if err == nil {
+		t.Fatal("默认情况下请求回环地址应该被 SSRF 策略拦截")
+	}
+	if !strings.Contains(err.Error(), "安全拦截") {
+		t.Fatalf("期望错误提示包含安全拦截，实际: %v", err)
+	}
+
+	// 2. 传入 allowPrivate=true 时放行
+	_, err = fetchAndParseSubscription(context.Background(), srv.URL, true)
+	if err != nil && strings.Contains(err.Error(), "安全拦截") {
+		t.Fatalf("allowPrivate=true 时不应被安全策略拦截: %v", err)
 	}
 }
