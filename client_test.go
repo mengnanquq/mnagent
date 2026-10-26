@@ -324,3 +324,29 @@ func TestClientSendProgress(t *testing.T) {
 		t.Fatal("期望 cancelled 为 true")
 	}
 }
+
+// TestClientPollLargePayload 验证支持接收并解析多兆级别（>1MB）的超大任务 Payload。
+func TestClientPollLargePayload(t *testing.T) {
+	largeTarget := make([]byte, 2<<20) // 2MB
+	for i := range largeTarget {
+		largeTarget[i] = 'a'
+	}
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		job := Job{
+			ID:        "large-job",
+			Target:    string(largeTarget),
+			TimeoutMS: 60000,
+		}
+		_ = json.NewEncoder(w).Encode(job)
+	}))
+	defer srv.Close()
+
+	job, err := newClient(testConfig(srv.URL, nil)).poll(context.Background())
+	if err != nil {
+		t.Fatalf("接收超大任务失败: %v", err)
+	}
+	if job == nil || job.ID != "large-job" || len(job.Target) != len(largeTarget) {
+		t.Fatalf("超大任务数据不完整: len=%d", len(job.Target))
+	}
+}

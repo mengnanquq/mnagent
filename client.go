@@ -70,8 +70,8 @@ type Result struct {
 	Data     json.RawMessage `json:"data,omitempty"`
 }
 
-// maxResponseBytes 限制解析响应体时读取的字节数。
-const maxResponseBytes = 1 << 20
+// maxResponseBytes 限制解析响应体时读取的字节数（16MB），支持超大代理配置与多节点订阅的整体下发。
+const maxResponseBytes = 16 << 20
 
 // maxResultAttempts 是回传结果的最大尝试次数（结果按任务 ID 幂等，重试安全）。
 const maxResultAttempts = 3
