@@ -22,7 +22,7 @@ var errUpdating = errors.New("正在应用更新")
 
 // Job 是机器人下发的探测任务，字段与机器人侧 internal/agent 的 Job 保持一致。
 //
-// Kind 决定执行方式：空/"trace" 走 nexttrace；"miaospeed"/"speed" 走 miaospeed 代理测速；
+// Kind 决定执行方式：空/"trace" 走 nexttrace；"miaospeed" 走 miaospeed 代理测速；
 // "ping"/"tcping"/"http"/"dns" 由本进程内的探针实现（不依赖外部二进制）。
 type Job struct {
 	ID        string `json:"id"`
@@ -50,7 +50,7 @@ func (j Job) Timeout() time.Duration {
 		timeout = jobMinTimeout
 	}
 	maxTimeout := jobMaxTimeout
-	if j.Kind == "miaospeed" || j.Kind == "speed" {
+	if j.Kind == "miaospeed" {
 		maxTimeout = jobMiaospeedMaxTimeout
 	}
 	if timeout > maxTimeout {

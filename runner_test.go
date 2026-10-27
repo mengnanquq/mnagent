@@ -448,7 +448,7 @@ func TestAgentLoopProbeJobEndToEnd(t *testing.T) {
 	}
 }
 
-// TestRunnerMiaospeedDispatch 验证 runner 对 miaospeed/speed 任务的分发与错误返回。
+// TestRunnerMiaospeedDispatch 验证 runner 对 miaospeed 任务的分发与错误返回，并验证已删除的 speed 别名不再分发。
 func TestRunnerMiaospeedDispatch(t *testing.T) {
 	r := newRunnerWithMiaospeed("nexttrace", "non-existent-miaospeed-path", nil)
 
@@ -462,14 +462,14 @@ func TestRunnerMiaospeedDispatch(t *testing.T) {
 		t.Fatalf("应拒绝非法代理 URI: exitCode=%d errText=%q", res.ExitCode, res.ErrText)
 	}
 
-	// 2. speed 别名同样能正确分发
+	// 2. speed 别名已移除，不再分发至 miaospeed，直接返回未知探针类型
 	resSpeed := r.run(context.Background(), Job{
 		ID:     "miao-2",
 		Kind:   "speed",
 		Target: "not-a-valid-proxy-uri",
 	})
-	if resSpeed.ExitCode == 0 || !strings.Contains(resSpeed.ErrText, "不支持的代理协议") {
-		t.Fatalf("speed 别名应分发至 miaospeed: exitCode=%d errText=%q", resSpeed.ExitCode, resSpeed.ErrText)
+	if resSpeed.ExitCode == 0 || !strings.Contains(resSpeed.ErrText, "未知探针类型") {
+		t.Fatalf("speed 不应分发至 miaospeed，应返回未知探针类型: exitCode=%d errText=%q", resSpeed.ExitCode, resSpeed.ErrText)
 	}
 }
 

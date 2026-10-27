@@ -24,7 +24,6 @@ import (
 // 常量定义：MiaoSpeed 任务类型与官方通用构建凭证。
 const (
 	kindMiaospeed = "miaospeed"
-	kindSpeed     = "speed"
 
 	// defaultBuildToken 是 AirportR/miaospeed 官方发布的默认嵌入凭证，
 	// 与主流客户端（FullTclash、miaolib、Koipy 等）保持完全一致。

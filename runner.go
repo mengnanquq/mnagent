@@ -126,12 +126,7 @@ func (r *runner) run(ctx context.Context, job Job) runResult {
 
 // isMiaospeedKind 判断是否为 miaospeed 代理测速任务。
 func isMiaospeedKind(kind string) bool {
-	switch kind {
-	case kindMiaospeed, kindSpeed:
-		return true
-	default:
-		return false
-	}
+	return kind == kindMiaospeed
 }
 
 // runMiaospeed 执行 miaospeed 代理测速。
@@ -329,7 +324,7 @@ type logger interface {
 
 func isHeavy(job Job) bool {
 	kind := probeKind(job)
-	return kind == kindTrace || kind == "miaospeed" || kind == "speed"
+	return kind == kindTrace || kind == kindMiaospeed
 }
 
 // loop 不断领取任务并执行，直到 ctx 结束；启用自动更新时按周期检查新版本。
@@ -406,7 +401,7 @@ func (a *agent) loop(ctx context.Context) error {
 			continue
 		}
 
-		// 收到远程更新控制包或重任务（trace / miaospeed / speed）：投入串行调度队列，不阻塞主循环长轮询
+		// 收到远程更新控制包或重任务（trace / miaospeed）：投入串行调度队列，不阻塞主循环长轮询
 		if isHeavy(*job) || job.Kind == "upgrade" || job.Kind == "update" {
 			select {
 			case a.heavyQueue <- *job:
