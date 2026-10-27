@@ -38,6 +38,7 @@ UNINSTALL="no"
 SERVICE_NAME="mnagent"
 AUTO_UPDATE="yes"   # 默认开启自动更新（可 --auto-update no 关闭）
 UPDATE_INTERVAL="6h"
+ISP=""
 INSTALL_NEXTTRACE="yes" # 缺少 nexttrace 时默认自动按照官方脚本/包管理器安装
 INSTALL_MIAOSPEED="yes" # 缺少 miaospeed 时默认自动从 GitHub Releases 下载安装
 GH_PROXY="${GH_PROXY:-${MNAGENT_GH_PROXY:-}}" # GitHub 代理前缀，例如 https://gh-proxy.com/
@@ -118,6 +119,7 @@ while [ $# -gt 0 ]; do
 			--auto-update)  AUTO_UPDATE="yes"; shift;;
 			--no-auto-update) AUTO_UPDATE="no"; shift;;
 			--update-interval) UPDATE_INTERVAL="${2:-}"; shift 2;;
+		--isp)             ISP="${2:-}"; shift 2;;
 			--install-nexttrace)
 				case "${2:-}" in
 					no|false|0) INSTALL_NEXTTRACE="no"; shift 2;;
@@ -720,7 +722,9 @@ Wants=network-online.target
 Type=simple
 User=$RUN_USER
 Group=$RUN_GROUP
-ExecStart=$PREFIX/mnagent -bot $BOT_URL -token-file $TOKEN_FILE -nexttrace $NEXTTRACE_EXEC -miaospeed $MIAOSPEED_EXEC$AUTO_UPDATE_ARGS
+ISP_ARG=""
+[ -n "$ISP" ] && ISP_ARG=" -isp $ISP"
+ExecStart=$PREFIX/mnagent -bot $BOT_URL -token-file $TOKEN_FILE -nexttrace $NEXTTRACE_EXEC -miaospeed $MIAOSPEED_EXEC$AUTO_UPDATE_ARGS$ISP_ARG
 	# nexttrace 需要可写的主目录来存放配置与 IP 库；ProtectSystem=strict 下只有
 	# StateDirectory 指向的目录可写。
 	StateDirectory=mnagent

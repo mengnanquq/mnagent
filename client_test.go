@@ -350,3 +350,34 @@ func TestClientPollLargePayload(t *testing.T) {
 		t.Fatalf("超大任务数据不完整: len=%d", len(job.Target))
 	}
 }
+
+func TestClientSendsISP(t *testing.T) {
+	var pollISP, hbISP string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/jobs" {
+			pollISP = r.Header.Get("X-Agent-ISP")
+			w.WriteHeader(http.StatusNoContent)
+			return
+		}
+		if r.URL.Path == "/heartbeat" {
+			hbISP = r.Header.Get("X-Agent-ISP")
+			w.WriteHeader(http.StatusNoContent)
+			return
+		}
+		http.NotFound(w, r)
+	}))
+	defer srv.Close()
+
+	cli := newClient(testConfig(srv.URL, nil))
+	cli.setISP("HKT Limited")
+
+	_, _ = cli.poll(context.Background())
+	_ = cli.heartbeat(context.Background())
+
+	if pollISP != "HKT Limited" {
+		t.Errorf("poll X-Agent-ISP = %q, want HKT Limited", pollISP)
+	}
+	if hbISP != "HKT Limited" {
+		t.Errorf("heartbeat X-Agent-ISP = %q, want HKT Limited", hbISP)
+	}
+}

@@ -83,7 +83,22 @@ type client struct {
 	tokens  *tokenSource
 	http    *http.Client
 
+	isp    atomic.Pointer[string]
 	paused atomic.Bool // 更新期间暂停轮询，避免新旧版本交替领取任务。
+}
+
+// setISP 设置本地探测或指定的运营商/ISP 名称。
+func (c *client) setISP(isp string) {
+	s := strings.TrimSpace(isp)
+	c.isp.Store(&s)
+}
+
+// getISP 获取当前已探测或指定的运营商/ISP 名称。
+func (c *client) getISP() string {
+	if p := c.isp.Load(); p != nil {
+		return *p
+	}
+	return ""
 }
 
 // newClient 构建通信客户端；轮询超时略大于机器人侧的长轮询保持时间。
@@ -246,6 +261,9 @@ func (c *client) do(ctx context.Context, method, path string, body []byte) (*htt
 	req.Header.Set("Authorization", "Bearer "+token)
 	req.Header.Set("User-Agent", "mnagent/"+version)
 	req.Header.Set("X-Agent-Version", version)
+	if isp := c.getISP(); isp != "" {
+		req.Header.Set("X-Agent-ISP", isp)
+	}
 	if body != nil {
 		req.Header.Set("Content-Type", "application/json")
 	}

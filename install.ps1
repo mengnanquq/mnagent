@@ -22,6 +22,7 @@ param(
     [string]$Token,
 
     [string]$TokenFile,
+    [string]$ISP = "",
     [string]$InstallDir = "",
     [string]$Version = "latest",
     [string]$GhProxy = "",
@@ -352,6 +353,9 @@ if ($enableAutoUpdate) {
 }
 if (-not [string]::IsNullOrWhiteSpace($GhProxy)) {
     $serviceArgs += "-gh-proxy `"$GhProxy`""
+}
+if (-not [string]::IsNullOrWhiteSpace($ISP)) {
+    $serviceArgs += "-isp `"$ISP`""
 }
 
 $binPathValue = "`"$mnagentBin`" " + ($serviceArgs -join " ")

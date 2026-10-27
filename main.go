@@ -68,6 +68,7 @@ type config struct {
 	probeTarget        string
 	probeKind          string
 	allowPrivateProbes bool
+	isp                string
 }
 
 func main() {
@@ -156,6 +157,19 @@ func runWithContext(ctx context.Context, args []string) error {
 	}
 
 	cli := newClient(cfg)
+	if cfg.isp != "" {
+		cli.setISP(cfg.isp)
+		log.Info("已指定探针运营商", "isp", cfg.isp)
+	} else {
+		go func() {
+			ispProbeClient := &http.Client{Timeout: 4 * time.Second}
+			detected := detectOutboundISP(ctx, ispProbeClient)
+			if detected != "" {
+				cli.setISP(detected)
+				log.Info("成功探测出站运营商", "isp", detected)
+			}
+		}()
+	}
 	tracker := newJobTracker()
 	rnr := newRunnerFull(cfg.binary, cfg.miaospeedBinary, cfg.ghProxy, cfg.allowPrivateProbes, log)
 	rnr.setProgressReporter(func(p Progress) {
@@ -220,6 +234,7 @@ func parseConfig(args []string) (*config, error) {
 		probeTarget  = fs.String("probe-target", "", "本地直接执行一次探针网络测试的目标（域名或 IP）")
 		probeKind    = fs.String("probe-kind", "ping", "本地探针类型：ping / tcping / trace / http / dns")
 		allowPrivate = fs.Bool("allow-private-probes", false, "允许探测内网私有地址与链路本地地址（默认禁止，防范 SSRF/云元数据盗取）")
+		isp          = fs.String("isp", "", "手动指定本探针主机的运营商/ISP 名称（留空则自动探测出站 ISP）")
 	)
 	if err := fs.Parse(args); err != nil {
 		return nil, err
@@ -310,6 +325,7 @@ func parseConfig(args []string) (*config, error) {
 		probeTarget:        strings.TrimSpace(*probeTarget),
 		probeKind:          strings.ToLower(strings.TrimSpace(*probeKind)),
 		allowPrivateProbes: *allowPrivate,
+		isp:                cleanISPName(*isp),
 	}, nil
 }
 
