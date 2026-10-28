@@ -2,6 +2,7 @@ package main
 
 import (
 	"bytes"
+	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -96,7 +97,7 @@ func TestInstallScriptSyntax(t *testing.T) {
 	if err != nil {
 		t.Fatalf("--help 执行失败: %v\n%s", err, out)
 	}
-	for _, want := range []string{"--bot", "--token", "--uninstall", "OpenWrt", "--miaospeed", "--miaospeed-version"} {
+	for _, want := range []string{"--bot", "--token", "--uninstall", "OpenWrt", "--miaospeed", "--miaospeed-version", "--isp"} {
 		if !strings.Contains(string(out), want) {
 			t.Fatalf("--help 未提及 %s: %s", want, out)
 		}
@@ -161,6 +162,8 @@ func TestInstallScriptKeepsKeySafeguards(t *testing.T) {
 		{"服务参数继承代理", `AUTO_UPDATE_ARGS="$AUTO_UPDATE_ARGS -gh-proxy $GH_PROXY"`},
 		{"下载文件时显示进度条", "curl -#"},
 		{"systemd 默认以 root 运行", `[ -n "$RUN_USER" ] || RUN_USER="root"`},
+		{"systemd 传递 ISP 参数", `-miaospeed $MIAOSPEED_EXEC$AUTO_UPDATE_ARGS$ISP_ARG`},
+		{"ISP 参数清洗与引号包裹", `clean_isp="$(printf '%s' "$ISP" | tr -d '"\r\n')"`},
 	} {
 		if !strings.Contains(script, want.needle) {
 			t.Errorf("install.sh 缺少 %s（应包含 %q）", want.name, want.needle)
@@ -200,11 +203,133 @@ func TestWindowsInstallScript(t *testing.T) {
 		{"参数定义 -Token", "[string]$Token"},
 		{"参数定义 -TokenFile", "[string]$TokenFile"},
 		{"参数定义 -Uninstall", "[switch]$Uninstall"},
+		{"参数定义 -ISP", "[string]$ISP = \"\""},
 	}
 
 	for _, c := range checks {
 		if !strings.Contains(script, c.needle) {
 			t.Errorf("install.ps1 缺少关键逻辑 [%s]，应包含 %q", c.name, c.needle)
 		}
+	}
+}
+
+// TestInstallScriptUnitGenerationUnderSetEU 验证在 set -eu（nounset）严格模式下，
+// 服务模板生成（systemd 与 procd）不会因为未定义变量（如 ISP_ARG）导致安装脚本崩溃，
+// 且生成的服务文件中不包含暴露的 shell 代码或未解析占位符。
+func TestInstallScriptUnitGenerationUnderSetEU(t *testing.T) {
+	script := string(readInstallScript(t))
+	sh, err := exec.LookPath("sh")
+	if err != nil {
+		t.Skip("未找到 sh，跳过测试")
+	}
+
+	testCases := []struct {
+		name       string
+		ispVal     string
+		wantSubstr string
+	}{
+		{"留空自动探测", "", "miaospeed"},
+		{"手动指定带空格ISP", "China Telecom", `-isp "China Telecom"`},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			tmpDir := t.TempDir()
+			testRunner := filepath.Join(tmpDir, "run_test.sh")
+
+			cmdScript := fmt.Sprintf(`set -eu
+INIT_DIR=%q
+SERVICE_NAME="mnagent"
+RUN_USER="root"
+RUN_GROUP="root"
+PREFIX="/usr/local/bin"
+BOT_URL="https://mnbot.example.com/agent"
+TOKEN_FILE="/etc/mnagent/token"
+NEXTTRACE_EXEC="/usr/local/bin/nexttrace"
+MIAOSPEED_EXEC="/usr/local/bin/miaospeed"
+AUTO_UPDATE="yes"
+UPDATE_INTERVAL="6h"
+GH_PROXY="https://gh-proxy.com/"
+ISP=%q
+
+# 模拟 install.sh 中的参数组装
+AUTO_UPDATE_ARGS=""
+if [ "$AUTO_UPDATE" = "yes" ]; then
+	AUTO_UPDATE_ARGS=" -auto-update -update-interval $UPDATE_INTERVAL"
+fi
+if [ -n "$GH_PROXY" ]; then
+	AUTO_UPDATE_ARGS="$AUTO_UPDATE_ARGS -gh-proxy $GH_PROXY"
+fi
+
+ISP_ARG=""
+if [ -n "$ISP" ]; then
+	clean_isp="$(printf '%%s' "$ISP" | tr -d '"\r\n')"
+	ISP_ARG=" -isp \"$clean_isp\""
+fi
+
+# 执行 systemd 单元文件生成 heredoc
+cat > "$INIT_DIR/$SERVICE_NAME.service" <<EOF
+[Unit]
+Description=mnagent (nexttrace agent)
+
+[Service]
+Type=simple
+User=$RUN_USER
+Group=$RUN_GROUP
+ExecStart=$PREFIX/mnagent -bot $BOT_URL -token-file $TOKEN_FILE -nexttrace $NEXTTRACE_EXEC -miaospeed $MIAOSPEED_EXEC$AUTO_UPDATE_ARGS$ISP_ARG
+EOF
+
+# 执行 procd 脚本生成 heredoc
+cat > "$INIT_DIR/$SERVICE_NAME" <<EOF
+#!/bin/sh /etc/rc.common
+START=95
+USE_PROCD=1
+	start_service() {
+		procd_open_instance
+		procd_set_param command $PREFIX/mnagent \\
+			-bot $BOT_URL \\
+			-token-file $TOKEN_FILE \\
+			-nexttrace $NEXTTRACE_EXEC \\
+			-miaospeed $MIAOSPEED_EXEC$AUTO_UPDATE_ARGS$ISP_ARG
+		procd_close_instance
+	}
+EOF
+`, tmpDir, tc.ispVal)
+
+			if err := os.WriteFile(testRunner, []byte(cmdScript), 0o755); err != nil {
+				t.Fatal(err)
+			}
+
+			out, err := exec.Command(sh, testRunner).CombinedOutput()
+			if err != nil {
+				t.Fatalf("在 set -eu 下执行服务生成失败 (ISP=%q): %v\n输出:\n%s", tc.ispVal, err, out)
+			}
+
+			sysdContent, err := os.ReadFile(filepath.Join(tmpDir, "mnagent.service"))
+			if err != nil {
+				t.Fatal(err)
+			}
+			sysdStr := string(sysdContent)
+			if strings.Contains(sysdStr, "ISP_ARG=") {
+				t.Errorf("systemd 服务文件中不应包含未被执行的 shell 代码 'ISP_ARG=': %s", sysdStr)
+			}
+			if !strings.Contains(sysdStr, tc.wantSubstr) {
+				t.Errorf("systemd 服务文件缺少预期字符串 %q: %s", tc.wantSubstr, sysdStr)
+			}
+
+			procdContent, err := os.ReadFile(filepath.Join(tmpDir, "mnagent"))
+			if err != nil {
+				t.Fatal(err)
+			}
+			procdStr := string(procdContent)
+			if !strings.Contains(procdStr, tc.wantSubstr) {
+				t.Errorf("procd 脚本缺少预期字符串 %q: %s", tc.wantSubstr, procdStr)
+			}
+		})
+	}
+
+	// 确保 install.sh 中绝不会在 heredoc 内部出现 ISP_ARG 赋值代码
+	if strings.Contains(script, "Group=$RUN_GROUP\nISP_ARG=") {
+		t.Errorf("install.sh 中禁止在 cat <<EOF (heredoc) 内部进行 ISP_ARG 变量定义")
 	}
 }
