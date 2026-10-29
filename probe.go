@@ -392,18 +392,18 @@ func tcpingProbe(ctx context.Context, job Job, allowPrivate bool) (LatencyReport
 	}
 	address := net.JoinHostPort(host, strconv.Itoa(port))
 
-		resolved := ""
-		if net.ParseIP(host) == nil {
-			if ips, err := net.DefaultResolver.LookupIPAddr(ctx, host); err == nil && len(ips) > 0 {
-				resolved = ips[0].IP.String()
-				for _, addr := range ips {
-					if addr.IP.To4() != nil {
-						resolved = addr.IP.String()
-						break
-					}
+	resolved := ""
+	if net.ParseIP(host) == nil {
+		if ips, err := net.DefaultResolver.LookupIPAddr(ctx, host); err == nil && len(ips) > 0 {
+			resolved = ips[0].IP.String()
+			for _, addr := range ips {
+				if addr.IP.To4() != nil {
+					resolved = addr.IP.String()
+					break
 				}
 			}
 		}
+	}
 	if !allowPrivate {
 		if ip := net.ParseIP(host); ip != nil {
 			if isBlockedProbeIP(ip) {

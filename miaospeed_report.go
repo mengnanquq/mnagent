@@ -563,69 +563,69 @@ func queryIPGeo(host string) (ip, geo string) {
 	}
 
 	client := &http.Client{Timeout: 3 * time.Second}
-		req, err := http.NewRequest(http.MethodGet, apiURL, nil)
+	req, err := http.NewRequest(http.MethodGet, apiURL, nil)
+	if err == nil {
+		req.Header.Set("User-Agent", "Mozilla/5.0")
+		resp, err := client.Do(req)
 		if err == nil {
-			req.Header.Set("User-Agent", "Mozilla/5.0")
-			resp, err := client.Do(req)
-			if err == nil {
-				if resp.StatusCode == http.StatusOK {
-					var info struct {
-						CountryName string `json:"country_name"`
-						ISPName     string `json:"isp_name"`
-						IP          string `json:"ip"`
+			if resp.StatusCode == http.StatusOK {
+				var info struct {
+					CountryName string `json:"country_name"`
+					ISPName     string `json:"isp_name"`
+					IP          string `json:"ip"`
+				}
+				if err := json.NewDecoder(io.LimitReader(resp.Body, 64*1024)).Decode(&info); err == nil {
+					if info.IP != "" {
+						targetIP = info.IP
 					}
-					if err := json.NewDecoder(io.LimitReader(resp.Body, 64*1024)).Decode(&info); err == nil {
-						if info.IP != "" {
-							targetIP = info.IP
+					parts := make([]string, 0, 2)
+					if info.CountryName != "" {
+						parts = append(parts, info.CountryName)
+					}
+					if info.ISPName != "" && info.ISPName != info.CountryName {
+						parts = append(parts, info.ISPName)
+					}
+					if len(parts) > 0 {
+						geo = strings.Join(parts, " ")
+					}
+				}
+			}
+			_ = resp.Body.Close()
+		}
+	}
+
+	if geo == "" {
+		reqSB, err := http.NewRequest(http.MethodGet, "https://api.ip.sb/geoip/"+targetIP, nil)
+		if err == nil {
+			reqSB.Header.Set("User-Agent", "Mozilla/5.0")
+			respSB, err := client.Do(reqSB)
+			if err == nil {
+				if respSB.StatusCode == http.StatusOK {
+					var infoSB struct {
+						Country string `json:"country"`
+						ISP     string `json:"isp"`
+						IP      string `json:"ip"`
+					}
+					if err := json.NewDecoder(io.LimitReader(respSB.Body, 64*1024)).Decode(&infoSB); err == nil {
+						if infoSB.IP != "" {
+							targetIP = infoSB.IP
 						}
 						parts := make([]string, 0, 2)
-						if info.CountryName != "" {
-							parts = append(parts, info.CountryName)
+						if infoSB.Country != "" {
+							parts = append(parts, infoSB.Country)
 						}
-						if info.ISPName != "" && info.ISPName != info.CountryName {
-							parts = append(parts, info.ISPName)
+						if infoSB.ISP != "" && infoSB.ISP != infoSB.Country {
+							parts = append(parts, infoSB.ISP)
 						}
 						if len(parts) > 0 {
 							geo = strings.Join(parts, " ")
 						}
 					}
 				}
-				_ = resp.Body.Close()
+				_ = respSB.Body.Close()
 			}
 		}
-
-		if geo == "" {
-			reqSB, err := http.NewRequest(http.MethodGet, "https://api.ip.sb/geoip/"+targetIP, nil)
-			if err == nil {
-				reqSB.Header.Set("User-Agent", "Mozilla/5.0")
-				respSB, err := client.Do(reqSB)
-				if err == nil {
-					if respSB.StatusCode == http.StatusOK {
-						var infoSB struct {
-							Country string `json:"country"`
-							ISP     string `json:"isp"`
-							IP      string `json:"ip"`
-						}
-						if err := json.NewDecoder(io.LimitReader(respSB.Body, 64*1024)).Decode(&infoSB); err == nil {
-							if infoSB.IP != "" {
-								targetIP = infoSB.IP
-							}
-							parts := make([]string, 0, 2)
-							if infoSB.Country != "" {
-								parts = append(parts, infoSB.Country)
-							}
-							if infoSB.ISP != "" && infoSB.ISP != infoSB.Country {
-								parts = append(parts, infoSB.ISP)
-							}
-							if len(parts) > 0 {
-								geo = strings.Join(parts, " ")
-							}
-						}
-					}
-					_ = respSB.Body.Close()
-				}
-			}
-		}
+	}
 
 	ip = targetIP
 	if geo == "" && ip != "" {
