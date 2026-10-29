@@ -676,8 +676,15 @@ func extractTarGzFile(r io.Reader, destFile string) error {
 		if err != nil {
 			return err
 		}
+		if hdr.FileInfo().IsDir() || hdr.Typeflag != tar.TypeReg {
+			continue
+		}
 		name := filepath.Base(hdr.Name)
-		if !hdr.FileInfo().IsDir() && !strings.HasSuffix(name, ".tar.gz") && hdr.Typeflag == tar.TypeReg {
+		lower := strings.ToLower(name)
+		if strings.HasSuffix(lower, ".tar.gz") || strings.HasSuffix(lower, ".tgz") || strings.EqualFold(name, "license") || strings.HasPrefix(lower, "readme") {
+			continue
+		}
+		if strings.HasSuffix(lower, ".exe") || strings.Contains(lower, "miaospeed") {
 			f, err := os.OpenFile(destFile, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0755)
 			if err != nil {
 				return err
