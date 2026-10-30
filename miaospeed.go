@@ -522,6 +522,7 @@ func executeMiaospeedTask(ctx context.Context, wsURL, origin, token string, node
 	if err != nil {
 		return nil, fmt.Errorf("配置 websocket 失败: %w", err)
 	}
+	wsCfg.Dialer = &net.Dialer{Timeout: 5 * time.Second}
 
 	type dialResult struct {
 		conn *websocket.Conn
