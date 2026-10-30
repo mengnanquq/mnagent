@@ -214,6 +214,8 @@ func (r *runner) runNexttrace(ctx context.Context, job Job) (output string, errT
 	switch {
 	case errors.Is(runCtx.Err(), context.DeadlineExceeded):
 		return out, fmt.Sprintf("执行超时（%s）", job.Timeout()), code
+	case errors.Is(runCtx.Err(), context.Canceled):
+		return out, "任务已取消", code
 	case runErr != nil:
 		return out, describeRunError(runErr, code), code
 	default:
