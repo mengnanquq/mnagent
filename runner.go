@@ -307,12 +307,10 @@ type agent struct {
 	update  *updater
 	tracker *jobTracker
 
-	heavyActive atomic.Bool
-	heavyDone   chan struct{}
-	heavyMu     sync.Mutex
-	heavyQueue  chan Job
-	lightSem    chan struct{}
-	tasksWG     sync.WaitGroup
+	heavyMu    sync.Mutex
+	heavyQueue chan Job
+	lightSem   chan struct{}
+	tasksWG    sync.WaitGroup
 }
 
 // logger 是本包用到的最小日志接口，便于测试注入。
@@ -439,19 +437,10 @@ func (a *agent) heavyWorker(ctx context.Context) {
 			if !ok {
 				return
 			}
-			doneCh := make(chan struct{})
-			a.heavyMu.Lock()
-			a.heavyActive.Store(true)
-			a.heavyDone = doneCh
-			a.heavyMu.Unlock()
 
 			// 检查任务在排队期间是否已被 cancel
 			if a.tracker != nil && a.tracker.IsCancelled(j.ID) {
 				a.logger.Info("任务在排队期间已被取消，跳过执行", "job", j.ID, "kind", j.Kind)
-				a.heavyMu.Lock()
-				a.heavyActive.Store(false)
-				close(doneCh)
-				a.heavyMu.Unlock()
 				continue
 			}
 
@@ -460,11 +449,6 @@ func (a *agent) heavyWorker(ctx context.Context) {
 			} else {
 				a.execute(ctx, j)
 			}
-
-			a.heavyMu.Lock()
-			a.heavyActive.Store(false)
-			close(doneCh)
-			a.heavyMu.Unlock()
 		}
 	}
 }
@@ -808,6 +792,11 @@ func (a *agent) handleUpgradeJob(ctx context.Context, job Job) {
 		installedVer, version, depSummary)
 	a.logger.Info("已成功更新并回传结果，即将平滑重启服务", "new_version", installedVer)
 	a.sendUpgradeResult(job, 0, strings.TrimSpace(successMsg), "")
+
+	// 重启前通知在途轻任务取消，避免直接硬杀导致任务状态丢失
+	if a.tracker != nil {
+		a.tracker.CancelAll()
+	}
 
 	// 短暂休眠确保结果数据包送出网络缓冲区，随后触发重启
 	time.Sleep(500 * time.Millisecond)

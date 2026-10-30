@@ -93,3 +93,21 @@ func (t *jobTracker) IsCancelled(id string) bool {
 	}
 	return true
 }
+
+// CancelAll 取消所有当前正在运行的任务，并返回取消的任务数量。
+func (t *jobTracker) CancelAll() int {
+	if t == nil {
+		return 0
+	}
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	count := 0
+	for id, cancel := range t.jobs {
+		if cancel != nil {
+			cancel()
+			count++
+		}
+		delete(t.jobs, id)
+	}
+	return count
+}

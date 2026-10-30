@@ -1,4 +1,4 @@
-.PHONY: all build build-windows test test-race check clean fmt
+.PHONY: all build build-windows test test-race check clean fmt fmt-check
 
 BIN := mnagent
 VERSION ?= $(shell git describe --tags --always 2>/dev/null || echo dev)
@@ -22,7 +22,15 @@ test-race:
 fmt:
 	gofmt -s -w .
 
-check: test test-race
+fmt-check:
+	@diffs=$$(gofmt -l .); \
+	if [ -n "$$diffs" ]; then \
+		echo "代码格式未满足 gofmt 要求:"; \
+		echo "$$diffs"; \
+		exit 1; \
+	fi
+
+check: fmt-check test test-race
 	go vet ./...
 
 clean:

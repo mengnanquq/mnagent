@@ -4,7 +4,6 @@ import (
 	"context"
 	"sync"
 	"testing"
-	"time"
 )
 
 func TestJobTracker(t *testing.T) {
@@ -64,16 +63,6 @@ func TestJobTracker(t *testing.T) {
 }
 
 func TestConcurrentLightExecutionDuringHeavyJob(t *testing.T) {
-	tracker := newJobTracker()
-	a := &agent{
-		tracker: tracker,
-	}
-
-	// 模拟重任务开始执行
-	a.heavyActive.Store(true)
-	doneCh := make(chan struct{})
-	a.heavyDone = doneCh
-
 	heavyJob := Job{ID: "heavy-1", Kind: "trace", Target: "1.1.1.1"}
 	if !isHeavy(heavyJob) {
 		t.Fatal("heavyJob 应该是重任务")
@@ -83,19 +72,27 @@ func TestConcurrentLightExecutionDuringHeavyJob(t *testing.T) {
 	if isHeavy(lightJob) {
 		t.Fatal("lightJob 应该是轻任务")
 	}
+}
 
-	// 验证重任务激活状态下，isHeavy 判定有效
-	if !a.heavyActive.Load() {
-		t.Fatal("heavyActive 应该为 true")
+func TestJobTrackerCancelAll(t *testing.T) {
+	tracker := newJobTracker()
+	ctx1, cancel1 := context.WithCancel(context.Background())
+	ctx2, cancel2 := context.WithCancel(context.Background())
+
+	tracker.Register("job-1", cancel1)
+	tracker.Register("job-2", cancel2)
+
+	n := tracker.CancelAll()
+	if n != 2 {
+		t.Fatalf("CancelAll 期望取消 2 个任务，实际: %d", n)
 	}
 
-	// 模拟重任务结束
-	a.heavyActive.Store(false)
-	close(doneCh)
+	if ctx1.Err() == nil || ctx2.Err() == nil {
+		t.Fatal("CancelAll 后所有在途任务 context 必须已被取消")
+	}
 
-	select {
-	case <-a.heavyDone:
-	case <-time.After(100 * time.Millisecond):
-		t.Fatal("heavyDone 超时未就绪")
+	// 再次调用应返回 0
+	if n2 := tracker.CancelAll(); n2 != 0 {
+		t.Fatalf("空集合 CancelAll 期望 0，实际: %d", n2)
 	}
 }
