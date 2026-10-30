@@ -179,11 +179,13 @@ func (r *runner) runTrace(ctx context.Context, job Job) runResult {
 		} else {
 			resolveCtx, cancel := context.WithTimeout(ctx, 3*time.Second)
 			defer cancel()
-			if ips, err := net.DefaultResolver.LookupIP(resolveCtx, "ip", target); err == nil {
-				for _, ip := range ips {
-					if isBlockedProbeIP(ip) {
-						return runResult{ErrText: fmt.Sprintf("安全策略拦截：禁止探测私有或云元数据地址 (%s)", ip.String()), ExitCode: -1}
-					}
+			ips, err := net.DefaultResolver.LookupIP(resolveCtx, "ip", target)
+			if err != nil || len(ips) == 0 {
+				return runResult{ErrText: fmt.Sprintf("安全策略拦截：无法解析目标主机 (%s)", target), ExitCode: -1}
+			}
+			for _, ip := range ips {
+				if isBlockedProbeIP(ip) {
+					return runResult{ErrText: fmt.Sprintf("安全策略拦截：禁止探测私有或云元数据地址 (%s)", ip.String()), ExitCode: -1}
 				}
 			}
 		}

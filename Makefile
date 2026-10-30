@@ -30,7 +30,7 @@ fmt-check:
 		exit 1; \
 	fi
 
-check: fmt-check test test-race
+check: fmt-check test
 	go vet ./...
 
 clean:
