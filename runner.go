@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"math/rand/v2"
+	"net"
 	"net/http"
 	"os"
 	"os/exec"
@@ -166,6 +167,27 @@ func (r *runner) runProbeJob(ctx context.Context, job Job, kind string) runResul
 
 // runTrace 通过外部 nexttrace 执行一次路由追踪。
 func (r *runner) runTrace(ctx context.Context, job Job) runResult {
+	if !r.allowPrivateProbes {
+		target := strings.TrimSpace(job.Target)
+		if h, _, err := net.SplitHostPort(target); err == nil {
+			target = h
+		}
+		if ip := net.ParseIP(target); ip != nil {
+			if isBlockedProbeIP(ip) {
+				return runResult{ErrText: fmt.Sprintf("安全策略拦截：禁止探测私有或云元数据地址 (%s)", ip.String()), ExitCode: -1}
+			}
+		} else {
+			resolveCtx, cancel := context.WithTimeout(ctx, 3*time.Second)
+			defer cancel()
+			if ips, err := net.DefaultResolver.LookupIP(resolveCtx, "ip", target); err == nil {
+				for _, ip := range ips {
+					if isBlockedProbeIP(ip) {
+						return runResult{ErrText: fmt.Sprintf("安全策略拦截：禁止探测私有或云元数据地址 (%s)", ip.String()), ExitCode: -1}
+					}
+				}
+			}
+		}
+	}
 	out, errText, exitCode := r.runNexttrace(ctx, job)
 	return runResult{Output: out, ErrText: errText, ExitCode: exitCode}
 }

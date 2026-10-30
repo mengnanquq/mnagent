@@ -794,3 +794,26 @@ func TestKillProcessGroup(t *testing.T) {
 	killProcessGroup(cmd)
 	_ = cmd.Wait()
 }
+
+func TestRunTraceBlockedPrivateIP(t *testing.T) {
+	r := newRunner("nexttrace", nil)
+	r.allowPrivateProbes = false
+
+	blockedTargets := []string{
+		"127.0.0.1",
+		"169.254.169.254",
+		"192.168.1.1:80",
+		"10.0.0.1",
+	}
+
+	for _, target := range blockedTargets {
+		res := r.run(context.Background(), Job{
+			ID:     "trace-blocked",
+			Kind:   "trace",
+			Target: target,
+		})
+		if res.ExitCode != -1 || !strings.Contains(res.ErrText, "安全策略拦截") {
+			t.Errorf("目标 %q 期望被安全策略拦截，实际: %+v", target, res)
+		}
+	}
+}
