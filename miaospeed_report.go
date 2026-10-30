@@ -65,7 +65,7 @@ func (r MiaospeedReport) Format() string {
 		b.WriteString(fmt.Sprintf("节点: %s (%s)\n", r.NodeName, proto))
 	}
 	if r.Server != "" {
-		b.WriteString(fmt.Sprintf("目标: %s\n", r.Server))
+		b.WriteString(fmt.Sprintf("目标: %s\n", maskIP(r.Server)))
 	}
 
 	if r.HTTPCode > 0 {
