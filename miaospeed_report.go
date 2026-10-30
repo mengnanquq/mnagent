@@ -108,10 +108,10 @@ func (r MiaospeedReport) Format() string {
 	if r.InboundGeo != "" || r.OutboundGeo != "" || r.Hijack != "" {
 		b.WriteString("链路拓扑:\n")
 		if r.InboundGeo != "" {
-			b.WriteString(fmt.Sprintf("  - 入站: %s\n", r.InboundGeo))
+			b.WriteString(fmt.Sprintf("  - 入站: %s\n", maskIP(r.InboundGeo)))
 		}
 		if r.OutboundGeo != "" {
-			b.WriteString(fmt.Sprintf("  - 出站: %s\n", r.OutboundGeo))
+			b.WriteString(fmt.Sprintf("  - 出站: %s\n", maskIP(r.OutboundGeo)))
 		}
 		if r.Hijack != "" {
 			b.WriteString(fmt.Sprintf("  - 劫持检测: %s\n", r.Hijack))
@@ -673,4 +673,48 @@ func parseMatrixScript(payload string) (name, status string) {
 		return display, obj.Text
 	}
 	return "", ""
+}
+
+// maskIP 对 IP 或包含 "地域 (IP)" 格式的字符串进行脱敏处理。
+func maskIP(ip string) string {
+	ip = strings.TrimSpace(ip)
+	if ip == "" || ip == "---" {
+		return ip
+	}
+
+	if start := strings.LastIndex(ip, "("); start != -1 {
+		if end := strings.LastIndex(ip, ")"); end > start {
+			prefix := ip[:start+1]
+			innerIP := ip[start+1 : end]
+			suffix := ip[end:]
+			return prefix + maskIP(innerIP) + suffix
+		}
+	}
+
+	if host, port, err := net.SplitHostPort(ip); err == nil {
+		return net.JoinHostPort(maskIP(host), port)
+	}
+
+	parsed := net.ParseIP(ip)
+	if parsed == nil {
+		if strings.Contains(ip, ".") {
+			parts := strings.Split(ip, ".")
+			if len(parts) == 4 {
+				return parts[0] + "." + parts[1] + ".*.*"
+			}
+		}
+		return ip
+	}
+
+	if v4 := parsed.To4(); v4 != nil {
+		return fmt.Sprintf("%d.%d.*.*", v4[0], v4[1])
+	}
+
+	if v6 := parsed.To16(); v6 != nil {
+		b0 := (uint16(v6[0]) << 8) | uint16(v6[1])
+		b1 := (uint16(v6[2]) << 8) | uint16(v6[3])
+		return fmt.Sprintf("%x:%x:*:*", b0, b1)
+	}
+
+	return ip
 }
