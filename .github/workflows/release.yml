@@ -100,7 +100,7 @@ jobs:
           fi
           output="mnagent_${GOOS}_${GOARCH}${ext}"
           go build -trimpath -ldflags "-s -w -X main.version=${VERSION}" \
-            -o "${output}" .
+            -o "${output}" ./cmd/mnagent
           if [ "${{ matrix.upx }}" = "true" ]; then
             upx --lzma --best "${output}" || upx -9 "${output}"
           fi

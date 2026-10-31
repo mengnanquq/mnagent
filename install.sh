@@ -394,7 +394,7 @@ build_from_source() {
 	fi
 	download_stdout "$(apply_gh_proxy "$src_url")" | tar -xz -C "$tmp"
 	dir="$(ls -d "$tmp"/*/ | head -n1)"
-	( cd "$dir" && go build -trimpath -ldflags "-s -w -X main.version=${VERSION}" -o "$PREFIX/mnagent" . )
+	( cd "$dir" && go build -trimpath -ldflags "-s -w -X main.version=${VERSION}" -o "$PREFIX/mnagent" ./cmd/mnagent )
 	rm -rf "$tmp"
 }
 
