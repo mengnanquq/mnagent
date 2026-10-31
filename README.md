@@ -1,6 +1,6 @@
 # mnagent
 
-运行在拨测与探测主机上的轻量化高性能 agent，配合 Telegram 机器人 [@mengnan_dedicated_bot](https://t.me/mengnan_dedicated_bot) 使用：
+运行在拨测与探测主机上的轻量化高性能 agent，配合 Telegram 机器人 [@mengna_app](https://t.me/mengna_app) 使用：
 机器人统一调度下发探测与测速任务，agent 在本机高效执行并回传结构化结果，支持路由追踪（`nexttrace`）、网络探针（`ping`、`tcping`、`http`、`dns`）以及代理节点/订阅测速（`miaospeed`）。
 
 它主动向机器人**长轮询**领取任务、在本机执行并回传。因此：
