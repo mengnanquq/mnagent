@@ -2,6 +2,7 @@ package updater
 
 import (
 	"context"
+	"crypto/sha256"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
@@ -325,5 +326,60 @@ func TestUpdaterAssetNameWindows(t *testing.T) {
 	u.Arch = "arm64"
 	if got := u.AssetName(); got != "mnagent_windows_arm64.exe" {
 		t.Fatalf("AssetName = %q, want mnagent_windows_arm64.exe", got)
+	}
+}
+
+// TestUpdaterSHA256ChecksumVerification 验证发布了 sha256sums.txt 时哈希匹配则成功，被篡改则拦截报错。
+func TestUpdaterSHA256ChecksumVerification(t *testing.T) {
+	bin := []byte("#!/bin/sh\n# padding for size check\n")
+	for len(bin) < 2048 {
+		bin = append(bin, "#"...)
+	}
+	realHash := fmt.Sprintf("%x", sha256.Sum256(bin))
+
+	var serveMismatched atomic.Bool
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case strings.HasSuffix(r.URL.Path, "/sha256sums.txt"):
+			hash := realHash
+			if serveMismatched.Load() {
+				hash = "0000000000000000000000000000000000000000000000000000000000000000"
+			}
+			fmt.Fprintf(w, "%s  mnagent_linux_amd64\n", hash)
+		case strings.HasSuffix(r.URL.Path, "/mnagent_linux_amd64"):
+			_, _ = w.Write(bin)
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer ts.Close()
+
+	exe := filepath.Join(t.TempDir(), "mnagent")
+	_ = os.WriteFile(exe, []byte("old-bin"), 0o755)
+
+	u := New(Config{
+		CurrentVersion: "v0.1.0",
+		Repo:           "owner/repo",
+		Platform:       "linux",
+		Arch:           "amd64",
+		DownloadClient: ts.Client(),
+		Executable:     exe,
+	})
+	u.URLForFunc = func(version string) string {
+		return ts.URL + "/releases/download/" + version + "/" + u.AssetName()
+	}
+	u.ChecksumURLFunc = func(version string) string {
+		return ts.URL + "/releases/download/" + version + "/sha256sums.txt"
+	}
+
+	// 1. 正确 Hash -> 正常替换
+	if err := u.Apply("v0.1.1"); err != nil {
+		t.Fatalf("匹配正确 Hash 应成功，但报错: %v", err)
+	}
+
+	// 2. 篡改 Hash -> 拦截报错
+	serveMismatched.Store(true)
+	if err := u.Apply("v0.1.2"); err == nil || !strings.Contains(err.Error(), "完整性校验失败") {
+		t.Fatalf("篡改 Hash 期望拦截报错，实际 got err: %v", err)
 	}
 }

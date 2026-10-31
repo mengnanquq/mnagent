@@ -1,6 +1,11 @@
 package updater
 
 import (
+	"bufio"
+	"bytes"
+	"crypto/sha256"
+	"crypto/subtle"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -118,9 +123,10 @@ type Updater struct {
 	GHProxy        string
 	RestartFunc    func() error
 
-	LatestURLFunc func() string
-	URLForFunc    func(version string) string
-	APIURLFunc    func() string
+	LatestURLFunc   func() string
+	URLForFunc      func(version string) string
+	ChecksumURLFunc func(version string) string
+	APIURLFunc      func() string
 }
 
 // New 创建一个新的 Updater 实例。
@@ -321,8 +327,64 @@ func (u *Updater) Check() (string, bool, error) {
 	return latest, true, nil
 }
 
-// DownloadAndReplace 下载并原子替换二进制文件，返回目标版本号，但不触发重启。
+func (u *Updater) checksumURLFor(version string) string {
+	if u.ChecksumURLFunc != nil {
+		return u.ChecksumURLFunc(version)
+	}
+	raw := "https://github.com/" + u.Repo + "/releases/download/" + version + "/sha256sums.txt"
+	return u.ProxyURL(raw)
+}
+
+// fetchExpectedChecksum 获取目标版本的 sha256 校验清单并提取当前资产对应 Hash。
+func (u *Updater) fetchExpectedChecksum(version string) (string, error) {
+	targetURL := u.checksumURLFor(version)
+	req, err := http.NewRequest(http.MethodGet, targetURL, nil)
+	if err != nil {
+		return "", err
+	}
+	req.Header.Set("User-Agent", "mnagent-updater")
+
+	cli := u.DownloadClient
+	if cli == nil {
+		cli = &http.Client{Timeout: DefaultDownloadTimeout}
+	}
+	resp, err := cli.Do(req)
+	if err != nil {
+		return "", err
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode == http.StatusNotFound {
+		return "", nil // 未发布校验文件，宽容放行
+	}
+	if resp.StatusCode != http.StatusOK {
+		return "", fmt.Errorf("HTTP %d", resp.StatusCode)
+	}
+
+	body, err := io.ReadAll(io.LimitReader(resp.Body, 1<<18)) // 256 KiB
+	if err != nil {
+		return "", err
+	}
+
+	assetName := u.AssetName()
+	scanner := bufio.NewScanner(bytes.NewReader(body))
+	for scanner.Scan() {
+		line := strings.TrimSpace(scanner.Text())
+		fields := strings.Fields(line)
+		if len(fields) >= 2 {
+			fileName := strings.TrimPrefix(fields[1], "*")
+			if filepath.Base(fileName) == assetName {
+				return strings.ToLower(fields[0]), nil
+			}
+		}
+	}
+	return "", nil
+}
+
+// DownloadAndReplace 下载并原子替换二进制文件，支持 SHA-256 完整性校验，返回目标版本号，但不触发重启。
 func (u *Updater) DownloadAndReplace(version string) (string, error) {
+	expectedHash, _ := u.fetchExpectedChecksum(version)
+
 	downloadURL := u.urlForOrFallback(version)
 	tmpFile, err := os.CreateTemp(filepath.Dir(u.Executable), "mnagent-upd-*")
 	if err != nil {
@@ -336,11 +398,21 @@ func (u *Updater) DownloadAndReplace(version string) (string, error) {
 		_ = os.Remove(tmpPath)
 	}()
 
-	if err := u.downloadTo(downloadURL, tmpFile); err != nil {
+	hasher := sha256.New()
+	multiWriter := io.MultiWriter(tmpFile, hasher)
+
+	if err := u.downloadTo(downloadURL, multiWriter); err != nil {
 		_ = tmpFile.Close()
 		return "", fmt.Errorf("下载新版本失败：%w", err)
 	}
 	_ = tmpFile.Close()
+
+	if expectedHash != "" {
+		actualHash := hex.EncodeToString(hasher.Sum(nil))
+		if subtle.ConstantTimeCompare([]byte(strings.ToLower(actualHash)), []byte(strings.ToLower(expectedHash))) != 1 {
+			return "", fmt.Errorf("SHA-256 完整性校验失败：期望 %s，实际 %s (防篡改拦截)", expectedHash, actualHash)
+		}
+	}
 
 	if err := os.Chmod(tmpPath, 0o755); err != nil {
 		return "", fmt.Errorf("设置执行权限失败：%w", err)
@@ -373,7 +445,7 @@ func (u *Updater) Apply(version string) error {
 	return nil
 }
 
-func (u *Updater) downloadTo(targetURL string, f *os.File) error {
+func (u *Updater) downloadTo(targetURL string, w io.Writer) error {
 	req, err := http.NewRequest(http.MethodGet, targetURL, nil)
 	if err != nil {
 		return err
@@ -394,7 +466,7 @@ func (u *Updater) downloadTo(targetURL string, f *os.File) error {
 		return fmt.Errorf("HTTP %d", resp.StatusCode)
 	}
 
-	n, err := io.Copy(f, resp.Body)
+	n, err := io.Copy(w, resp.Body)
 	if err != nil {
 		return err
 	}
