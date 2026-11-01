@@ -8,6 +8,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"io"
 	"net"
 	"net/http"
 	"net/http/httptest"
@@ -199,6 +200,47 @@ func TestHTTPProbeCountsRedirects(t *testing.T) {
 	}
 	if report.Status != http.StatusOK || report.Redirects != 1 {
 		t.Fatalf("重定向处理异常: %+v", report)
+	}
+}
+
+// TestHTTPProbePostWithHeadersAndBody 验证 HTTPProbe 支持 POST 请求体、自定义请求头及 ResponseBody 回传。
+func TestHTTPProbePostWithHeadersAndBody(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			t.Errorf("Method = %s, want POST", r.Method)
+		}
+		if r.Header.Get("X-Custom-Header") != "my-header" {
+			t.Errorf("X-Custom-Header = %s, want my-header", r.Header.Get("X-Custom-Header"))
+		}
+		bodyBytes, err := io.ReadAll(r.Body)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if string(bodyBytes) != "param1=val1&param2=val2" {
+			t.Errorf("Body = %s, want param1=val1&param2=val2", string(bodyBytes))
+		}
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(`{"code":200,"data":[{"url":"http://m7.music.126.net/test.mp3"}]}`))
+	}))
+	defer srv.Close()
+
+	job := model.Job{
+		Target:    srv.URL,
+		Method:    "POST",
+		Headers:   map[string]string{"X-Custom-Header": "my-header"},
+		Body:      "param1=val1&param2=val2",
+		TimeoutMS: 5000,
+	}
+	report, err := HTTPProbe(context.Background(), job, true)
+	if err != nil {
+		t.Fatalf("HTTPProbe POST 失败: %v", err)
+	}
+	if report.Status != http.StatusOK {
+		t.Fatalf("Status = %d, want 200", report.Status)
+	}
+	if !strings.Contains(report.ResponseBody, "http://m7.music.126.net/test.mp3") {
+		t.Fatalf("ResponseBody 未正确返回: %s", report.ResponseBody)
 	}
 }
 

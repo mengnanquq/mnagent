@@ -19,15 +19,18 @@ var (
 // Kind 决定执行方式：空/"trace" 走 nexttrace；"miaospeed" 走 miaospeed 代理测速；
 // "ping"/"tcping"/"http"/"dns" 由本进程内的探针实现（不依赖外部二进制）。
 type Job struct {
-	ID        string `json:"id"`
-	Kind      string `json:"kind,omitempty"`
-	Target    string `json:"target"`
-	Hops      int    `json:"hops,omitempty"`
-	Port      int    `json:"port,omitempty"`
-	Protocol  string `json:"protocol,omitempty"`
-	Count     int    `json:"count,omitempty"`
-	Query     string `json:"query,omitempty"`
-	TimeoutMS int64  `json:"timeout_ms"`
+	ID        string            `json:"id"`
+	Kind      string            `json:"kind,omitempty"`
+	Target    string            `json:"target"`
+	Hops      int               `json:"hops,omitempty"`
+	Port      int               `json:"port,omitempty"`
+	Protocol  string            `json:"protocol,omitempty"`
+	Count     int               `json:"count,omitempty"`
+	Query     string            `json:"query,omitempty"`
+	Method    string            `json:"method,omitempty"`
+	Headers   map[string]string `json:"headers,omitempty"`
+	Body      string            `json:"body,omitempty"`
+	TimeoutMS int64             `json:"timeout_ms"`
 }
 
 // 任务超时的夹取区间。
