@@ -192,8 +192,8 @@ func parseSingleSlot(slot slaveEntrySlot, node *MiaospeedNode, plan miaospeedTes
 		case matrixInboundGeoIP:
 			inIP, inGeo := parseMatrixGeo(m.Payload)
 			rep.InboundGeo = inGeo
-			if rep.InboundGeo == rep.NodeName || rep.InboundGeo == rep.Server || rep.InboundGeo == "" {
-				// 若 miaospeed 原生未能解析入站 Geo（如 IPv6 节点因官方核心缺少端口剥离 bug 导致查询失败），从节点 server 主动提取并解析入站 Geo
+			// 若 miaospeed 原生未能解析入站 Geo，或仅返回了裸国别简写（如 "TW"、"CN"）而缺少详细 ISP，从节点 server 主动提取并解析入站 Geo
+			if rep.InboundGeo == rep.NodeName || rep.InboundGeo == rep.Server || rep.InboundGeo == "" || len(strings.TrimSpace(rep.InboundGeo)) <= 3 || !strings.Contains(rep.InboundGeo, " ") {
 				if node != nil && node.Server != "" && !isLocalHost(node.Server) {
 					sHost := extractHost(node.Server)
 					if resolvedIP, resolvedGeo := queryIPGeo(sHost); resolvedGeo != "" && resolvedGeo != "本地直连" {
@@ -623,6 +623,45 @@ func queryIPGeo(host string) (ip, geo string) {
 					}
 				}
 				_ = respSB.Body.Close()
+			}
+		}
+	}
+
+	if geo == "" {
+		reqAPI, err := http.NewRequest(http.MethodGet, "http://ip-api.com/json/"+targetIP, nil)
+		if err == nil {
+			reqAPI.Header.Set("User-Agent", "Mozilla/5.0")
+			respAPI, err := client.Do(reqAPI)
+			if err == nil {
+				if respAPI.StatusCode == http.StatusOK {
+					var infoAPI struct {
+						Country string `json:"country"`
+						ISP     string `json:"isp"`
+						Org     string `json:"org"`
+						Query   string `json:"query"`
+						Status  string `json:"status"`
+					}
+					if err := json.NewDecoder(io.LimitReader(respAPI.Body, 64*1024)).Decode(&infoAPI); err == nil && infoAPI.Status == "success" {
+						if infoAPI.Query != "" {
+							targetIP = infoAPI.Query
+						}
+						parts := make([]string, 0, 2)
+						if infoAPI.Country != "" {
+							parts = append(parts, infoAPI.Country)
+						}
+						isp := infoAPI.ISP
+						if isp == "" || isp == infoAPI.Country {
+							isp = infoAPI.Org
+						}
+						if isp != "" && isp != infoAPI.Country {
+							parts = append(parts, isp)
+						}
+						if len(parts) > 0 {
+							geo = strings.Join(parts, " ")
+						}
+					}
+				}
+				_ = respAPI.Body.Close()
 			}
 		}
 	}

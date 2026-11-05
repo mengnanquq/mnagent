@@ -1614,6 +1614,57 @@ func TestIPv6InboundGeoFallback(t *testing.T) {
 	}
 }
 
+// TestInboundGeoFallbackWhenBareCountryCode 验证当 miaospeed 原生仅返回纯国别简写（如 "TW"）而缺少运营商时，
+// 系统能主动从节点 server 执行主动查询并补全运营商/地域。
+func TestInboundGeoFallbackWhenBareCountryCode(t *testing.T) {
+	node := &MiaospeedNode{
+		Name:     "CNIX",
+		Protocol: "ss",
+		Server:   "1.14.0.1:8388",
+	}
+	geoCacheMu.Lock()
+	geoCacheMap["1.14.0.1"] = struct{ ip, geo string }{ip: "1.14.0.1", geo: "China Shenzhen Tencent"}
+	geoCacheMu.Unlock()
+
+	// 模拟 miaospeed 核心因回退至代理自身出口 trace 而错误返回 "TW"
+	slot := slaveEntrySlot{
+		Matrices: []matrixResponse{
+			{Type: matrixInboundGeoIP, Payload: `{"Domain":"1.14.0.1:8388","MainStack":{"country":"TW","ip":"1.14.0.1"}}`},
+		},
+	}
+	rep := parseSingleSlot(slot, node, miaospeedTestPlan{})
+	if !strings.Contains(rep.InboundGeo, "China Shenzhen Tencent") {
+		t.Fatalf("入站信息应由节点 server 主动修正为腾讯云，实际: %q", rep.InboundGeo)
+	}
+	if !strings.Contains(rep.InboundGeo, "1.14.0.1") {
+		t.Fatalf("入站信息应保留脱敏前的入站 IP，实际: %q", rep.InboundGeo)
+	}
+}
+
+// TestIPScriptNoCloudflareTraceInHandler 验证 ip_fast 脚本中 handler(ip) 不再使用 cdn-cgi/trace 产生误判。
+func TestIPScriptNoCloudflareTraceInHandler(t *testing.T) {
+	scripts := buildDefaultMediaScripts()
+	var ipScript *slaveScript
+	for i := range scripts {
+		if scripts[i].ID == "ip_fast" {
+			ipScript = &scripts[i]
+			break
+		}
+	}
+	if ipScript == nil {
+		t.Fatal("未找到 ip_fast 脚本")
+	}
+	// 截取 handler 函数内容
+	idx := strings.Index(ipScript.Content, "function handler(ip)")
+	if idx < 0 {
+		t.Fatal("未在 ip_fast 脚本中找到 handler(ip)")
+	}
+	handlerBody := ipScript.Content[idx:]
+	if strings.Contains(handlerBody, "cdn-cgi/trace") {
+		t.Fatal("handler(ip) 中绝不能使用 cdn-cgi/trace 进行目标 IP 归属地判断，否则会污染入站 IP 为代理出口地域")
+	}
+}
+
 // TestWaitForPortReady 验证端口连通探测与超时/取消机制。
 func TestWaitForPortReady(t *testing.T) {
 	l, err := net.Listen("tcp", "127.0.0.1:0")

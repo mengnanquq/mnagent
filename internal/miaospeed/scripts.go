@@ -54,24 +54,45 @@ function handler(ip) {
         region = get(ret, "region_name", "");
     }
     if (!country && !countryCode) {
-        var trace = fetch("https://www.cloudflare.com/cdn-cgi/trace", {
+        var sbUrl = "https://api.ip.sb/geoip/" + ip;
+        var sbContent = fetch(sbUrl, {
             headers: {'User-Agent': 'Mozilla/5.0'},
-            timeout: 1500
+            retry: 1,
+            timeout: 1800
         });
-        var b = (get(trace, "body") || "").trim();
-        var mLoc = b.match(/loc=([A-Z]{2})/);
-        if (mLoc && mLoc[1]) {
-            countryCode = mLoc[1];
-            country = mLoc[1];
+        var sbRet = safeParse(get(sbContent, "body"));
+        if (sbRet) {
+            country = get(sbRet, "country", "");
+            countryCode = get(sbRet, "country_code", "");
+            isp = get(sbRet, "isp", "");
+            org = get(sbRet, "organization", isp);
+            city = get(sbRet, "city", "");
+            region = get(sbRet, "region", "");
+        }
+    }
+    if (!country && !countryCode) {
+        var apiContent = fetch("http://ip-api.com/json/" + ip, {
+            headers: {'User-Agent': 'Mozilla/5.0'},
+            retry: 1,
+            timeout: 1800
+        });
+        var apiRet = safeParse(get(apiContent, "body"));
+        if (apiRet && get(apiRet, "status") === "success") {
+            country = get(apiRet, "country", "");
+            countryCode = get(apiRet, "countryCode", "");
+            isp = get(apiRet, "isp", "");
+            org = get(apiRet, "org", isp);
+            city = get(apiRet, "city", "");
+            region = get(apiRet, "regionName", "");
         }
     }
     return {
         "ip": ip,
-        "isp": isp || org || countryCode || "Internet",
-        "organization": org || isp,
+        "isp": isp || org || country || "",
+        "organization": org || isp || "",
         "region": region,
         "city": city,
-        "country": country || countryCode,
+        "country": country || countryCode || "",
         "country_code": countryCode
     };
 }`,
