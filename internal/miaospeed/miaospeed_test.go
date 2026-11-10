@@ -1760,3 +1760,20 @@ type testLogger struct{ t *testing.T }
 func (tl testLogger) Info(msg string, args ...any)  { tl.t.Logf("[INFO] "+msg, args...) }
 func (tl testLogger) Warn(msg string, args ...any)  { tl.t.Logf("[WARN] "+msg, args...) }
 func (tl testLogger) Debug(msg string, args ...any) { tl.t.Logf("[DEBUG] "+msg, args...) }
+
+func TestParseProxyURI_SetsNodeURL(t *testing.T) {
+	vlessURI := "vless://uuid123@1.1.1.1:443?security=none#%E6%B5%8B%E8%AF%95%E8%8A%82%E7%82%B9"
+	node, err := parseProxyURI(vlessURI)
+	if err != nil {
+		t.Fatalf("解析失败: %v", err)
+	}
+	if node.URL != vlessURI {
+		t.Fatalf("node.URL 期望 %q, 实际: %q", vlessURI, node.URL)
+	}
+
+	slot := slaveEntrySlot{}
+	rep := parseSingleSlot(slot, node, miaospeedTestPlan{})
+	if rep.URL != vlessURI {
+		t.Fatalf("rep.URL 期望 %q, 实际: %q", vlessURI, rep.URL)
+	}
+}

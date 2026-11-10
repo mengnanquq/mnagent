@@ -25,6 +25,7 @@ type MiaospeedNode struct {
 	Server   string
 	Port     int
 	Payload  string // YAML 格式节点配置
+	URL      string // 节点原始或生成的代理 URL
 }
 
 // parseProxyTarget 将任务 Target（单节点链接、订阅 URL 或代理配置文件内容）解析为节点列表。
@@ -368,11 +369,13 @@ func parseClashYAMLProxies(content string) []MiaospeedNode {
 			payload := strings.TrimSpace(currentItem.String())
 			if currentName != "" && payload != "" {
 				srv := formatServerPortString(currentServer, currentPort)
+				nodeURL := formatClashPayloadToURI(payload, currentName, currentType, currentServer, currentPort)
 				nodes = append(nodes, MiaospeedNode{
 					Name:     currentName,
 					Protocol: currentType,
 					Server:   srv,
 					Payload:  payload,
+					URL:      nodeURL,
 				})
 			}
 		}
@@ -419,15 +422,17 @@ func parseClashYAMLProxies(content string) []MiaospeedNode {
 				pType := extractField(rawItem, "type")
 				server := extractField(rawItem, "server")
 				port := extractField(rawItem, "port")
-				if name != "" {
-					srv := formatServerPortString(server, port)
-					nodes = append(nodes, MiaospeedNode{
-						Name:     name,
-						Protocol: pType,
-						Server:   srv,
-						Payload:  rawItem,
-					})
-				}
+					if name != "" {
+						srv := formatServerPortString(server, port)
+						nodeURL := formatClashPayloadToURI(rawItem, name, pType, server, port)
+						nodes = append(nodes, MiaospeedNode{
+							Name:     name,
+							Protocol: pType,
+							Server:   srv,
+							Payload:  rawItem,
+							URL:      nodeURL,
+						})
+					}
 				continue
 			}
 
@@ -876,32 +881,40 @@ func parseProxyURI(rawURI string) (*MiaospeedNode, error) {
 		return nil, fmt.Errorf("无法解析节点链接: %w", err)
 	}
 
+	var node *MiaospeedNode
 	switch strings.ToLower(u.Scheme) {
 	case "anytls":
-		return parseAnyTLSURI(u)
+		node, err = parseAnyTLSURI(u)
 	case "ss":
-		return parseShadowsocksURI(rawURI, u)
+		node, err = parseShadowsocksURI(rawURI, u)
 	case "ssr":
-		return parseSSRURI(rawURI)
+		node, err = parseSSRURI(rawURI)
 	case "vmess":
-		return parseVmessURI(rawURI)
+		node, err = parseVmessURI(rawURI)
 	case "trojan":
-		return parseTrojanURI(u)
+		node, err = parseTrojanURI(u)
 	case "vless":
-		return parseVlessURI(u)
+		node, err = parseVlessURI(u)
 	case "hysteria2", "hy2":
-		return parseHysteria2URI(u)
+		node, err = parseHysteria2URI(u)
 	case "hysteria", "hy":
-		return parseHysteria1URI(u)
+		node, err = parseHysteria1URI(u)
 	case "tuic":
-		return parseTuicURI(u)
+		node, err = parseTuicURI(u)
 	case "socks5", "socks":
-		return parseSocks5URI(u)
+		node, err = parseSocks5URI(u)
 	case "snell":
-		return parseSnellURI(u)
+		node, err = parseSnellURI(u)
 	default:
 		return nil, fmt.Errorf("不支持的代理协议：%s", u.Scheme)
 	}
+	if err != nil {
+		return nil, err
+	}
+	if node != nil {
+		node.URL = rawURI
+	}
+	return node, nil
 }
 
 func parseShadowsocksURI(rawURI string, u *url.URL) (*MiaospeedNode, error) {
@@ -1797,4 +1810,173 @@ func selectJobNodes(allNodes []MiaospeedNode, count int) []MiaospeedNode {
 		return allNodes[:count]
 	}
 	return allNodes
+}
+
+// formatClashPayloadToURI 将 Clash YAML 节点 payload 还原为标准代理 URI。
+func formatClashPayloadToURI(payload, name, pType, server, port string) string {
+	if name == "" || server == "" || port == "" {
+		return ""
+	}
+	f := make(map[string]string)
+	f["name"] = name
+	f["type"] = pType
+	f["server"] = server
+	f["port"] = port
+
+	lines := strings.Split(payload, "\n")
+	for _, l := range lines {
+		l = strings.TrimSpace(l)
+		if idx := strings.Index(l, ":"); idx != -1 {
+			k := strings.ToLower(strings.TrimSpace(l[:idx]))
+			v := strings.Trim(strings.TrimSpace(l[idx+1:]), "\"'")
+			if k != "" && v != "" {
+				f[k] = v
+			}
+		}
+	}
+
+	for _, k := range []string{"uuid", "password", "auth", "cipher", "sni", "servername", "tls", "network", "flow", "alterid", "skip-cert-verify"} {
+		if _, ok := f[k]; !ok {
+			if v := extractField(payload, k); v != "" {
+				f[k] = v
+			}
+		}
+	}
+
+	frag := url.QueryEscape(name)
+	switch strings.ToLower(pType) {
+	case "ss", "shadowsocks":
+		cipher := f["cipher"]
+		pwd := f["password"]
+		if cipher == "" || pwd == "" {
+			return ""
+		}
+		userInfo := base64.URLEncoding.EncodeToString([]byte(cipher + ":" + pwd))
+		return fmt.Sprintf("ss://%s@%s:%s#%s", userInfo, server, port, frag)
+
+	case "trojan":
+		pwd := f["password"]
+		if pwd == "" {
+			return ""
+		}
+		sni := f["sni"]
+		if sni == "" {
+			sni = f["servername"]
+		}
+		q := url.Values{}
+		if sni != "" {
+			q.Set("sni", sni)
+		}
+		var qStr string
+		if len(q) > 0 {
+			qStr = "?" + q.Encode()
+		}
+		return fmt.Sprintf("trojan://%s@%s:%s%s#%s", url.QueryEscape(pwd), server, port, qStr, frag)
+
+	case "vless":
+		uuid := f["uuid"]
+		if uuid == "" {
+			return ""
+		}
+		q := url.Values{}
+		q.Set("encryption", "none")
+		if net := f["network"]; net != "" {
+			q.Set("type", net)
+		}
+		sni := f["sni"]
+		if sni == "" {
+			sni = f["servername"]
+		}
+		if sni != "" {
+			q.Set("sni", sni)
+		}
+		if tls := strings.ToLower(f["tls"]); tls == "true" || tls == "1" || sni != "" {
+			q.Set("security", "tls")
+		}
+		if flow := f["flow"]; flow != "" {
+			q.Set("flow", flow)
+		}
+		return fmt.Sprintf("vless://%s@%s:%s?%s#%s", uuid, server, port, q.Encode(), frag)
+
+	case "hysteria2", "hy2":
+		pwd := f["password"]
+		if pwd == "" {
+			pwd = f["auth"]
+		}
+		if pwd == "" {
+			return ""
+		}
+		sni := f["sni"]
+		if sni == "" {
+			sni = f["servername"]
+		}
+		q := url.Values{}
+		if sni != "" {
+			q.Set("sni", sni)
+		}
+		if ins := strings.ToLower(f["skip-cert-verify"]); ins == "true" || ins == "1" {
+			q.Set("insecure", "1")
+		}
+		var qStr string
+		if len(q) > 0 {
+			qStr = "?" + q.Encode()
+		}
+		return fmt.Sprintf("hysteria2://%s@%s:%s%s#%s", url.QueryEscape(pwd), server, port, qStr, frag)
+
+	case "vmess":
+		uuid := f["uuid"]
+		if uuid == "" {
+			return ""
+		}
+		pNum, _ := strconv.Atoi(port)
+		aid := 0
+		if aStr := f["alterid"]; aStr != "" {
+			aid, _ = strconv.Atoi(aStr)
+		}
+		netType := f["network"]
+		if netType == "" {
+			netType = "tcp"
+		}
+		tls := ""
+		if strings.ToLower(f["tls"]) == "true" || strings.ToLower(f["tls"]) == "1" {
+			tls = "tls"
+		}
+		sni := f["sni"]
+		if sni == "" {
+			sni = f["servername"]
+		}
+
+		vmJSON := map[string]any{
+			"v":    "2",
+			"ps":   name,
+			"add":  server,
+			"port": pNum,
+			"id":   uuid,
+			"aid":  aid,
+			"net":  netType,
+			"type": "none",
+			"host": sni,
+			"tls":  tls,
+		}
+		jBytes, err := json.Marshal(vmJSON)
+		if err != nil {
+			return ""
+		}
+		return "vmess://" + base64.StdEncoding.EncodeToString(jBytes)
+
+	case "tuic":
+		uuid := f["uuid"]
+		pwd := f["password"]
+		if uuid == "" && pwd == "" {
+			return ""
+		}
+		auth := uuid
+		if auth == "" {
+			auth = pwd
+		}
+		return fmt.Sprintf("tuic://%s@%s:%s#%s", auth, server, port, frag)
+
+	default:
+		return ""
+	}
 }

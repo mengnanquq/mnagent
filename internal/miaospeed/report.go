@@ -22,6 +22,7 @@ type MiaospeedReport struct {
 	NodeName         string            `json:"node_name"`
 	Protocol         string            `json:"protocol,omitempty"`
 	Server           string            `json:"server,omitempty"`
+	URL              string            `json:"url,omitempty"`
 	HTTPCode         int               `json:"http_code,omitempty"`
 	PingRTTMs        float64           `json:"ping_rtt_ms,omitempty"`
 	PingConnMs       float64           `json:"ping_conn_ms,omitempty"`
@@ -174,6 +175,7 @@ func parseSingleSlot(slot slaveEntrySlot, node *MiaospeedNode, plan miaospeedTes
 		rep.NodeName = node.Name
 		rep.Protocol = node.Protocol
 		rep.Server = node.Server
+		rep.URL = node.URL
 	}
 	for _, m := range slot.Matrices {
 		switch m.Type {
