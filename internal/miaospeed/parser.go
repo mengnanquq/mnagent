@@ -422,17 +422,17 @@ func parseClashYAMLProxies(content string) []MiaospeedNode {
 				pType := extractField(rawItem, "type")
 				server := extractField(rawItem, "server")
 				port := extractField(rawItem, "port")
-					if name != "" {
-						srv := formatServerPortString(server, port)
-						nodeURL := formatClashPayloadToURI(rawItem, name, pType, server, port)
-						nodes = append(nodes, MiaospeedNode{
-							Name:     name,
-							Protocol: pType,
-							Server:   srv,
-							Payload:  rawItem,
-							URL:      nodeURL,
-						})
-					}
+				if name != "" {
+					srv := formatServerPortString(server, port)
+					nodeURL := formatClashPayloadToURI(rawItem, name, pType, server, port)
+					nodes = append(nodes, MiaospeedNode{
+						Name:     name,
+						Protocol: pType,
+						Server:   srv,
+						Payload:  rawItem,
+						URL:      nodeURL,
+					})
+				}
 				continue
 			}
 
