@@ -1,12 +1,12 @@
 # ⚡ mnagent
 
-运行在拨测探针主机上的轻量化高性能 Agent，专为配合 Telegram 机器人 [@mengna_app](https://t.me/mengna_app) 协同工作而设计。
+运行在拨测探针主机上的轻量化高性能 Agent，专为配合网络拨测与节点测速服务端协同工作而设计。
 
 Agent 通过 HTTPS **主动长轮询**接收服务端下发的网络探测与节点测速任务，在本地执行后结构化回传结果。
 
-- 🔒 **网络零暴露**：**无需公网 IP、无需端口映射、无需 SSH**，只要探针能正常出站访问机器人即可。
+- 🔒 **网络零暴露**：**无需公网 IP、无需端口映射、无需 SSH**，只要探针能正常出站访问服务端即可。
 - 🔑 **令牌即身份**：每台主机单令牌鉴权（`--token` 或动态读取 `--token-file`），在线轮换无需重启。
-- 🔄 **全自动运维**：自动探测、补全与静默升级外部依赖（`nexttrace` / `miaospeed`），支持后台自更新与机器人端一键远程升级。
+- 🔄 **全自动运维**：自动探测、补全与静默升级外部依赖（`nexttrace` / `miaospeed`），支持后台自更新与服务端一键远程升级。
 - 🛡️ **安全沙箱防线**：默认严格拦截回环、内网私有网段及公有云元数据地址（`169.254.169.254` 等），防御 SSRF；命令参数白名单隔离，不经 Shell 解释器执行。
 
 ---
@@ -26,18 +26,18 @@ Agent 通过 HTTPS **主动长轮询**接收服务端下发的网络探测与节
 
 ## 🚀 快速安装
 
-在 Telegram 机器人中向管理员发送 `/host add <节点名>` 即可自动生成已预填参数的一键安装命令：
+在 Telegram 中发送 `/host add <节点名>` 即可自动生成已预填参数的一键安装命令：
 
 ### Linux / OpenWrt / macOS
 ```sh
 (curl -fsSL https://raw.githubusercontent.com/mengnanquq/mnagent/main/install.sh \
   || wget -qO- https://raw.githubusercontent.com/mengnanquq/mnagent/main/install.sh) \
-  | sh -s -- --bot https://<机器人地址>/agent --token <令牌>
+  | sh -s -- --bot https://<服务端地址>/agent --token <令牌>
 ```
 
 ### Windows (以管理员身份打开 PowerShell)
 ```powershell
-& ([scriptblock]::Create((irm https://raw.githubusercontent.com/mengnanquq/mnagent/main/install.ps1))) -Bot "https://<机器人地址>/agent" -Token "<令牌>"
+& ([scriptblock]::Create((irm https://raw.githubusercontent.com/mengnanquq/mnagent/main/install.ps1))) -Bot "https://<服务端地址>/agent" -Token "<令牌>"
 ```
 
 > **网络受限 / 国内加速**：
@@ -59,10 +59,10 @@ Agent 通过 HTTPS **主动长轮询**接收服务端下发的网络探测与节
 
 ## 🩺 本地自检与 CLI 探针调试
 
-无需经过 Telegram 机器人，可在探针主机终端直接执行诊断与网络探测：
+无需经过 Telegram 服务端，可在探针主机终端直接执行诊断与网络探测：
 
 ```sh
-# 1. 一键健康体检（依赖完整度、ICMP 套接字权限、DNS、IPv6 及机器人连接测试）
+# 1. 一键健康体检（依赖完整度、ICMP 套接字权限、DNS、IPv6 及服务端连接测试）
 mnagent -diag
 
 # 2. 本地执行单次网络探针测试
@@ -83,7 +83,7 @@ mnagent -apply-update latest         # 立即升级到最新版本并平滑重�
 
 | 参数 | 默认值 | 说明 |
 | :--- | :--- | :--- |
-| **`-bot <url>`** | 必填 | 机器人 Agent 接口基地址（如 `https://mnbot.example.org/agent`） |
+| **`-bot <url>`** | 必填 | 服务端 Agent 接口基地址（如 `https://mnbot.example.org/agent`） |
 | **`-token <value>`** | — | 接入令牌（亦可通过环境变量 `MNAGENT_TOKEN` 传入） |
 | **`-token-file <path>`** | 平台默认路径 | 令牌持久化文件；动态读取，**线上轮换令牌无需重启服务** |
 | **`-auto-update`** | `false` | 是否开启后台定时自动检查并升级（一键脚本安装默认开启） |
@@ -96,7 +96,7 @@ mnagent -apply-update latest         # 立即升级到最新版本并平滑重�
 
 ## ❓ 常见问题排查
 
-- **机器人端显示 ⚪️ 离线**：先运行 `mnagent -diag` 检查主机到机器人的 HTTPS 连通性，再确认系统服务运行状态（如 `systemctl status mnagent`）。
+- **服务端显示 ⚪️ 离线**：先运行 `mnagent -diag` 检查主机到服务端的 HTTPS 连通性，再确认系统服务运行状态（如 `systemctl status mnagent`）。
 - **日志提示 `鉴权失败`**：令牌与服务端不一致；可通过 Telegram `/host rotate` 重新生成，或直接修改令牌文件（Linux: `/etc/mnagent/token`）。
 - **报错 `无法启动 nexttrace/miaospeed`**：运行 `mnagent -apply-update latest` 触发依赖自动补全下载；网络受限环境请配置 `-gh-proxy`。
 - **Ping 探针报套接字权限不足**：systemd 需配置 `AmbientCapabilities=CAP_NET_RAW CAP_NET_ADMIN`（重新执行安装脚本会自动修复）；OpenWrt 需以 root 运行。
