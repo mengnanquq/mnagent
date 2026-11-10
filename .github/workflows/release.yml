@@ -1,13 +1,19 @@
 name: release
 
-# 支持打 v* 标签或推送 main 分支触发 Release 构建与发布。
-# 安装脚本默认从 releases/latest/download/mnagent_<os>_<arch> 下载，
-# 主机上的一键安装或后台自更新即可自动获取最新二进制。
+# 仅支持手动执行发布：
+# 1. 在 GitHub Actions 页面手动点击 "Run workflow"（可自定义 tag 或留空自动递增 patch 版本号）。
+# 2. 本地手动打 v* 标签并推送到远端（如 git tag v0.4.0 && git push origin v0.4.0）。
+# 普通代码推送不再自动打 tag 或发布 Release。
 on:
+  workflow_dispatch:
+    inputs:
+      tag_name:
+        description: 'Release 标签版本号 (例如 v0.4.0)，留空则基于最新标签自动递增 patch'
+        required: false
+        default: ''
+        type: string
   push:
     tags: ['v*']
-    branches: ['main']
-  workflow_dispatch:
 
 permissions:
   contents: write
@@ -26,13 +32,25 @@ jobs:
       - name: Compute version
         id: version
         run: |
+          # 1. 若由推 tag 触发 (refs/tags/v*)
           if [[ "${GITHUB_REF}" == refs/tags/v* ]]; then
             echo "version=${GITHUB_REF_NAME}" >> "$GITHUB_OUTPUT"
             exit 0
           fi
 
-          # 推送 main 时：查找最新 git 标签，递增 patch 版本号
-          latest_tag=$(git tag -l "v*" --sort=-v:refname | head -n1)
+          # 2. 若由 workflow_dispatch 手动指定了 tag_name
+          input_tag="${{ github.event.inputs.tag_name }}"
+          input_tag=$(echo "$input_tag" | xargs)
+          if [ -n "$input_tag" ]; then
+            if [[ "$input_tag" != v* ]]; then
+              input_tag="v${input_tag}"
+            fi
+            echo "version=${input_tag}" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          # 3. workflow_dispatch 留空时：查找最新版本标签，递增 patch 生成纯语义化版本号
+          latest_tag=$(git tag -l "v*" | grep -E '^v[0-9]+\.[0-9]+\.[0-9]+' | sort -V | tail -n1)
           if [ -z "$latest_tag" ]; then
             latest_tag="v0.0.0"
           fi
@@ -49,11 +67,9 @@ jobs:
           patch=${patch:-0}
 
           next_patch=$((patch + 1))
-          ts=$(date -u +'%Y%m%d%H%M%S')
-          short_sha=$(echo "${GITHUB_SHA}" | cut -c1-7)
-          version="v${major}.${minor}.${next_patch}-main.${ts}.${short_sha}"
+          version="v${major}.${minor}.${next_patch}"
 
-          echo "Calculated main release version: $version"
+          echo "Calculated release version: $version"
           echo "version=${version}" >> "$GITHUB_OUTPUT"
 
   build:
