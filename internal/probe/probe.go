@@ -38,14 +38,13 @@ const (
 
 // 探针默认参数与上限。
 const (
-	defaultPingCount     = 4
-	defaultTCPingCount   = 4
-	maxProbeCount        = 20
-	probeInterval        = time.Second
-	pingPayloadSize      = 32
-	httpMaxBodyBytes     = 8 << 10 // 默认诊断模式读取字节数
-	httpMaxResponseBytes = 1 << 20 // 支持完整中继响应时的上限（1MB）
-	httpMaxRedirects     = 5
+	defaultPingCount   = 4
+	defaultTCPingCount = 4
+	maxProbeCount      = 20
+	probeInterval      = time.Second
+	pingPayloadSize    = 32
+	httpMaxBodyBytes   = 8 << 10 // 默认诊断模式读取字节数
+	httpMaxRedirects   = 5
 )
 
 // LatencyAttempt 是一次延迟探测的结果（ping 与 tcping 共用）。
@@ -73,24 +72,23 @@ type LatencyReport struct {
 
 // HTTPReport 是 HTTP 拨测的结构化结果（各阶段耗时便于定位瓶颈）。
 type HTTPReport struct {
-	URL          string            `json:"url"`
-	Status       int               `json:"status"`
-	StatusText   string            `json:"status_text,omitempty"`
-	RemoteIP     string            `json:"remote_ip,omitempty"`
-	TLS          bool              `json:"tls"`
-	CertExpiry   string            `json:"cert_expiry,omitempty"`
-	Redirects    int               `json:"redirects"`
-	DNSMs        float64           `json:"dns_ms"`
-	ConnectMs    float64           `json:"connect_ms"`
-	TLSHandMs    float64           `json:"tls_ms"`
-	TTFBMs       float64           `json:"ttfb_ms"`
-	TotalMs      float64           `json:"total_ms"`
-	BodySnippet  string            `json:"body_snippet,omitempty"`
-	ResponseBody string            `json:"response_body,omitempty"`
-	Proto        string            `json:"proto,omitempty"`
-	TLSVersion   string            `json:"tls_version,omitempty"`
-	CertIssuer   string            `json:"cert_issuer,omitempty"`
-	Headers      map[string]string `json:"headers,omitempty"`
+	URL         string            `json:"url"`
+	Status      int               `json:"status"`
+	StatusText  string            `json:"status_text,omitempty"`
+	RemoteIP    string            `json:"remote_ip,omitempty"`
+	TLS         bool              `json:"tls"`
+	CertExpiry  string            `json:"cert_expiry,omitempty"`
+	Redirects   int               `json:"redirects"`
+	DNSMs       float64           `json:"dns_ms"`
+	ConnectMs   float64           `json:"connect_ms"`
+	TLSHandMs   float64           `json:"tls_ms"`
+	TTFBMs      float64           `json:"ttfb_ms"`
+	TotalMs     float64           `json:"total_ms"`
+	BodySnippet string            `json:"body_snippet,omitempty"`
+	Proto       string            `json:"proto,omitempty"`
+	TLSVersion  string            `json:"tls_version,omitempty"`
+	CertIssuer  string            `json:"cert_issuer,omitempty"`
+	Headers     map[string]string `json:"headers,omitempty"`
 }
 
 // DNSReport 是 DNS 查询的结构化结果。
@@ -559,24 +557,11 @@ func HTTPProbe(ctx context.Context, job model.Job, allowPrivate bool) (HTTPRepor
 	reqCtx, cancel := context.WithTimeout(httptrace.WithClientTrace(ctx, trace), timeout)
 	defer cancel()
 
-	method := strings.ToUpper(strings.TrimSpace(job.Method))
-	if method == "" {
-		method = http.MethodGet
-	}
-
-	var reqBody io.Reader
-	if job.Body != "" {
-		reqBody = strings.NewReader(job.Body)
-	}
-
-	req, err := http.NewRequestWithContext(reqCtx, method, parsed.String(), reqBody)
+	req, err := http.NewRequestWithContext(reqCtx, http.MethodGet, parsed.String(), nil)
 	if err != nil {
 		return report, err
 	}
 	req.Header.Set("User-Agent", "mnagent/"+Version)
-	for k, v := range job.Headers {
-		req.Header.Set(k, v)
-	}
 
 	dialer := &net.Dialer{Timeout: timeout}
 	transport := &http.Transport{
@@ -643,11 +628,7 @@ func HTTPProbe(ctx context.Context, job model.Job, allowPrivate bool) (HTTPRepor
 	}
 	defer resp.Body.Close()
 
-	readLimit := int64(httpMaxBodyBytes)
-	if method == http.MethodPost || len(job.Headers) > 0 {
-		readLimit = httpMaxResponseBytes
-	}
-	body, _ := io.ReadAll(io.LimitReader(resp.Body, readLimit))
+	body, _ := io.ReadAll(io.LimitReader(resp.Body, httpMaxBodyBytes))
 	report.Status = resp.StatusCode
 	report.StatusText = resp.Status
 	report.Redirects = redirects
@@ -655,9 +636,6 @@ func HTTPProbe(ctx context.Context, job model.Job, allowPrivate bool) (HTTPRepor
 	report.Proto = resp.Proto
 	report.DNSMs, report.ConnectMs, report.TLSHandMs, report.TTFBMs = dnsMs, connMs, tlsMs, ttfbMs
 	report.TotalMs = sinceMs(start)
-	if len(body) > 0 {
-		report.ResponseBody = string(body)
-	}
 	if resp.TLS != nil {
 		switch resp.TLS.Version {
 		case tls.VersionTLS13:
