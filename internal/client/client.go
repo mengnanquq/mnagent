@@ -10,8 +10,11 @@ import (
 	"net"
 	"net/http"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"time"
+
+	"github.com/coder/websocket"
 
 	"github.com/mengnanquq/mnagent/internal/config"
 	"github.com/mengnanquq/mnagent/internal/model"
@@ -35,6 +38,14 @@ type Client struct {
 
 	isp    atomic.Pointer[string]
 	paused atomic.Bool // 更新期间暂停轮询，避免新旧版本交替领取任务。
+
+	// WebSocket 长连接（可用时优先使用，否则回退 HTTP）
+	wsDisabled bool
+	wsHTTP     *http.Client
+	wsOnce     sync.Once
+	ws         atomic.Pointer[websocket.Conn]
+	wsJobs     chan *model.Job
+	wsISP      atomic.Pointer[string] // 已同步给机器人的 ISP
 }
 
 // New 构建通信客户端；轮询超时略大于机器人侧的长轮询保持时间。
@@ -58,6 +69,9 @@ func New(cfg *config.Config) *Client {
 			Transport: transport,
 			Timeout:   cfg.PollTimeout,
 		},
+		wsDisabled: wsDisabledByEnv(),
+		wsHTTP:     newWSHTTPClient(),
+		wsJobs:     make(chan *model.Job, 64),
 	}
 }
 
@@ -65,6 +79,9 @@ func New(cfg *config.Config) *Client {
 func (c *Client) SetISP(isp string) {
 	s := strings.TrimSpace(isp)
 	c.isp.Store(&s)
+	if c.WSConnected() {
+		c.syncISP()
+	}
 }
 
 func (c *Client) setISP(isp string) {
@@ -83,15 +100,30 @@ func (c *Client) getISP() string {
 	return c.GetISP()
 }
 
-// SetPaused 设置更新暂停状态。
+// SetPaused 设置更新暂停状态；暂停时断开长连接，避免机器人继续推送任务。
 func (c *Client) SetPaused(paused bool) {
 	c.paused.Store(paused)
+	if paused {
+		if conn := c.ws.Load(); conn != nil {
+			_ = conn.Close(websocket.StatusGoingAway, "agent updating")
+		}
+	}
 }
 
 // Poll 领取一个任务；无任务时返回 (nil, nil)。
 func (c *Client) Poll(ctx context.Context) (*model.Job, error) {
 	if c.paused.Load() {
 		return nil, model.ErrUpdating
+	}
+	c.startWS(ctx)
+	// 先取走长连接已推送的任务（含断线前缓冲的）
+	select {
+	case job := <-c.wsJobs:
+		return job, nil
+	default:
+	}
+	if c.WSConnected() {
+		return c.pollWS(ctx)
 	}
 	resp, err := c.do(ctx, http.MethodPost, "/jobs", nil)
 	if err != nil {
@@ -106,11 +138,8 @@ func (c *Client) Poll(ctx context.Context) (*model.Job, error) {
 		if err := json.NewDecoder(io.LimitReader(resp.Body, maxResponseBytes)).Decode(&job); err != nil {
 			return nil, fmt.Errorf("解析任务失败: %w", err)
 		}
-		if strings.TrimSpace(job.ID) == "" {
-			return nil, errors.New("任务缺少必需字段 ID")
-		}
-		if job.Kind != "cancel" && strings.TrimSpace(job.Target) == "" {
-			return nil, errors.New("任务缺少必需字段 Target")
+		if err := validateJob(&job); err != nil {
+			return nil, err
 		}
 		return &job, nil
 	case http.StatusUnauthorized:
@@ -120,12 +149,26 @@ func (c *Client) Poll(ctx context.Context) (*model.Job, error) {
 	}
 }
 
+// validateJob 校验任务必需字段。
+func validateJob(job *model.Job) error {
+	if strings.TrimSpace(job.ID) == "" {
+		return errors.New("任务缺少必需字段 ID")
+	}
+	if job.Kind != "cancel" && strings.TrimSpace(job.Target) == "" {
+		return errors.New("任务缺少必需字段 Target")
+	}
+	return nil
+}
+
 func (c *Client) poll(ctx context.Context) (*model.Job, error) {
 	return c.Poll(ctx)
 }
 
 // SendResult 回传执行结果，失败时按退避重试。
 func (c *Client) SendResult(ctx context.Context, res model.Result) error {
+	if c.wsSend(ctx, wsMessage{Type: "result", Result: &res}) == nil {
+		return nil
+	}
 	payload, err := json.Marshal(res)
 	if err != nil {
 		return err
@@ -163,7 +206,11 @@ func (c *Client) sendResult(ctx context.Context, res model.Result) error {
 }
 
 // SendProgress 上报实时进度，返回机器人是否要求取消该任务（单次网络错误不阻塞主流程）。
+// 长连接模式下取消指令由机器人主动推送，这里固定返回 false。
 func (c *Client) SendProgress(ctx context.Context, p model.Progress) (bool, error) {
+	if c.wsSend(ctx, wsMessage{Type: "progress", Progress: &p}) == nil {
+		return false, nil
+	}
 	payload, err := json.Marshal(p)
 	if err != nil {
 		return false, err
@@ -187,7 +234,11 @@ func (c *Client) sendProgress(ctx context.Context, p model.Progress) (bool, erro
 }
 
 // Heartbeat 发送轻量保活心跳，更新服务端的 lastSeen 时间戳。
+// 长连接在线时无需心跳（连接本身即在线状态），直接返回。
 func (c *Client) Heartbeat(ctx context.Context) error {
+	if c.WSConnected() {
+		return nil
+	}
 	resp, err := c.do(ctx, http.MethodPost, "/heartbeat", nil)
 	if err != nil {
 		return err

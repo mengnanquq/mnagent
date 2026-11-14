@@ -4,4 +4,7 @@ go 1.26.0
 
 require golang.org/x/net v0.59.0
 
-require golang.org/x/sys v0.48.0 // indirect
+require (
+	github.com/coder/websocket v1.8.15 // indirect
+	golang.org/x/sys v0.48.0 // indirect
+)

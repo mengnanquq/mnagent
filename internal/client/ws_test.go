@@ -1,0 +1,162 @@
+package client
+
+import (
+	"context"
+	"encoding/json"
+	"net/http"
+	"net/http/httptest"
+	"os"
+	"sync/atomic"
+	"testing"
+	"time"
+
+	"github.com/coder/websocket"
+
+	"github.com/mengnanquq/mnagent/internal/model"
+)
+
+// 既有 HTTP 用例默认关闭 WebSocket，避免测试服务器收到 /ws 握手。
+func TestMain(m *testing.M) {
+	os.Setenv("MNAGENT_DISABLE_WS", "1")
+	os.Exit(m.Run())
+}
+
+func newWSClient(url string) *Client {
+	cli := New(testConfig(url, nil))
+	cli.wsDisabled = false
+	return cli
+}
+
+func waitFor(t *testing.T, what string, cond func() bool) {
+	t.Helper()
+	deadline := time.Now().Add(3 * time.Second)
+	for time.Now().Before(deadline) {
+		if cond() {
+			return
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	t.Fatalf("等待超时：%s", what)
+}
+
+// TestClientWSRoundTrip 覆盖：建立长连接 → 接收推送任务 → 进度/结果走长连接 → 心跳免发。
+func TestClientWSRoundTrip(t *testing.T) {
+	got := make(chan wsMessage, 8)
+	var httpHits atomic.Int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/ws" {
+			httpHits.Add(1)
+			w.WriteHeader(http.StatusNoContent)
+			return
+		}
+		if r.Header.Get("Authorization") != "Bearer tok" {
+			http.Error(w, "unauthorized", http.StatusUnauthorized)
+			return
+		}
+		conn, err := websocket.Accept(w, r, nil)
+		if err != nil {
+			return
+		}
+		defer conn.CloseNow()
+		ctx := r.Context()
+		job, _ := json.Marshal(wsMessage{Type: "job", Job: &model.Job{ID: "j1", Target: "1.1.1.1"}})
+		_ = conn.Write(ctx, websocket.MessageText, job)
+		for {
+			_, data, err := conn.Read(ctx)
+			if err != nil {
+				return
+			}
+			var msg wsMessage
+			_ = json.Unmarshal(data, &msg)
+			got <- msg
+		}
+	}))
+	defer srv.Close()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	cli := newWSClient(srv.URL)
+
+	var job *model.Job
+	waitFor(t, "收到推送任务", func() bool {
+		j, err := cli.Poll(ctx)
+		if err != nil {
+			t.Fatalf("Poll 失败: %v", err)
+		}
+		job = j
+		return j != nil
+	})
+	if job.ID != "j1" {
+		t.Fatalf("任务异常: %+v", job)
+	}
+	if !cli.WSConnected() {
+		t.Fatal("应处于长连接模式")
+	}
+
+	if cancelled, err := cli.SendProgress(ctx, model.Progress{ID: "j1", Current: 1, Total: 2}); err != nil || cancelled {
+		t.Fatalf("SendProgress 异常: %v %v", cancelled, err)
+	}
+	if err := cli.SendResult(ctx, model.Result{ID: "j1", Output: "out"}); err != nil {
+		t.Fatalf("SendResult 失败: %v", err)
+	}
+	before := httpHits.Load()
+	if err := cli.Heartbeat(ctx); err != nil {
+		t.Fatalf("Heartbeat 失败: %v", err)
+	}
+	if httpHits.Load() != before {
+		t.Fatal("长连接模式下心跳不应发 HTTP 请求")
+	}
+
+	var types []string
+	for len(types) < 2 {
+		select {
+		case m := <-got:
+			if m.Type == "meta" {
+				continue
+			}
+			types = append(types, m.Type)
+			if m.Type == "result" && (m.Result == nil || m.Result.Output != "out") {
+				t.Fatalf("结果异常: %+v", m)
+			}
+		case <-time.After(2 * time.Second):
+			t.Fatalf("服务端未收到消息，已收到: %v", types)
+		}
+	}
+	if types[0] != "progress" || types[1] != "result" {
+		t.Fatalf("消息顺序异常: %v", types)
+	}
+
+	cli.SetPaused(true)
+	waitFor(t, "暂停后断开长连接", func() bool { return !cli.WSConnected() })
+}
+
+// TestClientWSFallbackToHTTP 验证机器人不支持 /ws 时回退 HTTP 长轮询。
+func TestClientWSFallbackToHTTP(t *testing.T) {
+	var jobsHits atomic.Int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/jobs":
+			jobsHits.Add(1)
+			w.Header().Set("Content-Type", "application/json")
+			_ = json.NewEncoder(w).Encode(model.Job{ID: "h1", Target: "8.8.8.8"})
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer srv.Close()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	cli := newWSClient(srv.URL)
+	job, err := cli.Poll(ctx)
+	if err != nil || job == nil || job.ID != "h1" {
+		t.Fatalf("HTTP 回退失败: job=%+v err=%v", job, err)
+	}
+	time.Sleep(100 * time.Millisecond)
+	if cli.WSConnected() {
+		t.Fatal("不支持 /ws 时不应处于长连接模式")
+	}
+	if jobsHits.Load() == 0 {
+		t.Fatal("应通过 /jobs 领取任务")
+	}
+}
