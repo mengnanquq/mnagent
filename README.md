@@ -89,7 +89,6 @@ mnagent -apply-update latest         # 立即升级到最新版本并平滑重�
 | **`-auto-update`** | `false` | 是否开启后台定时自动检查并升级（一键脚本安装默认开启） |
 | **`-gh-proxy <url>`** | — | GitHub 代理加速前缀（支持环境变量 `GH_PROXY`） |
 | **`-allow-private-probes`** | `false` | 放行对内网私有网段与云元数据地址的探测（默认严格拦截） |
-| **`-isp <name>`** | 自动探测 | 手动指定探针出站运营商名称（留空时自动识别并上报） |
 | **`-log-level`** | `info` | 日志级别：`debug` / `info` / `warn` / `error` |
 
 ---

@@ -13,7 +13,6 @@ import (
 	"time"
 
 	"github.com/mengnanquq/mnagent/internal/dep"
-	"github.com/mengnanquq/mnagent/internal/isp"
 	"github.com/mengnanquq/mnagent/internal/updater"
 )
 
@@ -46,7 +45,6 @@ type Config struct {
 	ProbeTarget        string
 	ProbeKind          string
 	AllowPrivateProbes bool
-	ISP                string
 }
 
 // DefaultTokenFile 根据操作系统平台返回默认的令牌文件路径。
@@ -168,7 +166,6 @@ func ParseConfig(args []string, version string) (*Config, error) {
 		probeTarget  = fs.String("probe-target", "", "本地直接执行一次探针网络测试的目标（域名或 IP）")
 		probeKind    = fs.String("probe-kind", "ping", "本地探针类型：ping / tcping / trace / http / dns")
 		allowPrivate = fs.Bool("allow-private-probes", false, "允许探测内网私有地址与链路本地地址（默认禁止，防范 SSRF/云元数据盗取）")
-		ispVal       = fs.String("isp", "", "手动指定本探针主机的运营商/ISP 名称（留空则自动探测出站 ISP）")
 	)
 	if err := fs.Parse(args); err != nil {
 		return nil, err
@@ -258,6 +255,5 @@ func ParseConfig(args []string, version string) (*Config, error) {
 		ProbeTarget:        strings.TrimSpace(*probeTarget),
 		ProbeKind:          strings.ToLower(strings.TrimSpace(*probeKind)),
 		AllowPrivateProbes: *allowPrivate,
-		ISP:                isp.CleanISPName(*ispVal),
 	}, nil
 }

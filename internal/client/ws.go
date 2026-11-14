@@ -37,8 +37,6 @@ type wsMessage struct {
 	Job      *model.Job      `json:"job,omitempty"`
 	Result   *model.Result   `json:"result,omitempty"`
 	Progress *model.Progress `json:"progress,omitempty"`
-	ISP      string          `json:"isp,omitempty"`
-	Version  string          `json:"version,omitempty"`
 }
 
 func wsDisabledByEnv() bool {
@@ -118,10 +116,6 @@ func (c *Client) dialWS(ctx context.Context) (*websocket.Conn, int, error) {
 	h.Set("Authorization", "Bearer "+token)
 	h.Set("User-Agent", "mnagent/"+Version)
 	h.Set("X-Agent-Version", Version)
-	isp := c.GetISP()
-	if isp != "" {
-		h.Set("X-Agent-ISP", isp)
-	}
 	dctx, cancel := context.WithTimeout(ctx, wsHandshakeTimeout)
 	defer cancel()
 	conn, resp, err := websocket.Dial(dctx, c.baseURL+"/ws", &websocket.DialOptions{
@@ -137,7 +131,6 @@ func (c *Client) dialWS(ctx context.Context) (*websocket.Conn, int, error) {
 		return nil, status, err
 	}
 	conn.SetReadLimit(maxResponseBytes)
-	c.wsISP.Store(&isp)
 	return conn, http.StatusSwitchingProtocols, nil
 }
 
@@ -154,9 +147,6 @@ func (c *Client) serveWS(ctx context.Context, conn *websocket.Conn) {
 			_ = conn.CloseNow()
 		}
 	}()
-
-	// 连接期间 ISP 若已变化（启动时异步探测），补发一次
-	c.syncISP()
 
 	go func() {
 		ticker := time.NewTicker(wsPingInterval)
@@ -218,21 +208,6 @@ func (c *Client) wsSend(ctx context.Context, msg wsMessage) error {
 		return err
 	}
 	return nil
-}
-
-// syncISP 在 ISP 与握手时上报的不一致时补发元信息。
-func (c *Client) syncISP() {
-	isp := c.GetISP()
-	if p := c.wsISP.Load(); p != nil && *p == isp {
-		return
-	}
-	go func() {
-		ctx, cancel := context.WithTimeout(context.Background(), wsWriteTimeout)
-		defer cancel()
-		if c.wsSend(ctx, wsMessage{Type: "meta", ISP: isp, Version: Version}) == nil {
-			c.wsISP.Store(&isp)
-		}
-	}()
 }
 
 // pollWS 在长连接模式下等待推送的任务。

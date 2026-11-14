@@ -9,7 +9,6 @@ import (
 	"context"
 	"fmt"
 	"log/slog"
-	"net/http"
 	"os"
 	"os/signal"
 	"syscall"
@@ -18,7 +17,6 @@ import (
 	"github.com/mengnanquq/mnagent/internal/client"
 	"github.com/mengnanquq/mnagent/internal/config"
 	"github.com/mengnanquq/mnagent/internal/dep"
-	"github.com/mengnanquq/mnagent/internal/isp"
 	"github.com/mengnanquq/mnagent/internal/model"
 	"github.com/mengnanquq/mnagent/internal/probe"
 	"github.com/mengnanquq/mnagent/internal/runner"
@@ -121,19 +119,6 @@ func runWithContext(ctx context.Context, args []string) error {
 	}
 
 	cli := client.New(cfg)
-	if cfg.ISP != "" {
-		cli.SetISP(cfg.ISP)
-		log.Info("已指定探针运营商", "isp", cfg.ISP)
-	} else {
-		go func() {
-			ispProbeClient := &http.Client{Timeout: 4 * time.Second}
-			detected := isp.DetectOutboundISP(ctx, ispProbeClient)
-			if detected != "" {
-				cli.SetISP(detected)
-				log.Info("成功探测出站运营商", "isp", detected)
-			}
-		}()
-	}
 	trk := tracker.New()
 	rnr := runner.NewRunnerFull(cfg.Binary, cfg.MiaospeedBinary, cfg.GHProxy, cfg.AllowPrivateProbes, log)
 	rnr.SetProgressReporter(func(p model.Progress) {

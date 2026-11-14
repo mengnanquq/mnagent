@@ -36,7 +36,6 @@ type Client struct {
 	tokens  *config.TokenSource
 	http    *http.Client
 
-	isp    atomic.Pointer[string]
 	paused atomic.Bool // 更新期间暂停轮询，避免新旧版本交替领取任务。
 
 	// WebSocket 长连接（可用时优先使用，否则回退 HTTP）
@@ -45,7 +44,6 @@ type Client struct {
 	wsOnce     sync.Once
 	ws         atomic.Pointer[websocket.Conn]
 	wsJobs     chan *model.Job
-	wsISP      atomic.Pointer[string] // 已同步给机器人的 ISP
 }
 
 // New 构建通信客户端；轮询超时略大于机器人侧的长轮询保持时间。
@@ -73,31 +71,6 @@ func New(cfg *config.Config) *Client {
 		wsHTTP:     newWSHTTPClient(),
 		wsJobs:     make(chan *model.Job, 64),
 	}
-}
-
-// SetISP 设置本地探测或指定的运营商/ISP 名称。
-func (c *Client) SetISP(isp string) {
-	s := strings.TrimSpace(isp)
-	c.isp.Store(&s)
-	if c.WSConnected() {
-		c.syncISP()
-	}
-}
-
-func (c *Client) setISP(isp string) {
-	c.SetISP(isp)
-}
-
-// GetISP 获取当前已探测或指定的运营商/ISP 名称。
-func (c *Client) GetISP() string {
-	if p := c.isp.Load(); p != nil {
-		return *p
-	}
-	return ""
-}
-
-func (c *Client) getISP() string {
-	return c.GetISP()
 }
 
 // SetPaused 设置更新暂停状态；暂停时断开长连接，避免机器人继续推送任务。
@@ -275,9 +248,6 @@ func (c *Client) do(ctx context.Context, method, path string, body []byte) (*htt
 	req.Header.Set("Authorization", "Bearer "+token)
 	req.Header.Set("User-Agent", "mnagent/"+Version)
 	req.Header.Set("X-Agent-Version", Version)
-	if isp := c.GetISP(); isp != "" {
-		req.Header.Set("X-Agent-ISP", isp)
-	}
 	if body != nil {
 		req.Header.Set("Content-Type", "application/json")
 	}

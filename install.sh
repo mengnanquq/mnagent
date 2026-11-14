@@ -38,7 +38,6 @@ UNINSTALL="no"
 SERVICE_NAME="mnagent"
 AUTO_UPDATE="yes"   # 默认开启自动更新（可 --auto-update no 关闭）
 UPDATE_INTERVAL="6h"
-ISP=""
 INSTALL_NEXTTRACE="yes" # 缺少 nexttrace 时默认自动按照官方脚本/包管理器安装
 INSTALL_MIAOSPEED="yes" # 缺少 miaospeed 时默认自动从 GitHub Releases 下载安装
 GH_PROXY="${GH_PROXY:-${MNAGENT_GH_PROXY:-}}" # GitHub 代理前缀，例如 https://gh-proxy.com/
@@ -71,7 +70,6 @@ usage() {
   --no-install-nexttrace 缺少 nexttrace 时不自动安装（等同于 --install-nexttrace no）
   --install-miaospeed [yes|no] 缺少 miaospeed 时是否自动安装（默认 yes）
   --no-install-miaospeed 缺少 miaospeed 时不自动安装（等同于 --install-miaospeed no）
-  --isp <name>         手动指定本探针运营商（默认留空，自动探测）
   --gh-proxy <url>     GitHub 代理前缀，例如 https://gh-proxy.com/
   --uninstall          卸载：停止并删除服务与二进制（保留令牌与用户）
   -h, --help           显示本帮助
@@ -120,7 +118,6 @@ while [ $# -gt 0 ]; do
 			--auto-update)  AUTO_UPDATE="yes"; shift;;
 			--no-auto-update) AUTO_UPDATE="no"; shift;;
 			--update-interval) UPDATE_INTERVAL="${2:-}"; shift 2;;
-		--isp)             ISP="${2:-}"; shift 2;;
 			--install-nexttrace)
 				case "${2:-}" in
 					no|false|0) INSTALL_NEXTTRACE="no"; shift 2;;
@@ -360,16 +357,6 @@ if [ -n "$existing_cmd" ]; then
 		extracted_miao="$(printf '%s' "$existing_cmd" | grep -o -- '-miaospeed [^ ]*' | head -n1 | awk '{print $2}' || true)"
 		if [ -n "$extracted_miao" ]; then
 			MIAOSPEED_BIN="$extracted_miao"
-		fi
-	fi
-	if [ -z "$ISP" ]; then
-		extracted_isp="$(printf '%s' "$existing_cmd" | grep -o -- '-isp [^ ]*' | head -n1 | awk '{print $2}' || true)"
-		if printf '%s' "$existing_cmd" | grep -q -- '-isp "'; then
-			extracted_isp="$(printf '%s' "$existing_cmd" | sed -n 's/.*-isp "\([^"]*\)".*/\1/p' || true)"
-		fi
-		if [ -n "$extracted_isp" ]; then
-			ISP="$extracted_isp"
-			log "已从现有服务配置继承 --isp 运营商: $ISP"
 		fi
 	fi
 fi
@@ -718,12 +705,6 @@ if [ -n "$GH_PROXY" ]; then
 	AUTO_UPDATE_ARGS="$AUTO_UPDATE_ARGS -gh-proxy $GH_PROXY"
 fi
 
-ISP_ARG=""
-if [ -n "$ISP" ]; then
-	clean_isp="$(printf '%s' "$ISP" | tr -d '"\r\n')"
-	ISP_ARG=" -isp \"$clean_isp\""
-fi
-
 # ---------- 安装服务 ----------
 
 install_systemd_unit() {
@@ -739,7 +720,7 @@ Wants=network-online.target
 Type=simple
 User=$RUN_USER
 Group=$RUN_GROUP
-ExecStart=$PREFIX/mnagent -bot $BOT_URL -token-file $TOKEN_FILE -nexttrace $NEXTTRACE_EXEC -miaospeed $MIAOSPEED_EXEC$AUTO_UPDATE_ARGS$ISP_ARG
+ExecStart=$PREFIX/mnagent -bot $BOT_URL -token-file $TOKEN_FILE -nexttrace $NEXTTRACE_EXEC -miaospeed $MIAOSPEED_EXEC$AUTO_UPDATE_ARGS
 	# nexttrace 需要可写的主目录来存放配置与 IP 库；ProtectSystem=strict 下只有
 	# StateDirectory 指向的目录可写。
 	StateDirectory=mnagent
@@ -791,7 +772,7 @@ USE_PROCD=1
 			-bot $BOT_URL \\
 			-token-file $TOKEN_FILE \\
 			-nexttrace $NEXTTRACE_EXEC \\
-			-miaospeed $MIAOSPEED_EXEC$AUTO_UPDATE_ARGS$ISP_ARG
+			-miaospeed $MIAOSPEED_EXEC$AUTO_UPDATE_ARGS
 		procd_set_param env PATH="/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
 		procd_set_param respawn
 		procd_set_param stdout 1
@@ -841,8 +822,8 @@ case "$PLATFORM" in
 		;;
 	*)
 		warn "未检测到 systemd 或 OpenWrt(procd)：已安装二进制，请自行守护运行"
-		printf '    %s/mnagent -bot %s -token-file %s -nexttrace %s%s%s\n' \
-			"$PREFIX" "$BOT_URL" "$TOKEN_FILE" "$NEXTTRACE_EXEC" "$AUTO_UPDATE_ARGS" "$ISP_ARG" >&2
+		printf '    %s/mnagent -bot %s -token-file %s -nexttrace %s%s\n' \
+			"$PREFIX" "$BOT_URL" "$TOKEN_FILE" "$NEXTTRACE_EXEC" "$AUTO_UPDATE_ARGS" >&2
 		if [ -n "$NEXTTRACE_PATH" ] && command -v setcap >/dev/null 2>&1; then
 			# 没有 systemd/procd 时只能靠二进制能力，手工前台运行也需要原始套接字权限。
 			setcap cap_net_raw,cap_net_admin+eip "$NEXTTRACE_PATH" \
