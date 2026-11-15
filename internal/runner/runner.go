@@ -9,7 +9,6 @@ import (
 	"net"
 	"os"
 	"os/exec"
-	"path/filepath"
 	"regexp"
 	"strconv"
 	"strings"
@@ -521,7 +520,6 @@ func newUpdater(cfg *config.Config, log Logger) *updater.Updater {
 		Platform:       platform,
 		Arch:           arch,
 		Executable:     exe,
-		SkipFile:       filepath.Join(os.TempDir(), "mnagent-skip-versions"),
 		GHProxy:        cfg.GHProxy,
 		Restart: func() error {
 			if log != nil {

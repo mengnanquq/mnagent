@@ -159,6 +159,10 @@ func TestUpdaterApply(t *testing.T) {
 		}
 		return base + "/releases/download/" + version + "/" + u.AssetName()
 	}
+	// 校验清单指向本地假服务器（返回 404 = 该版本未发布清单），避免测试访问真实 GitHub。
+	u.ChecksumURLFunc = func(version string) string {
+		return base + "/releases/download/" + version + "/sha256sums.txt"
+	}
 
 	if err := u.Apply("v0.1.8"); err != nil {
 		t.Fatal(err)

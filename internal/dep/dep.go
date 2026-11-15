@@ -25,6 +25,8 @@ import (
 	"runtime"
 	"strings"
 	"time"
+
+	"github.com/mengnanquq/mnagent/internal/statedir"
 )
 
 var (
@@ -423,7 +425,8 @@ func NexttraceAsset(goos, goarch string) (string, error) {
 	return name, nil
 }
 
-// resolveInstallTarget 确定依赖落地文件的路径，并在无写权限时降级到 TempDir。
+// ResolveInstallTarget 确定依赖落地文件的路径。目标目录不可写时降级到 mnagent 的私有状态目录
+// （bin 子目录），绝不降级到 /tmp 这类所有用户都可写的目录——agent 通常以 root 运行并会执行这些文件。
 func ResolveInstallTarget(configuredPath, defaultName string) string {
 	if runtime.GOOS == "windows" && !strings.HasSuffix(strings.ToLower(defaultName), ".exe") {
 		defaultName += ".exe"
@@ -435,35 +438,39 @@ func ResolveInstallTarget(configuredPath, defaultName string) string {
 	if dest == "" || dest == defaultName || !filepath.IsAbs(dest) {
 		if p, ok := ResolveBinaryPath(defaultName); ok && filepath.IsAbs(p) {
 			dest = p
+		} else if exe, err := os.Executable(); err == nil {
+			dest = filepath.Join(filepath.Dir(exe), defaultName)
+		} else if runtime.GOOS == "windows" {
+			dest = privateBinPath(defaultName, dest)
 		} else {
-			exe, err := os.Executable()
-			if err == nil {
-				dest = filepath.Join(filepath.Dir(exe), defaultName)
-			} else {
-				if runtime.GOOS == "windows" {
-					pd := os.Getenv("ProgramData")
-					if pd != "" {
-						dest = filepath.Join(pd, "mnagent", "bin", defaultName)
-					} else {
-						dest = filepath.Join(os.TempDir(), defaultName)
-					}
-				} else {
-					dest = filepath.Join("/usr/local/bin", defaultName)
-				}
-			}
+			dest = filepath.Join("/usr/local/bin", defaultName)
 		}
 	}
 
 	dir := filepath.Dir(dest)
 	if err := os.MkdirAll(dir, 0755); err != nil {
-		return filepath.Join(os.TempDir(), defaultName)
+		return privateBinPath(defaultName, dest)
 	}
 	testFile := filepath.Join(dir, fmt.Sprintf(".test_write_%d_%d", os.Getpid(), time.Now().UnixNano()))
 	if err := os.WriteFile(testFile, []byte("ok"), 0600); err != nil {
-		return filepath.Join(os.TempDir(), defaultName)
+		return privateBinPath(defaultName, dest)
 	}
 	_ = os.Remove(testFile)
 	return dest
+}
+
+// privateBinPath 返回私有状态目录下的 bin/<name>；状态目录不可用时原样返回 fallback，
+// 让后续写入以明确的权限错误失败，而不是悄悄落到不安全的位置。
+func privateBinPath(name, fallback string) string {
+	d, err := statedir.Dir()
+	if err != nil {
+		return fallback
+	}
+	bin := filepath.Join(d, "bin")
+	if err := os.MkdirAll(bin, 0o700); err != nil {
+		return fallback
+	}
+	return filepath.Join(bin, name)
 }
 
 // fetchAssetDigest 通过 GitHub API（直连，不走 gh-proxy）获取指定 Release 附件的 SHA-256 摘要。

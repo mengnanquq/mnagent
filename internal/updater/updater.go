@@ -18,6 +18,8 @@ import (
 	"strconv"
 	"strings"
 	"time"
+
+	"github.com/mengnanquq/mnagent/internal/statedir"
 )
 
 // 自动更新默认配置。
@@ -169,7 +171,9 @@ func New(cfg Config) *Updater {
 	}
 	skipFile := cfg.SkipFile
 	if skipFile == "" {
-		skipFile = filepath.Join(os.TempDir(), "mnagent-skip-versions")
+		// 跳过记录决定是否自动安装新版本，必须放在私有状态目录，不能放在所有用户可写的 /tmp；
+		// 状态目录不可用时为空串，即不记录跳过（宁可重复尝试更新）。
+		skipFile = statedir.Path("skip-versions")
 	}
 	curVer := cfg.CurrentVersion
 	if curVer == "" {
