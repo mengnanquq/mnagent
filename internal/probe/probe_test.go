@@ -102,6 +102,17 @@ func TestTCPingProbeRefusedPort(t *testing.T) {
 }
 
 // TestTCPingProbeRejectsBadPort 端口越界应直接报错。
+// TestTCPingProbeRejectsUnresolvedOrPrivateHost 验证域名无法解析时直接失败（不再按域名拨号），
+// 解析到回环/内网地址时被拦截。
+func TestTCPingProbeRejectsUnresolvedOrPrivateHost(t *testing.T) {
+	if _, err := TCPingProbe(context.Background(), model.Job{Target: "no-such-host.invalid", Port: 443, Count: 1}, false); err == nil || !strings.Contains(err.Error(), "无法解析") {
+		t.Fatalf("无法解析的域名应直接报错，实际: %v", err)
+	}
+	if _, err := TCPingProbe(context.Background(), model.Job{Target: "localhost", Port: 443, Count: 1}, false); err == nil || !strings.Contains(err.Error(), "安全策略拦截") {
+		t.Fatalf("解析到回环地址的域名应被拦截，实际: %v", err)
+	}
+}
+
 func TestTCPingProbeRejectsBadPort(t *testing.T) {
 	if _, err := TCPingProbe(context.Background(), model.Job{Target: "127.0.0.1", Port: 70000}, true); err == nil {
 		t.Fatal("非法端口应报错")

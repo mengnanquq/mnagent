@@ -415,10 +415,11 @@ func TCPingProbe(ctx context.Context, job model.Job, allowPrivate bool) (Latency
 			if IsBlockedProbeIP(ip) {
 				return LatencyReport{}, fmt.Errorf("安全策略拦截：禁止探测私有或云元数据地址 (%s)", ip.String())
 			}
-		} else if resolved != "" {
-			if ip := net.ParseIP(resolved); ip != nil && IsBlockedProbeIP(ip) {
-				return LatencyReport{}, fmt.Errorf("安全策略拦截：禁止探测私有或云元数据地址 (%s)", ip.String())
-			}
+		} else if resolved == "" {
+			// 解析失败时不能按域名拨号：拨号时的再次解析未经校验，可能指向内网（DNS 重绑定）
+			return LatencyReport{}, fmt.Errorf("无法解析目标主机 (%s)", host)
+		} else if ip := net.ParseIP(resolved); ip != nil && IsBlockedProbeIP(ip) {
+			return LatencyReport{}, fmt.Errorf("安全策略拦截：禁止探测私有或云元数据地址 (%s)", ip.String())
 		}
 	}
 	report := LatencyReport{Kind: KindTCPing, Target: address, Resolved: resolved, Sent: count}

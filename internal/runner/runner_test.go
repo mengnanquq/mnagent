@@ -814,6 +814,7 @@ func TestRunTraceBlockedPrivateIP(t *testing.T) {
 		"169.254.169.254",
 		"192.168.1.1:80",
 		"10.0.0.1",
+		"localhost",
 	}
 
 	for _, target := range blockedTargets {

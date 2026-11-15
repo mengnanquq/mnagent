@@ -152,8 +152,9 @@ func (r *Runner) runProbeJob(ctx context.Context, job model.Job, kind string) ru
 func (r *Runner) runTrace(ctx context.Context, job model.Job) runResult {
 	if !r.allowPrivateProbes {
 		target := strings.TrimSpace(job.Target)
-		if h, _, err := net.SplitHostPort(target); err == nil {
-			target = h
+		port := ""
+		if h, p, err := net.SplitHostPort(target); err == nil {
+			target, port = h, p
 		}
 		if ip := net.ParseIP(target); ip != nil {
 			if probe.IsBlockedProbeIP(ip) {
@@ -170,6 +171,19 @@ func (r *Runner) runTrace(ctx context.Context, job model.Job) runResult {
 				if probe.IsBlockedProbeIP(ip) {
 					return runResult{ErrText: fmt.Sprintf("安全策略拦截：禁止探测私有或云元数据地址 (%s)", ip.String()), ExitCode: -1}
 				}
+			}
+			// 直接追踪已校验的 IP：交给 nexttrace 的若仍是域名，它会再次解析，
+			// 两次解析之间域名可被切换到内网地址（DNS 重绑定）
+			checked := ips[0]
+			for _, ip := range ips {
+				if ip.To4() != nil {
+					checked = ip
+					break
+				}
+			}
+			job.Target = checked.String()
+			if port != "" {
+				job.Target = net.JoinHostPort(checked.String(), port)
 			}
 		}
 	}
