@@ -224,6 +224,17 @@ func RunJob(ctx context.Context, binary, ghProxy string, job model.Job, log Logg
 		return "", nil, fmt.Errorf("解析测速目标失败: %s", redactProxyError(err.Error(), job.Target))
 	}
 
+	if !allowPriv {
+		var removed int
+		allNodes, removed = filterBlockedNodes(ctx, allNodes)
+		if removed > 0 && log != nil {
+			log.Warn("已剔除指向私有内网或元数据地址的节点", "removed", removed, "kept", len(allNodes))
+		}
+		if len(allNodes) == 0 {
+			return "", nil, fmt.Errorf("安全拦截：全部 %d 个节点的服务器地址均指向私有内网、保留或云元数据地址，已拒绝测速", removed)
+		}
+	}
+
 	totalNodes := len(allNodes)
 	nodes := selectJobNodes(allNodes, job.Count)
 
