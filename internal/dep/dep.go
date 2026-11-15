@@ -9,11 +9,15 @@ import (
 	"archive/zip"
 	"compress/gzip"
 	"context"
+	"crypto/sha256"
+	"crypto/subtle"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
 	"net/http"
+	"net/url"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -93,6 +97,12 @@ func NewDependencyManager(ghProxy string) *DependencyManager {
 		goos:   runtime.GOOS,
 		goarch: runtime.GOARCH,
 	}
+}
+
+// SetGitHubEndpoints 覆盖 GitHub API 与站点地址（仅供测试使用）。
+func (dm *DependencyManager) SetGitHubEndpoints(apiBaseURL, githubBaseURL string) {
+	dm.apiBaseURL = apiBaseURL
+	dm.githubBaseURL = githubBaseURL
 }
 
 // resolveBinaryPath 解析可执行文件的具体绝对/环境路径。
@@ -456,6 +466,95 @@ func ResolveInstallTarget(configuredPath, defaultName string) string {
 	return dest
 }
 
+// fetchAssetDigest 通过 GitHub API（直连，不走 gh-proxy）获取指定 Release 附件的 SHA-256 摘要。
+// 返回空串表示无法获得摘要（API 不可达、限流或未提供 digest），由调用方降级为仅记录警告。
+func (dm *DependencyManager) fetchAssetDigest(ctx context.Context, repo, tag, assetName string) (string, error) {
+	targetURL := fmt.Sprintf("%s/repos/%s/releases/tags/%s", strings.TrimRight(dm.apiBaseURL, "/"), repo, url.PathEscape(tag))
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, targetURL, nil)
+	if err != nil {
+		return "", err
+	}
+	req.Header.Set("User-Agent", "mnagent")
+	req.Header.Set("Accept", "application/vnd.github+json")
+	client := dm.httpClient
+	if client == nil {
+		client = http.DefaultClient
+	}
+	resp, err := client.Do(req)
+	if err != nil {
+		return "", err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return "", fmt.Errorf("GitHub API 返回 HTTP %s", resp.Status)
+	}
+	var data struct {
+		Assets []struct {
+			Name   string `json:"name"`
+			Digest string `json:"digest"`
+		} `json:"assets"`
+	}
+	if err := json.NewDecoder(io.LimitReader(resp.Body, 4<<20)).Decode(&data); err != nil {
+		return "", fmt.Errorf("解析 Release JSON 失败：%w", err)
+	}
+	for _, a := range data.Assets {
+		if a.Name != assetName {
+			continue
+		}
+		if d, ok := strings.CutPrefix(strings.ToLower(a.Digest), "sha256:"); ok && len(d) == 64 {
+			return d, nil
+		}
+		return "", nil
+	}
+	return "", fmt.Errorf("Release %s 中不存在附件 %s", tag, assetName)
+}
+
+// downloadVerified 下载附件到 destPath，并在能拿到上游 SHA-256 摘要时强制校验；摘要不一致即报错。
+func (dm *DependencyManager) downloadVerified(ctx context.Context, repo, tag, assetName, downloadURL, destPath string, log Logger) (int64, error) {
+	digest, digestErr := dm.fetchAssetDigest(ctx, repo, tag, assetName)
+	if digest == "" && log != nil {
+		log.Warn("无法获取依赖的上游 SHA-256 摘要，将跳过完整性校验", "asset", assetName, "error", digestErr)
+	}
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, downloadURL, nil)
+	if err != nil {
+		return 0, err
+	}
+	req.Header.Set("User-Agent", "mnagent")
+	client := dm.httpClient
+	if client == nil {
+		client = http.DefaultClient
+	}
+	resp, err := client.Do(req)
+	if err != nil {
+		return 0, fmt.Errorf("下载 %s 失败：%w", assetName, err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return 0, fmt.Errorf("下载 %s HTTP 响应状态 %s", assetName, resp.Status)
+	}
+
+	f, err := os.OpenFile(destPath, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0755)
+	if err != nil {
+		return 0, fmt.Errorf("创建临时文件失败：%w", err)
+	}
+	hasher := sha256.New()
+	written, err := io.Copy(io.MultiWriter(f, hasher), resp.Body)
+	if closeErr := f.Close(); err == nil {
+		err = closeErr
+	}
+	if err != nil {
+		return 0, fmt.Errorf("写入 %s 失败：%w", assetName, err)
+	}
+	if digest != "" {
+		actual := hex.EncodeToString(hasher.Sum(nil))
+		if subtle.ConstantTimeCompare([]byte(actual), []byte(digest)) != 1 {
+			return 0, fmt.Errorf("%s SHA-256 完整性校验失败：期望 %s，实际 %s (防篡改拦截)", assetName, digest, actual)
+		}
+	}
+	return written, nil
+}
+
 // UpdateNextTrace 下载并安装/更新 nexttrace 到目标路径。
 func (dm *DependencyManager) UpdateNextTrace(ctx context.Context, targetPath, version string, log Logger) (string, error) {
 	destPath := ResolveInstallTarget(targetPath, "nexttrace")
@@ -476,6 +575,9 @@ func (dm *DependencyManager) UpdateNextTrace(ctx context.Context, targetPath, ve
 	if !strings.HasPrefix(tag, "v") {
 		tag = "v" + tag
 	}
+	if !updater.ValidReleaseTag(tag) {
+		return "", fmt.Errorf("nexttrace 版本号格式非法：%q", tag)
+	}
 
 	rawURL := fmt.Sprintf("https://github.com/nxtrace/NTrace-core/releases/download/%s/%s", tag, assetName)
 	downloadURL := updater.ApplyGHProxy(rawURL, dm.ghProxy)
@@ -491,38 +593,9 @@ func (dm *DependencyManager) UpdateNextTrace(ctx context.Context, targetPath, ve
 	tmpFile := filepath.Join(filepath.Dir(destPath), fmt.Sprintf(".nexttrace-update-%d", time.Now().UnixNano()))
 	defer os.Remove(tmpFile)
 
-	f, err := os.OpenFile(tmpFile, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0755)
+	written, err := dm.downloadVerified(ctx, "nxtrace/NTrace-core", tag, assetName, downloadURL, tmpFile, log)
 	if err != nil {
-		return "", fmt.Errorf("创建临时文件失败：%w", err)
-	}
-
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, downloadURL, nil)
-	if err != nil {
-		_ = f.Close()
 		return "", err
-	}
-	req.Header.Set("User-Agent", "mnagent")
-
-	client := dm.httpClient
-	if client == nil {
-		client = http.DefaultClient
-	}
-	resp, err := client.Do(req)
-	if err != nil {
-		_ = f.Close()
-		return "", fmt.Errorf("下载 nexttrace 失败：%w", err)
-	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode != http.StatusOK {
-		_ = f.Close()
-		return "", fmt.Errorf("下载 nexttrace HTTP 响应状态 %s", resp.Status)
-	}
-
-	written, err := io.Copy(f, resp.Body)
-	_ = f.Close()
-	if err != nil {
-		return "", fmt.Errorf("写入 nexttrace 失败：%w", err)
 	}
 	if written < 100*1024 { // nexttrace 二进制至少几百 KB 以上
 		return "", fmt.Errorf("下载的 nexttrace 二进制体积异常 (%d bytes)", written)
@@ -550,6 +623,10 @@ func (dm *DependencyManager) UpdateMiaospeed(ctx context.Context, targetPath, ve
 		}
 	}
 
+	if !updater.ValidReleaseTag(tag) {
+		return "", fmt.Errorf("miaospeed 版本号格式非法：%q", tag)
+	}
+
 	archMapped := MapMiaospeedArch(dm.goarch)
 	var archiveName string
 	if dm.goos == "windows" {
@@ -568,48 +645,27 @@ func (dm *DependencyManager) UpdateMiaospeed(ctx context.Context, targetPath, ve
 		return "", fmt.Errorf("创建目录失败：%w", err)
 	}
 
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, downloadURL, nil)
-	if err != nil {
-		return "", err
-	}
-	req.Header.Set("User-Agent", "mnagent")
-
-	client := dm.httpClient
-	if client == nil {
-		client = http.DefaultClient
-	}
-	resp, err := client.Do(req)
-	if err != nil {
-		return "", fmt.Errorf("下载 miaospeed 失败：%w", err)
-	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode != http.StatusOK {
-		return "", fmt.Errorf("下载 miaospeed HTTP 响应状态 %s", resp.Status)
-	}
-
 	tmpFile := filepath.Join(filepath.Dir(destPath), fmt.Sprintf(".miaospeed-update-%d", time.Now().UnixNano()))
 	defer os.Remove(tmpFile)
 
+	dlPath := filepath.Join(filepath.Dir(destPath), fmt.Sprintf(".miaospeed-dl-%d", time.Now().UnixNano()))
+	defer os.Remove(dlPath)
+	if _, err := dm.downloadVerified(ctx, "AirportR/miaospeed", tag, archiveName, downloadURL, dlPath, log); err != nil {
+		return "", err
+	}
+
 	if strings.HasSuffix(archiveName, ".zip") {
-		dlFile, err := os.CreateTemp(filepath.Dir(destPath), ".miaospeed-dl-*")
-		if err != nil {
-			return "", fmt.Errorf("创建下载临时文件失败：%w", err)
-		}
-		dlPath := dlFile.Name()
-		defer os.Remove(dlPath)
-
-		if _, err := io.Copy(dlFile, resp.Body); err != nil {
-			_ = dlFile.Close()
-			return "", fmt.Errorf("下载 miaospeed zip 失败：%w", err)
-		}
-		_ = dlFile.Close()
-
 		if err := ExtractZipFile(dlPath, tmpFile); err != nil {
 			return "", fmt.Errorf("解压 miaospeed zip 失败：%w", err)
 		}
 	} else {
-		if err := ExtractTarGzFile(resp.Body, tmpFile); err != nil {
+		archive, err := os.Open(dlPath)
+		if err != nil {
+			return "", fmt.Errorf("打开 miaospeed 压缩包失败：%w", err)
+		}
+		err = ExtractTarGzFile(archive, tmpFile)
+		_ = archive.Close()
+		if err != nil {
 			return "", fmt.Errorf("解压 miaospeed 失败：%w", err)
 		}
 	}

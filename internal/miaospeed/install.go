@@ -10,6 +10,9 @@ import (
 	"github.com/mengnanquq/mnagent/internal/dep"
 )
 
+// newDependencyManager 可在测试中替换，避免访问真实 GitHub。
+var newDependencyManager = dep.NewDependencyManager
+
 var (
 	cachedMiaospeedVerMu sync.RWMutex
 	cachedMiaospeedVer   = make(map[string]string)
@@ -71,6 +74,6 @@ func getMiaospeedVersion(ctx context.Context, binPath string, serverOutput strin
 
 // autoInstallMiaospeed 在运行时自动下载并解压 AirportR/miaospeed Release，严格继承使用 ghProxy。
 func autoInstallMiaospeed(ctx context.Context, targetPath, ghProxy string, log Logger) (string, error) {
-	dm := dep.NewDependencyManager(ghProxy)
+	dm := newDependencyManager(ghProxy)
 	return dm.UpdateMiaospeed(ctx, targetPath, "latest", log)
 }

@@ -1,6 +1,7 @@
 package miaospeed
 
 import (
+	"github.com/mengnanquq/mnagent/internal/dep"
 	"github.com/mengnanquq/mnagent/internal/model"
 	"github.com/mengnanquq/mnagent/internal/updater"
 
@@ -529,6 +530,14 @@ func TestAutoInstallMiaospeedWithProxy(t *testing.T) {
 	}))
 	defer srv.Close()
 
+	oldNew := newDependencyManager
+	newDependencyManager = func(ghProxy string) *dep.DependencyManager {
+		dm := oldNew(ghProxy)
+		dm.SetGitHubEndpoints(srv.URL, srv.URL)
+		return dm
+	}
+	defer func() { newDependencyManager = oldNew }()
+
 	dest := filepath.Join(t.TempDir(), "bin", "miaospeed")
 	path, err := autoInstallMiaospeed(context.Background(), dest, srv.URL, nil)
 	if err != nil {
@@ -546,8 +555,14 @@ func TestAutoInstallMiaospeedWithProxy(t *testing.T) {
 	if len(requestedURLs) < 1 {
 		t.Fatalf("未通过代理服务器请求下载: %v", requestedURLs)
 	}
-	if !strings.Contains(requestedURLs[0], ".tar.gz") {
-		t.Fatalf("代理请求的不是 release 资源包: %s", requestedURLs[0])
+	viaProxy := false
+	for _, u := range requestedURLs {
+		if strings.Contains(u, "https://github.com/AirportR/miaospeed/releases/download/") && strings.HasSuffix(u, ".tar.gz") {
+			viaProxy = true
+		}
+	}
+	if !viaProxy {
+		t.Fatalf("资源包未经 ghProxy 前缀下载: %v", requestedURLs)
 	}
 }
 

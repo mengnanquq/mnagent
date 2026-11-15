@@ -10,12 +10,16 @@ import (
 	"bytes"
 	"compress/gzip"
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"runtime"
 	"strings"
+	"sync/atomic"
 	"testing"
 )
 
@@ -191,6 +195,7 @@ func TestUpdateNextTrace(t *testing.T) {
 	defer srv.Close()
 
 	dm := newDependencyManager(srv.URL)
+	dm.apiBaseURL = srv.URL
 	dm.goos = "linux"
 	dm.goarch = "amd64"
 
@@ -245,6 +250,7 @@ func TestUpdateMiaospeed(t *testing.T) {
 	defer srv.Close()
 
 	dm := newDependencyManager(srv.URL)
+	dm.apiBaseURL = srv.URL
 	dm.goos = "linux"
 	dm.goarch = "amd64"
 
@@ -301,6 +307,7 @@ func TestUpdateMiaospeedWindowsZip(t *testing.T) {
 	defer srv.Close()
 
 	dm := newDependencyManager(srv.URL)
+	dm.apiBaseURL = srv.URL
 	dm.goos = "windows"
 	dm.goarch = "amd64"
 
@@ -440,5 +447,49 @@ func TestUpdateDependencyDispatch(t *testing.T) {
 	_, err := dm.UpdateDependency(context.Background(), "unknown-dep", "target", "latest", nil)
 	if err == nil || !strings.Contains(err.Error(), "未知的依赖") {
 		t.Fatalf("期望未知依赖报错，实际: %v", err)
+	}
+}
+
+// TestUpdateNextTraceVerifiesDigest 验证：上游 API 给出的 SHA-256 摘要与下载内容不一致时拒绝安装，一致时正常安装。
+func TestUpdateNextTraceVerifiesDigest(t *testing.T) {
+	content := bytes.Repeat([]byte("N"), 150*1024)
+	sum := sha256.Sum256(content)
+	digest := hex.EncodeToString(sum[:])
+	var tampered atomic.Bool
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case strings.Contains(r.URL.Path, "/repos/nxtrace/NTrace-core/releases/tags/v1.7.4"):
+			d := digest
+			if tampered.Load() {
+				d = strings.Repeat("0", 64)
+			}
+			fmt.Fprintf(w, `{"assets":[{"name":"nexttrace_linux_amd64","digest":"sha256:%s"}]}`, d)
+		case strings.Contains(r.URL.Path, "releases/download"):
+			_, _ = w.Write(content)
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer srv.Close()
+
+	dm := newDependencyManager(srv.URL)
+	dm.apiBaseURL = srv.URL
+	dm.goos = "linux"
+	dm.goarch = "amd64"
+	target := filepath.Join(t.TempDir(), "nexttrace")
+
+	tampered.Store(true)
+	if _, err := dm.UpdateNextTrace(context.Background(), target, "v1.7.4", nil); err == nil || !strings.Contains(err.Error(), "完整性校验失败") {
+		t.Fatalf("摘要不一致应拒绝安装，实际 err=%v", err)
+	}
+	if _, err := os.Stat(target); err == nil {
+		t.Fatal("校验失败时不应写入目标文件")
+	}
+	tampered.Store(false)
+	if _, err := dm.UpdateNextTrace(context.Background(), target, "v1.7.4", nil); err != nil {
+		t.Fatalf("摘要一致应安装成功: %v", err)
+	}
+	if _, err := dm.UpdateNextTrace(context.Background(), target, "v1.7.4/../../x", nil); err == nil {
+		t.Fatal("非法版本号应被拒绝")
 	}
 }

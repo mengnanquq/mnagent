@@ -577,7 +577,7 @@ func HandleUpdateCLI(cfg *config.Config, log Logger) (handled bool, err error) {
 				return true, err
 			}
 			ver = l
-		} else if _, ok := updater.ParseVersion(ver); !ok {
+		} else if !updater.ValidReleaseTag(ver) {
 			return true, fmt.Errorf("版本号格式非法：%q", ver)
 		}
 
@@ -750,6 +750,10 @@ func (a *Agent) handleUpgradeJob(ctx context.Context, job model.Job) {
 	targetVer := strings.TrimSpace(job.Target)
 	if targetVer == "" {
 		targetVer = "latest"
+	}
+	if targetVer != "latest" && !updater.ValidReleaseTag(targetVer) {
+		a.sendUpgradeResult(job, -1, fmt.Sprintf("目标版本号格式非法：%q", targetVer)+depSummary, "invalid target version")
+		return
 	}
 
 	var (

@@ -383,3 +383,43 @@ func TestUpdaterSHA256ChecksumVerification(t *testing.T) {
 		t.Fatalf("篡改 Hash 期望拦截报错，实际 got err: %v", err)
 	}
 }
+
+// TestUpdaterChecksumFetchFailureAborts 验证：校验清单返回非 404 错误时中止更新，不得跳过校验；非法版本号直接拒绝。
+func TestUpdaterChecksumFetchFailureAborts(t *testing.T) {
+	bin := make([]byte, 4096)
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case strings.HasSuffix(r.URL.Path, "/sha256sums.txt"):
+			http.Error(w, "bad gateway", http.StatusBadGateway)
+		default:
+			_, _ = w.Write(bin)
+		}
+	}))
+	defer ts.Close()
+
+	exe := filepath.Join(t.TempDir(), "mnagent")
+	_ = os.WriteFile(exe, []byte("old-bin"), 0o755)
+	u := New(Config{CurrentVersion: "v0.1.0", Repo: "owner/repo", Platform: "linux", Arch: "amd64", DownloadClient: ts.Client(), Executable: exe})
+	u.URLForFunc = func(version string) string { return ts.URL + "/d/" + version + "/" + u.AssetName() }
+	u.ChecksumURLFunc = func(version string) string { return ts.URL + "/d/" + version + "/sha256sums.txt" }
+
+	if err := u.Apply("v0.1.1"); err == nil || !strings.Contains(err.Error(), "校验清单") {
+		t.Fatalf("校验清单 502 时应中止更新，实际 err=%v", err)
+	}
+	if got, _ := os.ReadFile(exe); string(got) != "old-bin" {
+		t.Fatal("中止更新时不应替换二进制")
+	}
+	for _, bad := range []string{"v1.2.3/../../x", "v1.2.3-a/b", "latest", "+1.2.3", "v1.2"} {
+		if ValidReleaseTag(bad) {
+			t.Fatalf("%q 不应被视为合法版本号", bad)
+		}
+		if err := u.Apply(bad); err == nil {
+			t.Fatalf("非法版本号 %q 应被拒绝", bad)
+		}
+	}
+	for _, good := range []string{"v0.3.96", "1.2.3", "v1.2.3-rc.1"} {
+		if !ValidReleaseTag(good) {
+			t.Fatalf("%q 应为合法版本号", good)
+		}
+	}
+}

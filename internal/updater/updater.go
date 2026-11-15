@@ -44,6 +44,13 @@ type VersionInfo struct {
 	IsSemver bool
 }
 
+var releaseTagPattern = regexp.MustCompile(`^v?[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.]+)?$`)
+
+// ValidReleaseTag 判断字符串是否为可安全拼入下载地址的发布版本号（如 v1.2.3、v1.2.3-rc.1）。
+func ValidReleaseTag(s string) bool {
+	return releaseTagPattern.MatchString(s)
+}
+
 // ParseVersion 解析版本字符串。
 func ParseVersion(s string) (VersionInfo, bool) {
 	raw := strings.TrimSpace(s)
@@ -383,7 +390,14 @@ func (u *Updater) fetchExpectedChecksum(version string) (string, error) {
 
 // DownloadAndReplace 下载并原子替换二进制文件，支持 SHA-256 完整性校验，返回目标版本号，但不触发重启。
 func (u *Updater) DownloadAndReplace(version string) (string, error) {
-	expectedHash, _ := u.fetchExpectedChecksum(version)
+	if !ValidReleaseTag(version) {
+		return "", fmt.Errorf("非法的目标版本号：%q", version)
+	}
+	// 校验清单只在明确 404（该版本未发布清单）时放行；其余错误一律中止，避免网络或代理故障时跳过校验
+	expectedHash, err := u.fetchExpectedChecksum(version)
+	if err != nil {
+		return "", fmt.Errorf("获取 SHA-256 校验清单失败，已中止更新：%w", err)
+	}
 
 	downloadURL := u.urlForOrFallback(version)
 	tmpFile, err := os.CreateTemp(filepath.Dir(u.Executable), "mnagent-upd-*")
