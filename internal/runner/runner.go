@@ -337,6 +337,17 @@ func isHeavy(job model.Job) bool {
 // loop 不断领取任务并执行，直到 ctx 结束；启用自动更新时按周期检查新版本。
 func (a *Agent) Loop(ctx context.Context) error {
 	defer a.tasksWG.Wait()
+	defer func() {
+		// 退出/重启前回报已推送但未执行的任务，免得机器人等到超时
+		if a.client == nil {
+			return
+		}
+		fctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		if n := a.client.FailPending(fctx, "agent 正在重启或退出，任务未执行，请重试"); n > 0 {
+			a.logger.Info("已回报未执行的任务", "count", n)
+		}
+	}()
 	a.startHeartbeat(ctx)
 
 	if a.heavyQueue == nil {

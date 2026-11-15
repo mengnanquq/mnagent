@@ -8,6 +8,7 @@ import (
 	"net"
 	"net/http"
 	"os"
+	"slices"
 	"strings"
 	"time"
 
@@ -29,11 +30,16 @@ const (
 	wsIdlePollWait     = 5 * time.Second  // 长连接模式下 Poll 单次等待上限，便于及时感知断线并回退
 )
 
+// wsAckTimeout 是等待机器人确认结果的上限，超时改走 HTTP 重发（测试中会缩短）。
+var wsAckTimeout = 10 * time.Second
+
 var errNoWS = errors.New("websocket 未连接")
 
 // wsMessage 与机器人侧 internal/agent 的消息信封保持一致。
 type wsMessage struct {
 	Type     string          `json:"type"`
+	ID       string          `json:"id,omitempty"`       // ack：机器人已收到的结果 ID
+	Features []string        `json:"features,omitempty"` // hello：机器人支持的协议特性
 	Job      *model.Job      `json:"job,omitempty"`
 	Result   *model.Result   `json:"result,omitempty"`
 	Progress *model.Progress `json:"progress,omitempty"`
@@ -138,6 +144,7 @@ func (c *Client) dialWS(ctx context.Context) (*websocket.Conn, int, error) {
 func (c *Client) serveWS(ctx context.Context, conn *websocket.Conn) {
 	cctx, cancel := context.WithCancel(ctx)
 	defer cancel()
+	c.wsAck.Store(false) // 等机器人 hello 声明支持后再启用结果确认
 	c.ws.Store(conn)
 	defer func() {
 		c.ws.CompareAndSwap(conn, nil)
@@ -177,7 +184,21 @@ func (c *Client) serveWS(ctx context.Context, conn *websocket.Conn) {
 			return
 		}
 		var msg wsMessage
-		if err := json.Unmarshal(data, &msg); err != nil || msg.Type != "job" || msg.Job == nil {
+		if err := json.Unmarshal(data, &msg); err != nil {
+			continue
+		}
+		switch msg.Type {
+		case "hello":
+			c.wsAck.Store(slices.Contains(msg.Features, "ack"))
+			continue
+		case "ack":
+			c.resolveAck(msg.ID)
+			continue
+		case "job":
+		default:
+			continue
+		}
+		if msg.Job == nil {
 			continue
 		}
 		if err := validateJob(msg.Job); err != nil {
@@ -232,5 +253,71 @@ func sleepCtx(ctx context.Context, d time.Duration) bool {
 		return false
 	case <-t.C:
 		return true
+	}
+}
+
+// sendResultWS 通过长连接回传结果，返回机器人是否已确认收到。
+// 机器人支持 ack 时等待确认，超时视为未送达（由调用方改走 HTTP 重发，结果按 ID 幂等）；
+// 旧版机器人不支持 ack，写入成功即视为送达。
+func (c *Client) sendResultWS(ctx context.Context, res model.Result) bool {
+	if !c.wsAck.Load() {
+		return c.wsSend(ctx, wsMessage{Type: "result", Result: &res}) == nil
+	}
+	ch := make(chan struct{})
+	c.ackMu.Lock()
+	if c.acks == nil {
+		c.acks = make(map[string]chan struct{})
+	}
+	c.acks[res.ID] = ch
+	c.ackMu.Unlock()
+	defer func() {
+		c.ackMu.Lock()
+		if c.acks[res.ID] == ch {
+			delete(c.acks, res.ID)
+		}
+		c.ackMu.Unlock()
+	}()
+	if c.wsSend(ctx, wsMessage{Type: "result", Result: &res}) != nil {
+		return false
+	}
+	timer := time.NewTimer(wsAckTimeout)
+	defer timer.Stop()
+	select {
+	case <-ch:
+		return true
+	case <-timer.C:
+		return false
+	case <-ctx.Done():
+		return false
+	}
+}
+
+func (c *Client) resolveAck(id string) {
+	c.ackMu.Lock()
+	ch, ok := c.acks[id]
+	if ok {
+		delete(c.acks, id)
+	}
+	c.ackMu.Unlock()
+	if ok {
+		close(ch)
+	}
+}
+
+// FailPending 把长连接已推送、但尚未被主循环领取的任务回报为失败（进程退出/重启前调用），
+// 避免机器人一直等到任务超时。返回回报的任务数。
+func (c *Client) FailPending(ctx context.Context, reason string) int {
+	n := 0
+	for {
+		select {
+		case job := <-c.wsJobs:
+			if job == nil || job.Kind == "cancel" {
+				continue
+			}
+			_ = c.SendResult(ctx, model.Result{ID: job.ID, Kind: job.Kind, ExitCode: -1, Error: reason})
+			n++
+		default:
+			return n
+		}
 	}
 }

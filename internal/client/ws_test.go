@@ -160,3 +160,91 @@ func TestClientWSFallbackToHTTP(t *testing.T) {
 		t.Fatal("应通过 /jobs 领取任务")
 	}
 }
+
+// TestClientWSResultAck 验证：机器人确认的结果不走 HTTP；未确认的结果超时后改走 HTTP 重发；
+// 退出前未领取的推送任务会被回报为失败。
+func TestClientWSResultAck(t *testing.T) {
+	old := wsAckTimeout
+	wsAckTimeout = 200 * time.Millisecond
+	defer func() { wsAckTimeout = old }()
+
+	var httpResults atomic.Int32
+	wsResults := make(chan model.Result, 8)
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/results" {
+			httpResults.Add(1)
+			w.WriteHeader(http.StatusNoContent)
+			return
+		}
+		if r.URL.Path != "/ws" {
+			w.WriteHeader(http.StatusNoContent)
+			return
+		}
+		conn, err := websocket.Accept(w, r, nil)
+		if err != nil {
+			return
+		}
+		defer conn.CloseNow()
+		ctx := r.Context()
+		send := func(m wsMessage) {
+			b, _ := json.Marshal(m)
+			_ = conn.Write(ctx, websocket.MessageText, b)
+		}
+		send(wsMessage{Type: "hello", Features: []string{"ack"}})
+		send(wsMessage{Type: "job", Job: &model.Job{ID: "p1", Target: "1.1.1.1"}})
+		send(wsMessage{Type: "job", Job: &model.Job{ID: "c1", Kind: "cancel"}})
+		for {
+			_, data, err := conn.Read(ctx)
+			if err != nil {
+				return
+			}
+			var m wsMessage
+			_ = json.Unmarshal(data, &m)
+			if m.Type != "result" || m.Result == nil {
+				continue
+			}
+			wsResults <- *m.Result
+			if m.Result.ID != "lost" {
+				send(wsMessage{Type: "ack", ID: m.Result.ID})
+			}
+		}
+	}))
+	defer srv.Close()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	cli := newWSClient(srv.URL)
+	cli.startWS(ctx)
+	waitFor(t, "建立长连接并收到 hello", func() bool { return cli.WSConnected() && cli.wsAck.Load() })
+	waitFor(t, "推送任务进入缓冲", func() bool { return len(cli.wsJobs) == 2 })
+
+	if err := cli.SendResult(ctx, model.Result{ID: "ok"}); err != nil {
+		t.Fatalf("SendResult 失败: %v", err)
+	}
+	if httpResults.Load() != 0 {
+		t.Fatal("已确认的结果不应再走 HTTP")
+	}
+	if err := cli.SendResult(ctx, model.Result{ID: "lost"}); err != nil {
+		t.Fatalf("SendResult 失败: %v", err)
+	}
+	if httpResults.Load() != 1 {
+		t.Fatalf("未确认的结果应改走 HTTP 重发，实际 %d 次", httpResults.Load())
+	}
+
+	if n := cli.FailPending(ctx, "restarting"); n != 1 {
+		t.Fatalf("应回报 1 个未执行任务（取消指令除外），实际 %d", n)
+	}
+	for {
+		select {
+		case r := <-wsResults:
+			if r.ID == "p1" {
+				if r.ExitCode != -1 || r.Error != "restarting" {
+					t.Fatalf("未执行任务回报异常: %+v", r)
+				}
+				return
+			}
+		case <-time.After(2 * time.Second):
+			t.Fatal("机器人未收到未执行任务的失败回报")
+		}
+	}
+}

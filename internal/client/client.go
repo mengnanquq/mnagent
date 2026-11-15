@@ -44,6 +44,10 @@ type Client struct {
 	wsOnce     sync.Once
 	ws         atomic.Pointer[websocket.Conn]
 	wsJobs     chan *model.Job
+	wsAck      atomic.Bool // 当前连接的机器人是否会确认结果（hello 声明）
+
+	ackMu sync.Mutex
+	acks  map[string]chan struct{} // 等待机器人确认的结果 ID
 }
 
 // New 构建通信客户端；轮询超时略大于机器人侧的长轮询保持时间。
@@ -139,7 +143,7 @@ func (c *Client) poll(ctx context.Context) (*model.Job, error) {
 
 // SendResult 回传执行结果，失败时按退避重试。
 func (c *Client) SendResult(ctx context.Context, res model.Result) error {
-	if c.wsSend(ctx, wsMessage{Type: "result", Result: &res}) == nil {
+	if c.WSConnected() && c.sendResultWS(ctx, res) {
 		return nil
 	}
 	payload, err := json.Marshal(res)
