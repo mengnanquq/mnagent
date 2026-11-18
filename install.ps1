@@ -198,6 +198,29 @@ function Download-File([string]$url, [string]$destination) {
     $wc.DownloadFile($proxied, $destination)
 }
 
+function Assert-Sha256([string]$filePath, [string]$checksumUrl, [string]$assetName) {
+    $sumPath = "$filePath.sha256"
+    try {
+        Download-File $checksumUrl $sumPath
+    } catch {
+        if (Test-Path $sumPath) { Remove-Item -Path $sumPath -Force -ErrorAction SilentlyContinue }
+        throw "下载 SHA-256 校验文件失败（已中止安装）: $_"
+    }
+    try {
+        $expected = ((Get-Content -Path $sumPath -TotalCount 1) -split '\s+')[0]
+        if ([string]::IsNullOrWhiteSpace($expected) -or $expected -notmatch '^[0-9a-fA-F]{64}$') {
+            throw "SHA-256 校验文件格式非法（已中止安装）"
+        }
+        $actual = (Get-FileHash -Path $filePath -Algorithm SHA256).Hash
+        if (-not [string]::Equals($actual, $expected, [StringComparison]::OrdinalIgnoreCase)) {
+            throw "SHA-256 校验失败：期望 $expected，实际 $actual（已中止安装，未覆盖旧二进制）"
+        }
+    } finally {
+        Remove-Item -Path $sumPath -Force -ErrorAction SilentlyContinue
+    }
+    Write-Host "SHA-256 校验通过（$assetName）" -ForegroundColor Green
+}
+
 function Get-GitHubLatestTag([string]$repo) {
     $apiUrl = "https://api.github.com/repos/$repo/releases/latest"
     try {
@@ -266,13 +289,14 @@ $mnagentUrl = if ($mnagentVer -eq "latest") {
 $tmpMnagent = Join-Path $InstallDir ".mnagent-install.tmp"
 try {
     Download-File $mnagentUrl $tmpMnagent
+    Assert-Sha256 $tmpMnagent "${mnagentUrl}.sha256" $mnagentAsset
     if ((Get-Item $tmpMnagent).Length -lt 100KB) {
         throw "下载的 mnagent 文件体积过小，可能发生错误"
     }
     Move-ExecutableSafely $tmpMnagent $mnagentBin
 } catch {
     if (Test-Path $tmpMnagent) { Remove-Item -Path $tmpMnagent -Force }
-    throw "下载 mnagent 失败: $_"
+    throw "安装 mnagent 失败（下载或完整性校验未通过）: $_"
 }
 
 # 9. 写入接入令牌 (使用 UTF-8 无 BOM 编码，避免认证 401 失败)

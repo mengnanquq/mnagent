@@ -268,6 +268,57 @@ apply_gh_proxy() {
 	esac
 }
 
+# sha256_of <文件>：输出文件的 SHA-256（小写十六进制）。
+# 依次回退 sha256sum（OpenWrt/BusyBox 通常自带）→ shasum -a 256 → openssl dgst -sha256。
+sha256_of() {
+	sha_file="$1"
+	if command -v sha256sum >/dev/null 2>&1; then
+		sha256sum "$sha_file" | awk '{print $1}'
+	elif command -v shasum >/dev/null 2>&1; then
+		shasum -a 256 "$sha_file" | awk '{print $1}'
+	elif command -v openssl >/dev/null 2>&1; then
+		openssl dgst -sha256 "$sha_file" | awk '{print $NF}'
+	else
+		return 1
+	fi
+}
+
+# verify_sha256 <文件> <校验文件 URL> <资产名>
+# 校验文件内容为 "<hash>  <文件名>"（release 工作流生成）。任何一步失败都中止安装，
+# 且校验发生在 install_file 之前，失败不会覆盖已有二进制。
+verify_sha256() {
+	verify_file="$1"
+	verify_url="$2"
+	verify_asset="$3"
+	verify_sum_file="${verify_file}.sha256"
+
+	verify_actual="$(sha256_of "$verify_file")" \
+		|| die "未找到可用的 SHA-256 工具（sha256sum / shasum / openssl），已中止安装"
+	if ! download "$verify_url" "$verify_sum_file"; then
+		rm -f "$verify_sum_file"
+		die "下载 SHA-256 校验文件失败：${verify_url}（已中止安装）"
+	fi
+	verify_expected="$(awk 'NF >= 1 { print $1; exit }' "$verify_sum_file")"
+	verify_name="$(awk 'NF >= 2 { print $2; exit }' "$verify_sum_file")"
+	rm -f "$verify_sum_file"
+	case "$verify_name" in
+		\**) verify_name="${verify_name#?}";;
+	esac
+	if [ "${#verify_expected}" -ne 64 ]; then
+		die "SHA-256 校验文件格式非法：${verify_url}（已中止安装）"
+	fi
+	if printf '%s' "$verify_expected" | grep -q '[^0-9a-fA-F]'; then
+		die "SHA-256 校验文件格式非法：${verify_url}（已中止安装）"
+	fi
+	if [ -n "$verify_name" ] && [ "$(basename "$verify_name")" != "$verify_asset" ]; then
+		die "SHA-256 校验文件与资产不匹配：期望 ${verify_asset}，实际 ${verify_name}（已中止安装）"
+	fi
+	if [ "$verify_expected" != "$verify_actual" ]; then
+		die "SHA-256 校验失败：期望 ${verify_expected}，实际 ${verify_actual}（已中止安装，未覆盖旧二进制）"
+	fi
+	log "SHA-256 校验通过（${verify_asset}）"
+}
+
 # install_file <源> <目标> <权限>
 install_file() {
 	if command -v install >/dev/null 2>&1; then
@@ -386,13 +437,16 @@ build_from_source() {
 }
 
 download_release() {
-	url="https://github.com/$REPO/releases/latest/download/mnagent_${OS}_${ARCH}"
+	asset="mnagent_${OS}_${ARCH}"
+	url="https://github.com/$REPO/releases/latest/download/${asset}"
 	if [ "$VERSION" != "latest" ]; then
-		url="https://github.com/$REPO/releases/download/${VERSION}/mnagent_${OS}_${ARCH}"
+		url="https://github.com/$REPO/releases/download/${VERSION}/${asset}"
 	fi
 	url="$(apply_gh_proxy "$url")"
+	sum_url="${url}.sha256"
 	log "下载 mnagent（${VERSION}，${OS}/${ARCH}）"
 	download "$url" "$PREFIX/.mnagent.new" || return 1
+	verify_sha256 "$PREFIX/.mnagent.new" "$sum_url" "$asset"
 	install_file "$PREFIX/.mnagent.new" "$PREFIX/mnagent" 0755
 	rm -f "$PREFIX/.mnagent.new"
 }

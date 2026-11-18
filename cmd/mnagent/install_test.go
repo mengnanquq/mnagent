@@ -154,6 +154,20 @@ func TestInstallScriptSupportsOpenWrt(t *testing.T) {
 	}
 }
 
+// containsActiveLine 判断脚本的非注释行中是否包含 needle。
+// 守护断言必须跳过注释，否则把关键调用注释掉、注释文本仍含同一字符串时测试会假通过。
+func containsActiveLine(script, needle string) bool {
+	for _, line := range strings.Split(script, "\n") {
+		if strings.HasPrefix(strings.TrimSpace(line), "#") {
+			continue
+		}
+		if strings.Contains(line, needle) {
+			return true
+		}
+	}
+	return false
+}
+
 // TestInstallScriptKeepsKeySafeguards 防止把踩过坑的修复改回去：
 // 令牌目录权限、升级时重启、能力来源、安装后自检。
 func TestInstallScriptKeepsKeySafeguards(t *testing.T) {
@@ -167,6 +181,11 @@ func TestInstallScriptKeepsKeySafeguards(t *testing.T) {
 		{"原始套接字能力由服务携带", "AmbientCapabilities=CAP_NET_RAW CAP_NET_ADMIN"},
 		{"为 nexttrace 准备可写主目录", "StateDirectory=mnagent"},
 		{"自动更新可写目录", "ReadWritePaths=$PREFIX"},
+		{"下载后强制校验 SHA-256", `verify_sha256 "$PREFIX/.mnagent.new"`},
+		{"校验文件为同名 .sha256", `sum_url="${url}.sha256"`},
+		{"SHA-256 工具首选 sha256sum", `sha256sum "$sha_file"`},
+		{"SHA-256 回退 shasum -a 256", "shasum -a 256"},
+		{"SHA-256 回退 openssl dgst -sha256", "openssl dgst -sha256"},
 		{"缺失时自动安装 nexttrace 官方地址", "https://nxtrace.org/nt"},
 		{"官方 nexttrace 安装指定 --bin-dir", `--bin-dir "$PREFIX"`},
 		{"通用二进制查找 find_binary", "find_binary()"},
@@ -181,8 +200,8 @@ func TestInstallScriptKeepsKeySafeguards(t *testing.T) {
 		{"下载文件时显示进度条", "curl -#"},
 		{"systemd 默认以 root 运行", `[ -n "$RUN_USER" ] || RUN_USER="root"`},
 	} {
-		if !strings.Contains(script, want.needle) {
-			t.Errorf("install.sh 缺少 %s（应包含 %q）", want.name, want.needle)
+		if !containsActiveLine(script, want.needle) {
+			t.Errorf("install.sh 缺少 %s（非注释行应包含 %q）", want.name, want.needle)
 		}
 	}
 }
@@ -214,6 +233,9 @@ func TestWindowsInstallScript(t *testing.T) {
 		{"自动更新展示正确变量", "$enableAutoUpdate"},
 		{"下载路径代理支持", "Get-ProxiedUrl"},
 		{"NextTrace 安装", "nexttrace_windows_"},
+		{"mnagent 下载后校验 SHA-256", "Assert-Sha256"},
+		{"Windows 使用 Get-FileHash", "Get-FileHash"},
+		{"下载同名 .sha256", "{mnagentUrl}.sha256"},
 		{"MiaoSpeed zip 提取", "Expand-Archive"},
 		{"参数定义 -Bot", "[string]$Bot"},
 		{"参数定义 -Token", "[string]$Token"},
