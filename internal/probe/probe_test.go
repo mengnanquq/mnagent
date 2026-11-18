@@ -260,9 +260,9 @@ func TestBlockedProbeIP(t *testing.T) {
 	}
 }
 
-// TestDNSProbeLocalhost 用主机自身解析器查询回环地址。
+// TestDNSProbeLocalhost 用主机自身解析器查询回环地址（显式允许私网）。
 func TestDNSProbeLocalhost(t *testing.T) {
-	report, err := DNSProbe(context.Background(), model.Job{Target: "localhost", Query: "A", TimeoutMS: 3000})
+	report, err := DNSProbe(context.Background(), model.Job{Target: "localhost", Query: "A", TimeoutMS: 3000}, true)
 	if err != nil {
 		t.Fatalf("dns 探针失败: %v", err)
 	}
@@ -272,11 +272,31 @@ func TestDNSProbeLocalhost(t *testing.T) {
 	if report.ElapsedMs < 0 {
 		t.Fatalf("耗时异常: %+v", report)
 	}
-	if _, err := DNSProbe(context.Background(), model.Job{Target: "localhost", Query: "NOPE"}); err == nil {
+	if _, err := DNSProbe(context.Background(), model.Job{Target: "localhost", Query: "NOPE"}, true); err == nil {
 		t.Fatal("不支持的记录类型应报错")
 	}
-	if _, err := DNSProbe(context.Background(), model.Job{Target: "", Query: "A"}); err == nil {
+	if _, err := DNSProbe(context.Background(), model.Job{Target: "", Query: "A"}, true); err == nil {
 		t.Fatal("缺少域名应报错")
+	}
+}
+
+// TestDNSProbeBlocksPrivate 验证 allowPrivate=false 时 DNS 探针与其他探针一致：
+// 目标是私网/元数据地址或查询结果包含这类 IP 时直接拒绝，不返回记录。
+func TestDNSProbeBlocksPrivate(t *testing.T) {
+	// 目标是私网 IP（PTR/直查）应被拒绝。
+	for _, target := range []string{"127.0.0.1", "10.0.0.1", "169.254.169.254", "192.168.1.1", "::1"} {
+		if _, err := DNSProbe(context.Background(), model.Job{Target: target, Query: "PTR", TimeoutMS: 1000}, false); err == nil ||
+			!strings.Contains(err.Error(), "安全策略拦截") {
+			t.Fatalf("目标 %s 应被拦截，实际 err=%v", target, err)
+		}
+	}
+
+	// 域名解析到回环地址（localhost）时，A/AAAA/ALL 结果应被拒绝。
+	for _, recordType := range []string{"A", "AAAA", "ALL"} {
+		if _, err := DNSProbe(context.Background(), model.Job{Target: "localhost", Query: recordType, TimeoutMS: 3000}, false); err == nil ||
+			!strings.Contains(err.Error(), "DNS 查询结果包含") {
+			t.Fatalf("%s 查询 localhost 应因结果含私网地址被拒绝，实际 err=%v", recordType, err)
+		}
 	}
 }
 

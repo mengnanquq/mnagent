@@ -169,7 +169,7 @@ func RunProbe(ctx context.Context, job model.Job, allowPrivate bool) (Outcome, e
 		report, err := HTTPProbe(ctx, job, allowPrivate)
 		return marshalProbe(report, err)
 	case KindDNS:
-		report, err := DNSProbe(ctx, job)
+		report, err := DNSProbe(ctx, job, allowPrivate)
 		return marshalProbe(report, err)
 	default:
 		return Outcome{}, fmt.Errorf("未知探针类型：%s", job.Kind)
@@ -695,10 +695,19 @@ func collapseWhitespace(s string, limit int) string {
 // ---------- dns ----------
 
 // dnsProbe 用主机自身的解析器查询记录，便于对比不同地域/线路的解析结果。
-func DNSProbe(ctx context.Context, job model.Job) (DNSReport, error) {
+// allowPrivate=false 时与其他探针保持一致的 fail-closed 策略：查询目标本身是私网/元数据
+// 地址、或 A/AAAA/ALL 结果中出现这类地址时直接拒绝，不返回任何记录。
+// （Job 目前没有单独的“DNS 服务器”字段，解析始终走主机系统解析器；若以后增加该字段，
+// 也应在此按 IsBlockedProbeIP 拒绝私网 DNS 服务器。）
+func DNSProbe(ctx context.Context, job model.Job, allowPrivate bool) (DNSReport, error) {
 	host := strings.TrimSpace(job.Target)
 	if host == "" {
 		return DNSReport{}, errors.New("缺少查询域名")
+	}
+	if !allowPrivate {
+		if ip := net.ParseIP(host); ip != nil && IsBlockedProbeIP(ip) {
+			return DNSReport{}, fmt.Errorf("安全策略拦截：禁止查询私有或云元数据地址 (%s)", ip.String())
+		}
 	}
 	recordType := strings.ToUpper(strings.TrimSpace(job.Query))
 	if recordType == "" {
@@ -725,6 +734,9 @@ func DNSProbe(ctx context.Context, job model.Job) (DNSReport, error) {
 			return report, err
 		}
 		for _, ip := range ips {
+			if !allowPrivate && IsBlockedProbeIP(ip) {
+				return report, fmt.Errorf("安全策略拦截：DNS 查询结果包含私有或云元数据地址 (%s)", ip.String())
+			}
 			add([]string{ip.String()})
 		}
 	case "CNAME":
