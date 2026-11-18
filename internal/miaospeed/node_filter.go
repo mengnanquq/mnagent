@@ -35,22 +35,35 @@ var lookupNodeIPs = func(ctx context.Context, host string) ([]net.IP, error) {
 // 域名无法解析的节点予以保留（miaospeed 自身也会连接失败），避免因 DNS 抖动误杀正常节点；
 // 无法识别服务器地址的节点一律剔除，防止借畸形配置绕过检查。
 func filterBlockedNodes(ctx context.Context, nodes []MiaospeedNode) ([]MiaospeedNode, int) {
-	hosts := make(map[string]bool)
+	hostSet := make(map[string]bool)
 	for _, n := range nodes {
 		h := normalizeNodeHost(n.Server)
 		if h != "" {
-			hosts[h] = false
+			hostSet[h] = false
 		}
+	}
+	// 先固定待查列表再并发写入 map：直接在 range 期间写 map 会与已启动的解析协程并发写同一张 map。
+	hosts := make([]string, 0, len(hostSet))
+	for h := range hostSet {
+		hosts = append(hosts, h)
 	}
 
 	var mu sync.Mutex
-	var wg sync.WaitGroup
-	sem := make(chan struct{}, nodeResolveConcurrency)
-	for h := range hosts {
+	blocked := make(map[string]bool, len(hosts))
+	// 先同步处理字面 IP，再并发解析域名：所有 map 写入都必须持锁，
+	// 否则主协程与解析协程会同时写同一张 map（-race 会直接报错）。
+	pending := make([]string, 0, len(hosts))
+	for _, h := range hosts {
 		if ip := net.ParseIP(h); ip != nil {
-			hosts[h] = probe.IsBlockedProbeIP(ip)
+			blocked[h] = probe.IsBlockedProbeIP(ip)
 			continue
 		}
+		pending = append(pending, h)
+	}
+
+	var wg sync.WaitGroup
+	sem := make(chan struct{}, nodeResolveConcurrency)
+	for _, h := range pending {
 		wg.Add(1)
 		go func(h string) {
 			defer wg.Done()
@@ -59,17 +72,17 @@ func filterBlockedNodes(ctx context.Context, nodes []MiaospeedNode) ([]Miaospeed
 			rctx, cancel := context.WithTimeout(ctx, nodeResolveTimeout)
 			defer cancel()
 			ips, err := lookupNodeIPs(rctx, h)
-			blocked := false
+			isBlocked := false
 			if err == nil {
 				for _, ip := range ips {
 					if probe.IsBlockedProbeIP(ip) {
-						blocked = true
+						isBlocked = true
 						break
 					}
 				}
 			}
 			mu.Lock()
-			hosts[h] = blocked
+			blocked[h] = isBlocked
 			mu.Unlock()
 		}(h)
 	}
@@ -79,7 +92,7 @@ func filterBlockedNodes(ctx context.Context, nodes []MiaospeedNode) ([]Miaospeed
 	removed := 0
 	for _, n := range nodes {
 		h := normalizeNodeHost(n.Server)
-		if h == "" || hosts[h] {
+		if h == "" || blocked[h] {
 			removed++
 			continue
 		}
