@@ -120,18 +120,22 @@ func (r *Runner) runMiaospeed(ctx context.Context, job model.Job) runResult {
 
 	output, data, err := miaospeed.RunJob(runCtx, r.miaospeedBinary, r.ghProxy, job, r.logger, r.onProgress, r.allowPrivateProbes)
 	if err != nil {
-		return runResult{
-			Output:   output,
-			Data:     data,
-			ErrText:  err.Error(),
-			ExitCode: -1,
-		}
+		return buildMiaospeedResult(output, data, err.Error(), -1)
 	}
-	return runResult{
-		Output:   output,
-		Data:     data,
-		ExitCode: 0,
+	return buildMiaospeedResult(output, data, "", 0)
+}
+
+// buildMiaospeedResult 组装 miaospeed 任务的回传结果。
+// 结构化 Data 已携带完整报告，机器人各排版路径都优先读 Data（仅旧版本才回退 Output），
+// 因此不再把同一份 JSON 同时塞进 Output：300 节点约 1.8MB、500 节点约 3MB，重复一份会整整翻倍，
+// 直接撞上结果体上限。
+func buildMiaospeedResult(output string, data json.RawMessage, errText string, exitCode int) runResult {
+	res := runResult{Data: data, ErrText: errText, ExitCode: exitCode}
+	if len(data) == 0 {
+		// 没有结构化数据（例如启动阶段就失败）时保留文本输出，供机器人兜底展示。
+		res.Output = output
 	}
+	return res
 }
 
 // runProbeJob 执行 ping/tcping/http/dns 探针并映射为统一结果。

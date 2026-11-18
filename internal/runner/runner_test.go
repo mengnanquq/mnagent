@@ -829,6 +829,38 @@ func TestRunTraceBlockedPrivateIP(t *testing.T) {
 	}
 }
 
+// TestBuildMiaospeedResultDropsDuplicateOutput 验证 miaospeed 结果不再把同一份 JSON
+// 同时放进 Output 与 Data：两份相加会让 300+ 节点测速的体积翻倍并撞上机器人结果上限。
+func TestBuildMiaospeedResultDropsDuplicateOutput(t *testing.T) {
+	data := json.RawMessage(`{"node_name":"HK-01","total_nodes":300}`)
+
+	ok := buildMiaospeedResult(string(data), data, "", 0)
+	if ok.ExitCode != 0 || ok.ErrText != "" {
+		t.Fatalf("成功结果字段异常: %+v", ok)
+	}
+	if ok.Output != "" {
+		t.Fatalf("有结构化 Data 时不应再重复填充 Output，实际 %d 字节", len(ok.Output))
+	}
+	if string(ok.Data) != string(data) {
+		t.Fatalf("Data 应原样保留，实际 %s", ok.Data)
+	}
+
+	// 失败但仍有结构化数据：同样不重复；错误文案单独回传
+	fail := buildMiaospeedResult(string(data), data, "测速失败", -1)
+	if fail.Output != "" || fail.ErrText != "测速失败" || fail.ExitCode != -1 {
+		t.Fatalf("失败结果字段异常: %+v", fail)
+	}
+
+	// 没有结构化数据（启动阶段就失败）时保留文本输出供机器人兜底
+	bare := buildMiaospeedResult("启动 miaospeed 失败: exec format error", nil, "启动失败", -1)
+	if bare.Output == "" || !strings.Contains(bare.Output, "exec format error") {
+		t.Fatalf("无结构化数据时应保留文本输出，实际: %+v", bare)
+	}
+	if len(bare.Data) != 0 {
+		t.Fatalf("无结构化数据时 Data 应为空，实际: %s", bare.Data)
+	}
+}
+
 // TestAgentCheckAndUpdateDependencies 验证 agent.checkAndUpdateDependencies 过程触发的依赖更新。
 func TestAgentCheckAndUpdateDependencies(t *testing.T) {
 	tmpDir := t.TempDir()

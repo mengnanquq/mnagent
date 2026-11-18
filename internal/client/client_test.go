@@ -9,6 +9,7 @@ import (
 	"errors"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -155,6 +156,27 @@ func TestClientSendResultStopsOnUnauthorized(t *testing.T) {
 	}
 	if calls.Load() != 1 {
 		t.Fatalf("请求次数 = %d，期望 1（不重试）", calls.Load())
+	}
+}
+
+// TestClientSendResultStopsOnTooLarge 验证 413 不重试并给出可诊断的明确错误。
+func TestClientSendResultStopsOnTooLarge(t *testing.T) {
+	var calls atomic.Int64
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		calls.Add(1)
+		http.Error(w, "结果体超过上限（16 MB）", http.StatusRequestEntityTooLarge)
+	}))
+	defer srv.Close()
+
+	err := New(testConfig(srv.URL, nil)).sendResult(context.Background(), model.Result{ID: "j1"})
+	if err == nil {
+		t.Fatal("413 应返回错误")
+	}
+	if !strings.Contains(err.Error(), "413") || !strings.Contains(err.Error(), "结果体积超过上限") {
+		t.Fatalf("413 应给出明确的体积超限错误，实际: %v", err)
+	}
+	if calls.Load() != 1 {
+		t.Fatalf("请求次数 = %d，期望 1（413 不应重试）", calls.Load())
 	}
 }
 

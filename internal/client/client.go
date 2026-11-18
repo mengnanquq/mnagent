@@ -170,6 +170,10 @@ func (c *Client) SendResult(ctx context.Context, res model.Result) error {
 		if status == http.StatusNoContent || status == http.StatusOK {
 			return nil
 		}
+		if status == http.StatusRequestEntityTooLarge {
+			// 结果体超过机器人上限：重试只会再被拒一次，直接给出可诊断的明确错误。
+			return fmt.Errorf("回传结果被机器人拒绝：结果体积超过上限（413 %s），请减少测速节点数或升级机器人", snippet)
+		}
 		lastErr = fmt.Errorf("回传结果失败：%s %s", resp.Status, snippet)
 		if status == http.StatusUnauthorized || status == http.StatusBadRequest {
 			return lastErr // 鉴权/请求本身有问题，重试无意义。
