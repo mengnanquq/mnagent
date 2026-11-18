@@ -2,6 +2,7 @@ package runner
 
 import (
 	"context"
+	"crypto/sha256"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -578,11 +579,18 @@ func TestHandleUpgradeJob(t *testing.T) {
 			return
 		}
 		payload := make([]byte, 2048)
+		if strings.HasSuffix(r.URL.Path, ".sha256") {
+			fmt.Fprintf(w, "%x  mnagent_linux_amd64\n", sha256.Sum256(payload))
+			return
+		}
 		w.WriteHeader(http.StatusOK)
 		_, _ = w.Write(payload)
 	}))
 	defer downloadSrv.Close()
 	u.URLForFunc = func(v string) string { return downloadSrv.URL }
+	u.ChecksumURLFunc = func(v string) string {
+		return downloadSrv.URL + "/releases/download/" + v + "/mnagent_linux_amd64.sha256"
+	}
 	u.DownloadClient = downloadSrv.Client()
 
 	testAgent.handleUpgradeJob(context.Background(), model.Job{

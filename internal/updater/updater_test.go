@@ -58,6 +58,8 @@ type fakeReleaseServer struct {
 
 func (f *fakeReleaseServer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	switch {
+	case strings.HasPrefix(r.URL.Path, "/releases/download/") && strings.HasSuffix(r.URL.Path, "/mnagent_linux_amd64.sha256"):
+		fmt.Fprintf(w, "%x  mnagent_linux_amd64\n", sha256.Sum256(f.body))
 	case strings.HasPrefix(r.URL.Path, "/releases/download/") && strings.HasSuffix(r.URL.Path, "/mnagent_linux_amd64"):
 		f.dlHits.Add(1)
 		_, _ = w.Write(f.body)
@@ -159,9 +161,9 @@ func TestUpdaterApply(t *testing.T) {
 		}
 		return base + "/releases/download/" + version + "/" + u.AssetName()
 	}
-	// 校验清单指向本地假服务器（返回 404 = 该版本未发布清单），避免测试访问真实 GitHub。
+	// 校验文件同样指向本地假服务器，避免测试访问真实 GitHub。
 	u.ChecksumURLFunc = func(version string) string {
-		return base + "/releases/download/" + version + "/sha256sums.txt"
+		return base + "/releases/download/" + version + "/" + u.AssetName() + ".sha256"
 	}
 
 	if err := u.Apply("v0.1.8"); err != nil {
@@ -333,7 +335,7 @@ func TestUpdaterAssetNameWindows(t *testing.T) {
 	}
 }
 
-// TestUpdaterSHA256ChecksumVerification 验证发布了 sha256sums.txt 时哈希匹配则成功，被篡改则拦截报错。
+// TestUpdaterSHA256ChecksumVerification 验证发布了 <资产>.sha256 时哈希匹配则成功，被篡改则拦截报错。
 func TestUpdaterSHA256ChecksumVerification(t *testing.T) {
 	bin := []byte("#!/bin/sh\n# padding for size check\n")
 	for len(bin) < 2048 {
@@ -344,7 +346,7 @@ func TestUpdaterSHA256ChecksumVerification(t *testing.T) {
 	var serveMismatched atomic.Bool
 	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch {
-		case strings.HasSuffix(r.URL.Path, "/sha256sums.txt"):
+		case strings.HasSuffix(r.URL.Path, ".sha256"):
 			hash := realHash
 			if serveMismatched.Load() {
 				hash = "0000000000000000000000000000000000000000000000000000000000000000"
@@ -373,7 +375,7 @@ func TestUpdaterSHA256ChecksumVerification(t *testing.T) {
 		return ts.URL + "/releases/download/" + version + "/" + u.AssetName()
 	}
 	u.ChecksumURLFunc = func(version string) string {
-		return ts.URL + "/releases/download/" + version + "/sha256sums.txt"
+		return ts.URL + "/releases/download/" + version + "/" + u.AssetName() + ".sha256"
 	}
 
 	// 1. 正确 Hash -> 正常替换
@@ -388,12 +390,12 @@ func TestUpdaterSHA256ChecksumVerification(t *testing.T) {
 	}
 }
 
-// TestUpdaterChecksumFetchFailureAborts 验证：校验清单返回非 404 错误时中止更新，不得跳过校验；非法版本号直接拒绝。
+// TestUpdaterChecksumFetchFailureAborts 验证：校验文件返回非 200 错误时中止更新，不得跳过校验；非法版本号直接拒绝。
 func TestUpdaterChecksumFetchFailureAborts(t *testing.T) {
 	bin := make([]byte, 4096)
 	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch {
-		case strings.HasSuffix(r.URL.Path, "/sha256sums.txt"):
+		case strings.HasSuffix(r.URL.Path, ".sha256"):
 			http.Error(w, "bad gateway", http.StatusBadGateway)
 		default:
 			_, _ = w.Write(bin)
@@ -405,10 +407,10 @@ func TestUpdaterChecksumFetchFailureAborts(t *testing.T) {
 	_ = os.WriteFile(exe, []byte("old-bin"), 0o755)
 	u := New(Config{CurrentVersion: "v0.1.0", Repo: "owner/repo", Platform: "linux", Arch: "amd64", DownloadClient: ts.Client(), Executable: exe})
 	u.URLForFunc = func(version string) string { return ts.URL + "/d/" + version + "/" + u.AssetName() }
-	u.ChecksumURLFunc = func(version string) string { return ts.URL + "/d/" + version + "/sha256sums.txt" }
+	u.ChecksumURLFunc = func(version string) string { return ts.URL + "/d/" + version + "/" + u.AssetName() + ".sha256" }
 
-	if err := u.Apply("v0.1.1"); err == nil || !strings.Contains(err.Error(), "校验清单") {
-		t.Fatalf("校验清单 502 时应中止更新，实际 err=%v", err)
+	if err := u.Apply("v0.1.1"); err == nil || !strings.Contains(err.Error(), "校验值") {
+		t.Fatalf("校验文件 502 时应中止更新，实际 err=%v", err)
 	}
 	if got, _ := os.ReadFile(exe); string(got) != "old-bin" {
 		t.Fatal("中止更新时不应替换二进制")
@@ -425,5 +427,54 @@ func TestUpdaterChecksumFetchFailureAborts(t *testing.T) {
 		if !ValidReleaseTag(good) {
 			t.Fatalf("%q 应为合法版本号", good)
 		}
+	}
+}
+
+// TestUpdaterChecksumMissingOrInvalidAborts 覆盖拿不到有效校验值的各种情况：
+// 404、空文件、哈希不匹配、格式非法、清单中缺少当前资产，全部必须中止更新且不替换二进制。
+func TestUpdaterChecksumMissingOrInvalidAborts(t *testing.T) {
+	bin := make([]byte, 4096)
+	realHash := fmt.Sprintf("%x", sha256.Sum256(bin))
+	cases := []struct {
+		name         string
+		status       int
+		checksumBody string
+		wantErr      string
+	}{
+		{"校验文件 404", http.StatusNotFound, "", "404"},
+		{"校验文件为空", http.StatusOK, "\n", "为空"},
+		{"校验文件只有空白", http.StatusOK, "  \t\n", "为空"},
+		{"哈希不匹配", http.StatusOK, strings.Repeat("0", 64) + "  mnagent_linux_amd64\n", "完整性校验失败"},
+		{"哈希格式非法", http.StatusOK, "not-a-valid-hash  mnagent_linux_amd64\n", "格式非法"},
+		{"清单中缺少当前资产", http.StatusOK, realHash + "  other_asset\n", "未找到当前资产"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				if strings.HasSuffix(r.URL.Path, ".sha256") {
+					w.WriteHeader(tc.status)
+					_, _ = w.Write([]byte(tc.checksumBody))
+					return
+				}
+				_, _ = w.Write(bin)
+			}))
+			defer ts.Close()
+
+			exe := filepath.Join(t.TempDir(), "mnagent")
+			if err := os.WriteFile(exe, []byte("old-bin"), 0o755); err != nil {
+				t.Fatal(err)
+			}
+			u := New(Config{CurrentVersion: "v0.1.0", Repo: "owner/repo", Platform: "linux", Arch: "amd64", DownloadClient: ts.Client(), Executable: exe})
+			u.URLForFunc = func(version string) string { return ts.URL + "/d/" + version + "/" + u.AssetName() }
+			u.ChecksumURLFunc = func(version string) string { return ts.URL + "/d/" + version + "/" + u.AssetName() + ".sha256" }
+
+			err := u.Apply("v0.1.1")
+			if err == nil || !strings.Contains(err.Error(), tc.wantErr) {
+				t.Fatalf("期望错误包含 %q，实际 err=%v", tc.wantErr, err)
+			}
+			if got, _ := os.ReadFile(exe); string(got) != "old-bin" {
+				t.Fatal("校验失败时不应替换二进制")
+			}
+		})
 	}
 }

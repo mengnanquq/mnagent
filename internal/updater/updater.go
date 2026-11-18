@@ -342,11 +342,16 @@ func (u *Updater) checksumURLFor(version string) string {
 	if u.ChecksumURLFunc != nil {
 		return u.ChecksumURLFunc(version)
 	}
-	raw := "https://github.com/" + u.Repo + "/releases/download/" + version + "/sha256sums.txt"
+	// Release 工作流为每个资产生成同名的 "<资产>.sha256"（内容为 "<hash>  <文件名>"）。
+	raw := "https://github.com/" + u.Repo + "/releases/download/" + version + "/" + u.AssetName() + ".sha256"
 	return u.ProxyURL(raw)
 }
 
-// fetchExpectedChecksum 获取目标版本的 sha256 校验清单并提取当前资产对应 Hash。
+var sha256HexPattern = regexp.MustCompile(`^[0-9a-fA-F]{64}$`)
+
+// fetchExpectedChecksum 获取目标资产的 sha256 校验文件并提取 Hash。
+// 任何拿不到有效校验值的情况（404、空文件、格式非法、缺少当前资产）都返回错误，
+// 由调用方中止更新——绝不“没有校验值就放行”。
 func (u *Updater) fetchExpectedChecksum(version string) (string, error) {
 	targetURL := u.checksumURLFor(version)
 	req, err := http.NewRequest(http.MethodGet, targetURL, nil)
@@ -366,10 +371,10 @@ func (u *Updater) fetchExpectedChecksum(version string) (string, error) {
 	defer resp.Body.Close()
 
 	if resp.StatusCode == http.StatusNotFound {
-		return "", nil // 未发布校验文件，宽容放行
+		return "", fmt.Errorf("该版本未发布校验文件 %s.sha256（HTTP 404）", u.AssetName())
 	}
 	if resp.StatusCode != http.StatusOK {
-		return "", fmt.Errorf("HTTP %d", resp.StatusCode)
+		return "", fmt.Errorf("获取校验文件返回 HTTP %d", resp.StatusCode)
 	}
 
 	body, err := io.ReadAll(io.LimitReader(resp.Body, 1<<18)) // 256 KiB
@@ -378,18 +383,38 @@ func (u *Updater) fetchExpectedChecksum(version string) (string, error) {
 	}
 
 	assetName := u.AssetName()
+	if len(bytes.TrimSpace(body)) == 0 {
+		return "", fmt.Errorf("校验文件 %s.sha256 为空", assetName)
+	}
+
 	scanner := bufio.NewScanner(bytes.NewReader(body))
 	for scanner.Scan() {
 		line := strings.TrimSpace(scanner.Text())
-		fields := strings.Fields(line)
-		if len(fields) >= 2 {
-			fileName := strings.TrimPrefix(fields[1], "*")
-			if filepath.Base(fileName) == assetName {
-				return strings.ToLower(fields[0]), nil
-			}
+		if line == "" {
+			continue
 		}
+		fields := strings.Fields(line)
+		hash := strings.ToLower(fields[0])
+		// 允许两种格式：只含一个哈希，或 "<hash>  <文件名>"。
+		if len(fields) == 1 {
+			if !sha256HexPattern.MatchString(hash) {
+				return "", fmt.Errorf("校验文件格式非法：%q 不是合法的 SHA-256", line)
+			}
+			return hash, nil
+		}
+		fileName := strings.TrimPrefix(fields[1], "*")
+		if filepath.Base(fileName) != assetName {
+			continue
+		}
+		if !sha256HexPattern.MatchString(hash) {
+			return "", fmt.Errorf("校验文件中 %s 的哈希格式非法：%q", assetName, fields[0])
+		}
+		return hash, nil
 	}
-	return "", nil
+	if err := scanner.Err(); err != nil {
+		return "", err
+	}
+	return "", fmt.Errorf("校验文件 %s.sha256 中未找到当前资产的哈希", assetName)
 }
 
 // DownloadAndReplace 下载并原子替换二进制文件，支持 SHA-256 完整性校验，返回目标版本号，但不触发重启。
@@ -397,10 +422,10 @@ func (u *Updater) DownloadAndReplace(version string) (string, error) {
 	if !ValidReleaseTag(version) {
 		return "", fmt.Errorf("非法的目标版本号：%q", version)
 	}
-	// 校验清单只在明确 404（该版本未发布清单）时放行；其余错误一律中止，避免网络或代理故障时跳过校验
+	// 必须拿到有效校验值：缺失、为空或格式非法都中止更新，避免校验被静默跳过。
 	expectedHash, err := u.fetchExpectedChecksum(version)
 	if err != nil {
-		return "", fmt.Errorf("获取 SHA-256 校验清单失败，已中止更新：%w", err)
+		return "", fmt.Errorf("获取 SHA-256 校验值失败，已中止更新：%w", err)
 	}
 
 	downloadURL := u.urlForOrFallback(version)
@@ -425,11 +450,9 @@ func (u *Updater) DownloadAndReplace(version string) (string, error) {
 	}
 	_ = tmpFile.Close()
 
-	if expectedHash != "" {
-		actualHash := hex.EncodeToString(hasher.Sum(nil))
-		if subtle.ConstantTimeCompare([]byte(strings.ToLower(actualHash)), []byte(strings.ToLower(expectedHash))) != 1 {
-			return "", fmt.Errorf("SHA-256 完整性校验失败：期望 %s，实际 %s (防篡改拦截)", expectedHash, actualHash)
-		}
+	actualHash := hex.EncodeToString(hasher.Sum(nil))
+	if subtle.ConstantTimeCompare([]byte(strings.ToLower(actualHash)), []byte(strings.ToLower(expectedHash))) != 1 {
+		return "", fmt.Errorf("SHA-256 完整性校验失败：期望 %s，实际 %s (防篡改拦截)", expectedHash, actualHash)
 	}
 
 	if err := os.Chmod(tmpPath, 0o755); err != nil {
