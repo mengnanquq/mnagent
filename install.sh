@@ -580,12 +580,34 @@ map_nexttrace_arch() {
 	esac
 }
 
+# fetch_github_asset_digest <owner/repo> <资产名>
+# 从 GitHub Releases API 的最新发布中取指定资产的 sha256 摘要（形如 sha256:<hex>）。
+# 不执行任何远端脚本；取不到摘要时返回非零，由调用方跳过自动安装。
+fetch_github_asset_digest() {
+	digest_repo="$1"
+	digest_asset="$2"
+	digest_api="https://api.github.com/repos/${digest_repo}/releases/latest"
+	digest_json="$(download_stdout "$digest_api" 2>/dev/null || true)"
+	[ -n "$digest_json" ] || return 1
+	digest_value="$(printf '%s' "$digest_json" \
+		| awk -v target="$digest_asset" 'BEGIN { RS = "}" } index($0, target) > 0 { print }' \
+		| grep -o 'sha256:[0-9a-fA-F]*' | head -n1)"
+	[ -n "$digest_value" ] || return 1
+	printf '%s' "$digest_value"
+}
+
 download_nexttrace() {
 	nt_arch="$(map_nexttrace_arch "$ARCH")"
 	nt_asset="nexttrace_${OS}_${nt_arch}"
 	if [ "$OS" = "darwin" ]; then
 		nt_asset="nexttrace_darwin_universal"
 	fi
+	nt_digest="$(fetch_github_asset_digest "nxtrace/NTrace-core" "$nt_asset" || true)"
+	if [ -z "$nt_digest" ]; then
+		warn "无法获取 nexttrace（${nt_asset}）的 SHA-256 摘要，已跳过自动安装（请检查网络或 GitHub API 限额）"
+		return 1
+	fi
+	nt_expected="${nt_digest#sha256:}"
 	url="https://github.com/nxtrace/NTrace-core/releases/latest/download/${nt_asset}"
 	url="$(apply_gh_proxy "$url")"
 	if [ -n "$GH_PROXY" ]; then
@@ -593,21 +615,34 @@ download_nexttrace() {
 	else
 		log "从 GitHub Releases 下载 nexttrace（${OS}/${nt_arch}）"
 	fi
-	if download "$url" "$PREFIX/.nexttrace.new"; then
-		install_file "$PREFIX/.nexttrace.new" "$PREFIX/nexttrace" 0755
-		rm -f "$PREFIX/.nexttrace.new"
-		NEXTTRACE_PATH="$PREFIX/nexttrace"
+	if ! download "$url" "$PREFIX/.nexttrace.new"; then
+		return 1
 	fi
+	nt_actual="$(sha256_of "$PREFIX/.nexttrace.new" || true)"
+	if [ -z "$nt_actual" ]; then
+		rm -f "$PREFIX/.nexttrace.new"
+		warn "未找到可用的 SHA-256 工具，已跳过 nexttrace 自动安装"
+		return 1
+	fi
+	if [ "$nt_actual" != "$nt_expected" ]; then
+		rm -f "$PREFIX/.nexttrace.new"
+		warn "nexttrace SHA-256 校验失败：期望 ${nt_expected}，实际 ${nt_actual}（已丢弃下载文件）"
+		return 1
+	fi
+	log "nexttrace SHA-256 校验通过"
+	install_file "$PREFIX/.nexttrace.new" "$PREFIX/nexttrace" 0755
+	rm -f "$PREFIX/.nexttrace.new"
+	NEXTTRACE_PATH="$PREFIX/nexttrace"
 }
 
 NEXTTRACE_PATH="$(find_binary "$NEXTTRACE_BIN" || true)"
 
-# 缺少 nexttrace 时，按照官方推荐规范进行自动化安装：
-# 1. OpenWrt opkg 包管理器
-# 2. 官方一键脚本（显式指定 --bin-dir "$PREFIX"，避免 OpenWrt 等环境装入非 PATH 目录）
-# 3. GitHub Releases 预编译二进制直连下载（支持 GH_PROXY 代理）
+# 缺少 nexttrace 时自动安装：
+# 1. OpenWrt opkg 包管理器（保留原有分支）
+# 2. GitHub Releases 预编译二进制，下载前从 GitHub API 取 asset digest 强制校验
+# 不再执行远端一键脚本（curl https://nxtrace.org/nt | bash），避免以 root 运行未固定版本的远端代码。
 if [ -z "$NEXTTRACE_PATH" ] && [ "$INSTALL_NEXTTRACE" = "yes" ]; then
-	log "环境缺少 nexttrace，正在按照官方推荐方式安装..."
+	log "环境缺少 nexttrace，正在安装..."
 	# 1. 如果是 OpenWrt / ImmortalWrt 且有 opkg，优先尝试包管理器官方包
 	if [ "$PLATFORM" = "openwrt" ] && command -v opkg >/dev/null 2>&1; then
 		log "尝试通过 opkg 安装 nexttrace"
@@ -616,23 +651,11 @@ if [ -z "$NEXTTRACE_PATH" ] && [ "$INSTALL_NEXTTRACE" = "yes" ]; then
 		NEXTTRACE_PATH="$(find_binary "$NEXTTRACE_BIN" || true)"
 	fi
 
-	# 2. Linux / macOS 通用官方一键脚本（curl -sL https://nxtrace.org/nt | bash）
-	if [ -z "$NEXTTRACE_PATH" ]; then
-		log "执行 nexttrace 官方一键安装脚本（https://nxtrace.org/nt）"
-		SH_BIN="sh"
-		if command -v bash >/dev/null 2>&1; then
-			SH_BIN="bash"
-		fi
-		if download_stdout "https://nxtrace.org/nt" | "$SH_BIN" -s -- --bin-dir "$PREFIX" >/dev/null 2>&1 \
-			|| download_stdout "https://nxtrace.org/nt" | "$SH_BIN" >/dev/null 2>&1; then
-			NEXTTRACE_PATH="$(find_binary "$NEXTTRACE_BIN" || true)"
-		fi
-	fi
-
-	# 3. 官方脚本若失败，直接从 GitHub Releases 下载预编译二进制兜底
+	# 2. 直接从 GitHub Releases 下载预编译二进制并校验完整性
 	if [ -z "$NEXTTRACE_PATH" ]; then
 		download_nexttrace || true
-		NEXTTRACE_PATH="$(find_binary "$NEXTTRACE_BIN" || true)"
+		# 下载成功时 download_nexttrace 已设置 NEXTTRACE_PATH；不要再用 PATH 中的同名文件覆盖它。
+		[ -n "$NEXTTRACE_PATH" ] || NEXTTRACE_PATH="$(find_binary "$NEXTTRACE_BIN" || true)"
 	fi
 
 	if [ -n "$NEXTTRACE_PATH" ]; then

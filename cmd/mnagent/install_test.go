@@ -186,10 +186,11 @@ func TestInstallScriptKeepsKeySafeguards(t *testing.T) {
 		{"SHA-256 工具首选 sha256sum", `sha256sum "$sha_file"`},
 		{"SHA-256 回退 shasum -a 256", "shasum -a 256"},
 		{"SHA-256 回退 openssl dgst -sha256", "openssl dgst -sha256"},
-		{"缺失时自动安装 nexttrace 官方地址", "https://nxtrace.org/nt"},
-		{"官方 nexttrace 安装指定 --bin-dir", `--bin-dir "$PREFIX"`},
+		{"缺失时自动安装 nexttrace", "download_nexttrace"},
+		{"nexttrace 摘要取自 GitHub API", "fetch_github_asset_digest"},
+		{"nexttrace 下载后比对 SHA-256", `[ "$nt_actual" != "$nt_expected" ]`},
 		{"通用二进制查找 find_binary", "find_binary()"},
-		{"GitHub Releases 直连兜底", "download_nexttrace"},
+		{"GitHub Releases 直连下载", "download_nexttrace"},
 		{"OpenWrt 优先 opkg 安装 nexttrace", "opkg install nexttrace"},
 		{"自动安装 miaospeed 来源", "AirportR/miaospeed"},
 		{"自动安装 miaospeed 继承 gh-proxy", `apply_gh_proxy "$url"`},
@@ -203,6 +204,21 @@ func TestInstallScriptKeepsKeySafeguards(t *testing.T) {
 		if !containsActiveLine(script, want.needle) {
 			t.Errorf("install.sh 缺少 %s（非注释行应包含 %q）", want.name, want.needle)
 		}
+	}
+}
+
+// TestInstallScriptDoesNotRunRemoteNexttraceScript 守护：不能再以 root 执行
+// 未固定版本的远端一键脚本（curl https://nxtrace.org/nt | bash），
+// nexttrace 必须走 GitHub Releases 下载并校验摘要。
+func TestInstallScriptDoesNotRunRemoteNexttraceScript(t *testing.T) {
+	script := string(readInstallScript(t))
+	for _, bad := range []string{"nxtrace.org", "NTrace-core/install.sh"} {
+		if containsActiveLine(script, bad) {
+			t.Errorf("install.sh 非注释行仍引用远端 nexttrace 安装脚本 %q", bad)
+		}
+	}
+	if !containsActiveLine(script, "download_nexttrace") {
+		t.Error("install.sh 应通过 download_nexttrace 从 GitHub Releases 安装 nexttrace")
 	}
 }
 
