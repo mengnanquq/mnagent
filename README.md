@@ -51,6 +51,28 @@ Agent 通过 HTTPS **主动长轮询**接收服务端下发的网络探测与节
 
 ---
 
+## 🔐 更新签名（可选，推荐）
+
+自更新默认校验 SHA-256；如果发布方希望防御“二进制与 `.sha256` 被同时替换”的攻击，可以启用 Ed25519 签名：
+
+1. 在本地生成密钥对（**不要提交私钥**）：
+   ```sh
+   go run ./scripts/gen-signing-key.go
+   # 生成 signing-private.key（0600）与 signing-public.key（0644）
+   ```
+2. 把私钥内容保存为仓库 Secret `MNAGENT_SIGNING_PRIVATE_KEY`，然后删除本地私钥文件：
+   ```sh
+   gh secret set MNAGENT_SIGNING_PRIVATE_KEY < signing-private.key
+   rm -f signing-private.key
+   ```
+3. 下一次 Release 工作流会从私钥推导公钥并：
+   - 通过 `-ldflags "-X github.com/mengnanquq/mnagent/internal/updater.SigningPublicKeyBase64=<公钥>"` 把公钥内置进所有二进制；
+   - 为每个 `<资产>.sha256` 生成 `<资产>.sha256.sig`（base64 Ed25519 签名），并额外签名统一的 `checksums.txt`。
+
+二进制**内置了公钥时强制验签**：签名缺失、校验清单被篡改或密钥不匹配都会中止更新；未内置公钥的旧版本/本地构建保持原有 SHA-256 校验行为，并在更新时打印警告。没有配置 Secret 时 Release 仍可正常发布，只是不生成 `.sig`，构建出的二进制也不会强制验签。
+
+---
+
 ## 🛠️ 服务管理命令
 
 各平台安装脚本均会自动注册为系统原生守护服务（开机自启、崩溃自动拉起）：

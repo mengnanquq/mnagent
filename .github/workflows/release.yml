@@ -102,6 +102,21 @@ jobs:
         run: sudo apt-get update && sudo apt-get install -y upx
       - name: Test
         run: go test ./...
+      - name: Derive signing public key
+        env:
+          MNAGENT_SIGNING_PRIVATE_KEY: ${{ secrets.MNAGENT_SIGNING_PRIVATE_KEY }}
+        run: |
+          if [ -z "$MNAGENT_SIGNING_PRIVATE_KEY" ]; then
+            echo "未配置 MNAGENT_SIGNING_PRIVATE_KEY：本次构建不内置更新签名公钥（发布时也无法生成 .sig）" >&2
+            exit 0
+          fi
+          key="$RUNNER_TEMP/signing-private.key"
+          printf '%s' "$MNAGENT_SIGNING_PRIVATE_KEY" > "$key"
+          chmod 600 "$key"
+          pub="$(go run ./scripts/gen-signing-key.go -mode public -key "$key")"
+          rm -f "$key"
+          test -n "$pub"
+          echo "SIGNING_PUBLIC_KEY=$pub" >> "$GITHUB_ENV"
       - name: Build
         env:
           VERSION: ${{ needs.prepare.outputs.version }}
@@ -115,7 +130,11 @@ jobs:
             ext=".exe"
           fi
           output="mnagent_${GOOS}_${GOARCH}${ext}"
-          go build -trimpath -ldflags "-s -w -X main.version=${VERSION}" \
+          ldflags="-s -w -X main.version=${VERSION}"
+          if [ -n "${SIGNING_PUBLIC_KEY:-}" ]; then
+            ldflags="$ldflags -X github.com/mengnanquq/mnagent/internal/updater.SigningPublicKeyBase64=${SIGNING_PUBLIC_KEY}"
+          fi
+          go build -trimpath -ldflags "$ldflags" \
             -o "${output}" ./cmd/mnagent
           if [ "${{ matrix.upx }}" = "true" ]; then
             upx --lzma --best "${output}" || upx -9 "${output}"
@@ -134,6 +153,9 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
       - name: Download artifacts
         uses: actions/download-artifact@v4
         with:
@@ -143,6 +165,24 @@ jobs:
         run: |
           cp install.sh install.ps1 dist/
           (cd dist && sha256sum install.sh install.ps1 > installers.sha256)
+      - name: Sign checksum files
+        env:
+          MNAGENT_SIGNING_PRIVATE_KEY: ${{ secrets.MNAGENT_SIGNING_PRIVATE_KEY }}
+        run: |
+          if [ -z "$MNAGENT_SIGNING_PRIVATE_KEY" ]; then
+            echo "::warning title=未配置更新签名私钥::未设置 MNAGENT_SIGNING_PRIVATE_KEY，本次 Release 不会生成 .sig 附件"
+            exit 0
+          fi
+          key="$RUNNER_TEMP/signing-private.key"
+          printf '%s' "$MNAGENT_SIGNING_PRIVATE_KEY" > "$key"
+          chmod 600 "$key"
+          for sum in dist/*.sha256; do
+            [ -e "$sum" ] || continue
+            go run ./scripts/gen-signing-key.go -mode sign -key "$key" -in "$sum" -out "$sum.sig"
+          done
+          cat dist/*.sha256 | LC_ALL=C sort > dist/checksums.txt
+          go run ./scripts/gen-signing-key.go -mode sign -key "$key" -in dist/checksums.txt -out dist/checksums.txt.sig
+          rm -f "$key"
       - name: Publish release
         env:
           GH_TOKEN: ${{ github.token }}

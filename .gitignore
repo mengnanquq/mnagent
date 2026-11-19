@@ -15,6 +15,10 @@ coverage.html
 /token
 *.token
 
+# 更新签名私钥（切勿提交；仅通过 GitHub Actions Secret 注入）
+signing-*.key
+*.sig.key
+
 # 编辑器与环境
 .zcode/
 .zcodeignore

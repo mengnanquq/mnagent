@@ -2,7 +2,10 @@ package updater
 
 import (
 	"context"
+	"crypto/ed25519"
+	"crypto/rand"
 	"crypto/sha256"
+	"encoding/base64"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
@@ -117,6 +120,116 @@ func TestUpdaterCheck(t *testing.T) {
 	}
 	if _, ok, _ := u.Check(); ok {
 		t.Fatal("跳过版本后不应再提示更新")
+	}
+}
+
+// TestUpdaterEd25519Signature 覆盖内置公钥后的强制验签：
+// 有效签名放行；签名缺失、清单被篡改、密钥不匹配一律中止且不替换二进制。
+func TestUpdaterEd25519Signature(t *testing.T) {
+	bin := []byte("#!/bin/sh\necho \"mnagent v0.1.8 (linux/amd64, go1.26.0)\"\n")
+	for len(bin) < 2048 {
+		bin = append(bin, '#', '\n')
+	}
+	checksum := fmt.Sprintf("%x  mnagent_linux_amd64\n", sha256.Sum256(bin))
+	pub, priv, err := ed25519.GenerateKey(rand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	sig := base64.StdEncoding.EncodeToString(ed25519.Sign(priv, []byte(checksum)))
+	otherPub, _, err := ed25519.GenerateKey(rand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	const (
+		modeValid = iota
+		modeMissingSig
+		modeTamperedChecksum
+	)
+	var mode atomic.Int32
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case strings.HasSuffix(r.URL.Path, ".sha256.sig"):
+			if mode.Load() == modeMissingSig {
+				http.NotFound(w, r)
+				return
+			}
+			_, _ = w.Write([]byte(sig + "\n"))
+		case strings.HasSuffix(r.URL.Path, ".sha256"):
+			body := checksum
+			if mode.Load() == modeTamperedChecksum {
+				body = strings.Repeat("0", 64) + "  mnagent_linux_amd64\n"
+			}
+			_, _ = w.Write([]byte(body))
+		default:
+			_, _ = w.Write(bin)
+		}
+	}))
+	defer ts.Close()
+
+	run := func(t *testing.T, key ed25519.PublicKey, m int) (string, error) {
+		t.Helper()
+		mode.Store(int32(m))
+		exe := filepath.Join(t.TempDir(), "mnagent")
+		if err := os.WriteFile(exe, []byte("old-bin"), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		u := New(Config{
+			CurrentVersion:   "v0.1.7",
+			Repo:             "owner/repo",
+			Platform:         "linux",
+			Arch:             "amd64",
+			DownloadClient:   ts.Client(),
+			Executable:       exe,
+			SigningPublicKey: key,
+		})
+		u.URLForFunc = func(version string) string { return ts.URL + "/d/" + version + "/" + u.AssetName() }
+		u.ChecksumURLFunc = func(version string) string { return ts.URL + "/d/" + version + "/" + u.AssetName() + ".sha256" }
+		u.verifyBinary = func(string, string) error { return nil }
+		_, err := u.DownloadAndReplace("v0.1.8")
+		got, _ := os.ReadFile(exe)
+		return string(got), err
+	}
+
+	got, err := run(t, pub, modeValid)
+	if err != nil {
+		t.Fatalf("有效签名应放行: %v", err)
+	}
+	if got == "old-bin" {
+		t.Fatal("有效签名时应替换二进制")
+	}
+
+	if got, err := run(t, pub, modeMissingSig); err == nil || !strings.Contains(err.Error(), "签名") {
+		t.Fatalf("签名缺失应中止，实际 err=%v", err)
+	} else if got != "old-bin" {
+		t.Fatal("签名缺失时不应替换二进制")
+	}
+
+	if got, err := run(t, pub, modeTamperedChecksum); err == nil || !strings.Contains(err.Error(), "签名验证失败") {
+		t.Fatalf("清单被篡改应签名验证失败，实际 err=%v", err)
+	} else if got != "old-bin" {
+		t.Fatal("签名验证失败时不应替换二进制")
+	}
+
+	if _, err := run(t, otherPub, modeValid); err == nil || !strings.Contains(err.Error(), "签名验证失败") {
+		t.Fatalf("密钥不匹配应验证失败，实际 err=%v", err)
+	}
+}
+
+func TestParseSigningPublicKey(t *testing.T) {
+	if key, err := parseSigningPublicKey(""); err != nil || key != nil {
+		t.Fatalf("空公钥应表示未内置: key=%v err=%v", key, err)
+	}
+	if _, err := parseSigningPublicKey("not-base64"); err == nil {
+		t.Fatal("非法 base64 应报错")
+	}
+	if _, err := parseSigningPublicKey(base64.StdEncoding.EncodeToString([]byte("short"))); err == nil {
+		t.Fatal("长度错误的公钥应报错")
+	}
+	pub, _, _ := ed25519.GenerateKey(rand.Reader)
+	key, err := parseSigningPublicKey(base64.StdEncoding.EncodeToString(pub))
+	if err != nil || !key.Equal(pub) {
+		t.Fatalf("合法公钥解析失败: %v", err)
 	}
 }
 
