@@ -51,6 +51,33 @@ func TestClientPollWithoutTask(t *testing.T) {
 	}
 }
 
+// TestClientPollBacksOffOnImmediateEmptyResponse 验证服务端立即返回 204 时客户端会退避，
+// 避免长轮询退化成热循环。
+func TestClientPollBacksOffOnImmediateEmptyResponse(t *testing.T) {
+	var hits atomic.Int64
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		hits.Add(1)
+		w.WriteHeader(http.StatusNoContent)
+	}))
+	defer srv.Close()
+
+	start := time.Now()
+	job, err := New(testConfig(srv.URL, nil)).poll(context.Background())
+	elapsed := time.Since(start)
+	if err != nil || job != nil {
+		t.Fatalf("poll = (%v, %v)，期望 (nil, nil)", job, err)
+	}
+	if hits.Load() != 1 {
+		t.Fatalf("单次 Poll 应只请求一次，实际 %d 次", hits.Load())
+	}
+	if elapsed < emptyPollMinBackoff {
+		t.Fatalf("立即返回空任务时应至少退避 %s，实际仅 %s", emptyPollMinBackoff, elapsed)
+	}
+	if elapsed > time.Second {
+		t.Fatalf("空任务退避过长: %s", elapsed)
+	}
+}
+
 // TestClientPollSendsVersion 验证长轮询请求携带版本号（供机器人 /host list 展示）。
 func TestClientPollSendsVersion(t *testing.T) {
 	original := Version

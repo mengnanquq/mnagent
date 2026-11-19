@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"math/rand/v2"
 	"net"
 	"net/http"
 	"strings"
@@ -28,6 +29,14 @@ const maxResponseBytes = 16 << 20
 
 // maxResultAttempts 是回传结果的最大尝试次数（结果按任务 ID 幂等，重试安全）。
 const maxResultAttempts = 3
+
+// 长轮询为空时的防热循环退避：服务端若立刻返回 204（长轮询未真正挂起），
+// 客户端必须自行退避，否则会形成每秒数百次请求的热循环。
+const (
+	emptyPollFastThreshold = time.Second
+	emptyPollMinBackoff    = 200 * time.Millisecond
+	emptyPollMaxBackoff    = 500 * time.Millisecond
+)
 
 // Client 负责与机器人的 agent 端点通信。
 type Client struct {
@@ -116,6 +125,7 @@ func (c *Client) Poll(ctx context.Context) (*model.Job, error) {
 	if c.WSConnected() {
 		return c.pollWS(ctx)
 	}
+	pollStart := time.Now()
 	resp, err := c.do(ctx, http.MethodPost, "/jobs", nil)
 	if err != nil {
 		return nil, err
@@ -123,6 +133,9 @@ func (c *Client) Poll(ctx context.Context) (*model.Job, error) {
 	defer resp.Body.Close()
 	switch resp.StatusCode {
 	case http.StatusNoContent:
+		if err := c.waitEmptyPoll(ctx, time.Since(pollStart)); err != nil {
+			return nil, err
+		}
 		return nil, nil
 	case http.StatusOK:
 		var job model.Job
@@ -137,6 +150,23 @@ func (c *Client) Poll(ctx context.Context) (*model.Job, error) {
 		return nil, model.ErrUnauthorized
 	default:
 		return nil, fmt.Errorf("领取任务失败：%s %s", resp.Status, readSnippet(resp.Body))
+	}
+}
+
+// waitEmptyPoll 在服务端“立即返回空任务”时加入 200-500ms 抖动退避，避免热循环。
+// 真正的长轮询（请求本身已等待 ≥1s）不需要额外等待。
+func (c *Client) waitEmptyPoll(ctx context.Context, elapsed time.Duration) error {
+	if elapsed >= emptyPollFastThreshold {
+		return nil
+	}
+	wait := emptyPollMinBackoff + time.Duration(rand.Int64N(int64(emptyPollMaxBackoff-emptyPollMinBackoff)+1))
+	timer := time.NewTimer(wait)
+	defer timer.Stop()
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-timer.C:
+		return nil
 	}
 }
 
