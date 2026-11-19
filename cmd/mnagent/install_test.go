@@ -274,6 +274,11 @@ func TestWindowsInstallScript(t *testing.T) {
 		{"Windows 使用 Get-FileHash", "Get-FileHash"},
 		{"下载同名 .sha256", "{mnagentUrl}.sha256"},
 		{"MiaoSpeed zip 提取", "Expand-Archive"},
+		{"NextTrace 摘要取自 GitHub API", `Get-GitHubAssetDigest "nxtrace/NTrace-core"`},
+		{"NextTrace 下载后校验摘要", "Assert-AssetSha256 $tmpNt"},
+		{"MiaoSpeed 摘要取自 GitHub API", `Get-GitHubAssetDigest "AirportR/miaospeed"`},
+		{"MiaoSpeed 下载后校验摘要", "Assert-AssetSha256 $tmpZip"},
+		{"MiaoSpeed 按确切文件名取二进制", `$expectedExe = "miaospeed-windows-$arch.exe"`},
 		{"参数定义 -Bot", "[string]$Bot"},
 		{"参数定义 -Token", "[string]$Token"},
 		{"参数定义 -TokenFile", "[string]$TokenFile"},
@@ -284,5 +289,8 @@ func TestWindowsInstallScript(t *testing.T) {
 		if !strings.Contains(script, c.needle) {
 			t.Errorf("install.ps1 缺少关键逻辑 [%s]，应包含 %q", c.name, c.needle)
 		}
+	}
+	if strings.Contains(script, `"*miaospeed*.exe"`) {
+		t.Error("install.ps1 不应再用通配符取 miaospeed 压缩包内“第一个匹配”文件")
 	}
 }

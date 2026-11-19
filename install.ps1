@@ -221,6 +221,40 @@ function Assert-Sha256([string]$filePath, [string]$checksumUrl, [string]$assetNa
     Write-Host "SHA-256 校验通过（$assetName）" -ForegroundColor Green
 }
 
+# 从 GitHub Releases API 取指定资产的 SHA-256 摘要（上一步为已发布的 digest 字段）。
+# 取不到（API 不可达/限流/附件缺失/无 digest）返回空串，由调用方中止安装。
+function Get-GitHubAssetDigest([string]$repo, [string]$assetName, [string]$tag = "latest") {
+    $apiUrl = if ([string]::IsNullOrWhiteSpace($tag) -or $tag -eq "latest") {
+        "https://api.github.com/repos/$repo/releases/latest"
+    } else {
+        "https://api.github.com/repos/$repo/releases/tags/$tag"
+    }
+    try {
+        $wc = New-Object System.Net.WebClient
+        $wc.Headers.Add("User-Agent", "mnagent-installer")
+        $json = $wc.DownloadString($apiUrl) | ConvertFrom-Json
+        $asset = @($json.assets | Where-Object { $_.name -eq $assetName }) | Select-Object -First 1
+        if (-not $asset) { return "" }
+        $digest = [string]$asset.digest
+        if ($digest -match '^sha256:([0-9a-fA-F]{64})$') { return $Matches[1] }
+        return ""
+    } catch {
+        return ""
+    }
+}
+
+# 校验下载文件的 SHA-256；摘要缺失或格式非法一律中止，绝不“没校验就安装”。
+function Assert-AssetSha256([string]$filePath, [string]$expected, [string]$assetName) {
+    if ([string]::IsNullOrWhiteSpace($expected) -or $expected -notmatch '^[0-9a-fA-F]{64}$') {
+        throw "无法获取 $assetName 的 SHA-256 摘要（已中止安装）"
+    }
+    $actual = (Get-FileHash -Path $filePath -Algorithm SHA256).Hash
+    if (-not [string]::Equals($actual, $expected, [StringComparison]::OrdinalIgnoreCase)) {
+        throw "$assetName SHA-256 校验失败：期望 $expected，实际 $actual（已丢弃下载文件）"
+    }
+    Write-Host "$assetName SHA-256 校验通过。" -ForegroundColor Green
+}
+
 function Get-GitHubLatestTag([string]$repo) {
     $apiUrl = "https://api.github.com/repos/$repo/releases/latest"
     try {
@@ -317,13 +351,15 @@ if ($enableNextTrace) {
         "nexttrace_windows_${arch}.exe"
     }
     $ntUrl = "https://github.com/nxtrace/NTrace-core/releases/latest/download/$ntAsset"
+    $ntDigest = Get-GitHubAssetDigest "nxtrace/NTrace-core" $ntAsset "latest"
     $tmpNt = Join-Path $InstallDir ".nexttrace-install.tmp"
     try {
         Download-File $ntUrl $tmpNt
+        Assert-AssetSha256 $tmpNt $ntDigest $ntAsset
         Move-ExecutableSafely $tmpNt $nexttraceBin
         Write-Host "nexttrace 安装成功。" -ForegroundColor Green
     } catch {
-        Write-Warning "下载 nexttrace 失败，mnagent 启动后可在后台自动重试: $_"
+        Write-Warning "下载或校验 nexttrace 失败，已跳过安装（mnagent 启动后可在后台自动重试）: $_"
         if (Test-Path $tmpNt) { Remove-Item -Path $tmpNt -Force }
     }
 }
@@ -342,22 +378,28 @@ if ($enableMiaoSpeed) {
     }
     $miaoZip = "miaospeed-windows-$arch-$miaoVer.zip"
     $miaoUrl = "https://github.com/AirportR/miaospeed/releases/download/$miaoVer/$miaoZip"
-    $tmpZip = Join-Path $InstallDir ".miaospeed-dl.zip"
-    $tmpExtract = Join-Path $InstallDir ".miaospeed-extracted"
+    $miaoDigest = Get-GitHubAssetDigest "AirportR/miaospeed" $miaoZip $miaoVer
+    # 解压到独立的临时目录，避免污染安装目录；结束后整体清理。
+    $workDir = Join-Path ([System.IO.Path]::GetTempPath()) ("mnagent-miaospeed-" + [Guid]::NewGuid().ToString("N"))
+    $tmpZip = Join-Path $workDir "miaospeed.zip"
+    $tmpExtract = Join-Path $workDir "extract"
     try {
+        New-Item -ItemType Directory -Force -Path $workDir | Out-Null
         Download-File $miaoUrl $tmpZip
-        if (Test-Path $tmpExtract) { Remove-Item -Path $tmpExtract -Recurse -Force }
+        Assert-AssetSha256 $tmpZip $miaoDigest $miaoZip
         Expand-Archive -Path $tmpZip -DestinationPath $tmpExtract -Force
-        $extractedExe = Get-ChildItem -Path $tmpExtract -Filter "*miaospeed*.exe" -Recurse | Select-Object -First 1
-        if ($extractedExe) {
-            Move-ExecutableSafely $extractedExe.FullName $miaospeedBin
-            Write-Host "miaospeed 安装成功。" -ForegroundColor Green
+        # 按确切文件名取二进制（release 内命名为 miaospeed-windows-<arch>.exe），不再用通配符取第一个匹配。
+        $expectedExe = "miaospeed-windows-$arch.exe"
+        $extractedExe = Get-ChildItem -Path $tmpExtract -Filter $expectedExe -Recurse -File | Select-Object -First 1
+        if (-not $extractedExe) {
+            throw "压缩包内未找到预期二进制 $expectedExe（已跳过安装）"
         }
+        Move-ExecutableSafely $extractedExe.FullName $miaospeedBin
+        Write-Host "miaospeed 安装成功。" -ForegroundColor Green
     } catch {
-        Write-Warning "下载/解压 miaospeed 失败，mnagent 启动后可在后台自动重试: $_"
+        Write-Warning "下载/校验/解压 miaospeed 失败，已跳过安装（mnagent 启动后可在后台自动重试）: $_"
     } finally {
-        if (Test-Path $tmpZip) { Remove-Item -Path $tmpZip -Force }
-        if (Test-Path $tmpExtract) { Remove-Item -Path $tmpExtract -Recurse -Force }
+        if (Test-Path $workDir) { Remove-Item -Path $workDir -Recurse -Force -ErrorAction SilentlyContinue }
     }
 }
 
