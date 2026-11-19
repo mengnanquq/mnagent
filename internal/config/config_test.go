@@ -146,3 +146,21 @@ func TestParseConfigRejectsHostFlag(t *testing.T) {
 		t.Fatalf("BotURL = %q", cfg.BotURL)
 	}
 }
+
+// TestParseConfigAllowRemoteDowngrade 验证远程降级开关默认关闭、显式传入时开启。
+func TestParseConfigAllowRemoteDowngrade(t *testing.T) {
+	cfg, err := ParseConfig([]string{"-bot", "https://x/agent", "-token", "t", "-nexttrace", "/bin/echo"}, "dev")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.AllowRemoteDowngrade {
+		t.Fatal("默认不允许远程降级")
+	}
+	cfg, err = ParseConfig([]string{"-bot", "https://x/agent", "-token", "t", "-nexttrace", "/bin/echo", "-allow-remote-downgrade"}, "dev")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !cfg.AllowRemoteDowngrade {
+		t.Fatal("-allow-remote-downgrade 应开启远程降级")
+	}
+}

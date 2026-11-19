@@ -45,6 +45,10 @@ type Config struct {
 	ProbeTarget        string
 	ProbeKind          string
 	AllowPrivateProbes bool
+
+	// AllowRemoteDowngrade 允许服务端下发的升级指令把 agent 降级到旧版本。
+	// 默认只接受严格高于当前版本的目标；本地 -apply-update 不受此限制。
+	AllowRemoteDowngrade bool
 }
 
 // DefaultTokenFile 根据操作系统平台返回默认的令牌文件路径。
@@ -166,6 +170,7 @@ func ParseConfig(args []string, version string) (*Config, error) {
 		probeTarget  = fs.String("probe-target", "", "本地直接执行一次探针网络测试的目标（域名或 IP）")
 		probeKind    = fs.String("probe-kind", "ping", "本地探针类型：ping / tcping / trace / http / dns")
 		allowPrivate = fs.Bool("allow-private-probes", false, "允许探测内网私有地址与链路本地地址（默认禁止，防范 SSRF/云元数据盗取）")
+		allowDown    = fs.Bool("allow-remote-downgrade", false, "允许服务端远程下发降级到旧版本（默认只接受更高版本；本地 -apply-update 不受限）")
 	)
 	if err := fs.Parse(args); err != nil {
 		return nil, err
@@ -236,24 +241,25 @@ func ParseConfig(args []string, version string) (*Config, error) {
 		proxyVal = strings.TrimSpace(os.Getenv("MNAGENT_GH_PROXY"))
 	}
 	return &Config{
-		BotURL:             endpoint,
-		Tokens:             tokens,
-		Binary:             path,
-		MiaospeedBinary:    miaoPath,
-		MinBackoff:         *minBackoff,
-		MaxBackoff:         *maxBackoff,
-		PollTimeout:        *pollWait,
-		LogLevel:           ParseLogLevel(*logLevel),
-		AutoUpdate:         *autoUpdate,
-		UpdateInterval:     *updateIntv,
-		CheckUpdateOnce:    *checkUpd,
-		ApplyUpdate:        strings.TrimSpace(*applyUpd),
-		SkipUpdate:         strings.TrimSpace(*skipUpd),
-		GHProxy:            proxyVal,
-		DiagJob:            strings.TrimSpace(*diagJob),
-		RunDiag:            *runDiag,
-		ProbeTarget:        strings.TrimSpace(*probeTarget),
-		ProbeKind:          strings.ToLower(strings.TrimSpace(*probeKind)),
-		AllowPrivateProbes: *allowPrivate,
+		BotURL:               endpoint,
+		Tokens:               tokens,
+		Binary:               path,
+		MiaospeedBinary:      miaoPath,
+		MinBackoff:           *minBackoff,
+		MaxBackoff:           *maxBackoff,
+		PollTimeout:          *pollWait,
+		LogLevel:             ParseLogLevel(*logLevel),
+		AutoUpdate:           *autoUpdate,
+		UpdateInterval:       *updateIntv,
+		CheckUpdateOnce:      *checkUpd,
+		ApplyUpdate:          strings.TrimSpace(*applyUpd),
+		SkipUpdate:           strings.TrimSpace(*skipUpd),
+		GHProxy:              proxyVal,
+		DiagJob:              strings.TrimSpace(*diagJob),
+		RunDiag:              *runDiag,
+		ProbeTarget:          strings.TrimSpace(*probeTarget),
+		ProbeKind:            strings.ToLower(strings.TrimSpace(*probeKind)),
+		AllowPrivateProbes:   *allowPrivate,
+		AllowRemoteDowngrade: *allowDown,
 	}, nil
 }

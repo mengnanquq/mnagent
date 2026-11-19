@@ -712,6 +712,31 @@ func sleep(ctx context.Context, d time.Duration) bool {
 	}
 }
 
+// evaluateRemoteTarget 检查服务端下发的显式目标版本。
+// 默认只允许严格升级：目标等于当前版本视为无操作，低于当前版本一律拒绝，
+// 除非 agent 本地用 -allow-remote-downgrade 显式放行（本地 CLI -apply-update 不走这里）。
+func evaluateRemoteTarget(current, target string, allowDowngrade bool) (noop bool, err error) {
+	cur, okCur := updater.ParseVersion(current)
+	if !okCur {
+		// dev 或非 semver 构建无法比较，保持原有行为（仍受 ValidReleaseTag 约束）。
+		return false, nil
+	}
+	tgt, okTgt := updater.ParseVersion(target)
+	if !okTgt {
+		return false, fmt.Errorf("目标版本号格式非法：%q", target)
+	}
+	if !tgt.NewerThan(cur) && !cur.NewerThan(tgt) {
+		return true, nil
+	}
+	if tgt.NewerThan(cur) {
+		return false, nil
+	}
+	if !allowDowngrade {
+		return false, fmt.Errorf("拒绝降级：目标版本 %s 低于当前版本 %s（如确需降级，请在 agent 启动参数中显式添加 -allow-remote-downgrade）", target, current)
+	}
+	return false, nil
+}
+
 // handleUpgradeJob 处理来自机器人的远程更新指令。
 func (a *Agent) handleUpgradeJob(ctx context.Context, job model.Job) {
 	a.logger.Info("收到远程更新指令，开始处理", "job", job.ID, "current_version", Version, "target", job.Target)
@@ -766,6 +791,19 @@ func (a *Agent) handleUpgradeJob(ctx context.Context, job model.Job) {
 	if targetVer == "latest" {
 		newVer, hasUpdate, checkErr = a.update.Check()
 	} else {
+		allowDowngrade := a.cfg != nil && a.cfg.AllowRemoteDowngrade
+		noop, targetErr := evaluateRemoteTarget(Version, targetVer, allowDowngrade)
+		if targetErr != nil {
+			a.logger.Warn("拒绝远程升级目标", "job", job.ID, "target", targetVer, "error", targetErr)
+			a.sendUpgradeResult(job, -1, targetErr.Error()+depSummary, targetErr.Error())
+			return
+		}
+		if noop {
+			msg := fmt.Sprintf("目标版本与当前版本相同（%s），无需更新。原有运行参数保持不变。%s", Version, depSummary)
+			a.logger.Info("远程升级目标与当前版本相同，跳过", "Version", Version)
+			a.sendUpgradeResult(job, 0, strings.TrimSpace(msg), "")
+			return
+		}
 		newVer = targetVer
 		hasUpdate = true
 	}

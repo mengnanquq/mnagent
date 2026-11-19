@@ -610,6 +610,114 @@ func TestHandleUpgradeJob(t *testing.T) {
 	}
 }
 
+// TestEvaluateRemoteTarget 验证远程显式目标版本的升级/降级策略。
+func TestEvaluateRemoteTarget(t *testing.T) {
+	cases := []struct {
+		name           string
+		current        string
+		target         string
+		allowDowngrade bool
+		wantNoop       bool
+		wantErr        string
+	}{
+		{"严格升级", "v1.0.0", "v1.1.0", false, false, ""},
+		{"同版本视为无操作", "v1.0.0", "1.0.0", false, true, ""},
+		{"降级默认拒绝", "v1.1.0", "v1.0.0", false, false, "拒绝降级"},
+		{"显式放行后允许降级", "v1.1.0", "v1.0.0", true, false, ""},
+		{"dev 构建无法比较时保持原行为", "dev", "v1.0.0", false, false, ""},
+		{"目标版本非法", "v1.0.0", "latest", false, false, "格式非法"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			noop, err := evaluateRemoteTarget(tc.current, tc.target, tc.allowDowngrade)
+			if noop != tc.wantNoop {
+				t.Fatalf("noop = %v，期望 %v", noop, tc.wantNoop)
+			}
+			if tc.wantErr == "" {
+				if err != nil {
+					t.Fatalf("不应报错: %v", err)
+				}
+				return
+			}
+			if err == nil || !strings.Contains(err.Error(), tc.wantErr) {
+				t.Fatalf("期望错误包含 %q，实际 err=%v", tc.wantErr, err)
+			}
+		})
+	}
+}
+
+// TestHandleUpgradeJobRejectsRemoteDowngrade 验证远程下发旧版本默认被拒绝且不下载、不重启。
+func TestHandleUpgradeJobRejectsRemoteDowngrade(t *testing.T) {
+	var reportedResult model.Result
+	var reported atomic.Bool
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/results" {
+			http.NotFound(w, r)
+			return
+		}
+		var res model.Result
+		if err := json.NewDecoder(r.Body).Decode(&res); err != nil {
+			http.Error(w, err.Error(), http.StatusBadRequest)
+			return
+		}
+		reportedResult = res
+		reported.Store(true)
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer srv.Close()
+
+	cli := client.New(&config.Config{
+		BotURL:      srv.URL,
+		Tokens:      &config.TokenSource{Value: "tok"},
+		PollTimeout: 2 * time.Second,
+	})
+
+	var restarted atomic.Bool
+	u := updater.New(updater.Config{
+		CurrentVersion: "v2.0.0",
+		Repo:           "owner/repo",
+		Platform:       "linux",
+		Arch:           "amd64",
+		Executable:     filepath.Join(t.TempDir(), "mnagent"),
+		Restart: func() error {
+			restarted.Store(true)
+			return nil
+		},
+	})
+
+	origVersion := Version
+	Version = "v2.0.0"
+	defer func() { Version = origVersion }()
+
+	// cfg 为 nil 时跳过依赖检查，测试聚焦远程目标版本策略。
+	a := &Agent{client: cli, update: u, logger: &testLogger{t: t}}
+
+	a.handleUpgradeJob(context.Background(), model.Job{ID: "down-1", Kind: "upgrade", Target: "v1.9.0"})
+	if !reported.Load() {
+		t.Fatal("未回传拒绝结果")
+	}
+	if reportedResult.ExitCode != -1 || !strings.Contains(reportedResult.Output, "拒绝降级") ||
+		!strings.Contains(reportedResult.Output, "allow-remote-downgrade") {
+		t.Fatalf("降级应被拒绝并提示开关: %+v", reportedResult)
+	}
+	if restarted.Load() {
+		t.Fatal("拒绝降级时不得重启服务")
+	}
+
+	// 目标等于当前版本：无操作且回传成功，不触发重启。
+	reported.Store(false)
+	a.handleUpgradeJob(context.Background(), model.Job{ID: "same-1", Kind: "upgrade", Target: "v2.0.0"})
+	if !reported.Load() {
+		t.Fatal("未回传同版本结果")
+	}
+	if reportedResult.ExitCode != 0 || !strings.Contains(reportedResult.Output, "无需更新") {
+		t.Fatalf("同版本应视为无操作: %+v", reportedResult)
+	}
+	if restarted.Load() {
+		t.Fatal("同版本时不得重启服务")
+	}
+}
+
 // TestAgentLoopNonBlockingLightAndCancelQueue 验证重任务在后台排队或执行时，
 // 主循环完全非阻塞：可并发执行轻任务，且可即刻响应 cancel 信号打断重任务。
 func TestAgentLoopNonBlockingLightAndCancelQueue(t *testing.T) {
