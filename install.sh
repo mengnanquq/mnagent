@@ -672,6 +672,27 @@ fetch_github_asset_digest() {
 	digest_asset="$2"
 	digest_tag="${3:-latest}"
 	if [ -n "$digest_tag" ] && [ "$digest_tag" != "latest" ]; then
+		digest_base="https://github.com/${digest_repo}/releases/download/${digest_tag}"
+	else
+		digest_base="https://github.com/${digest_repo}/releases/latest/download"
+	fi
+
+	# 优先下载 Release 附件中的 "<资产>.sha256"：直接、稳定，不依赖 GitHub API 的
+	# JSON 结构，也不消耗 API 限额。解析失败再回退到 API digest 字段。
+	digest_sum_url="$(apply_gh_proxy "${digest_base}/${digest_asset}.sha256")"
+	digest_sum="$(download_stdout "$digest_sum_url" 2>/dev/null || true)"
+	if [ -n "$digest_sum" ]; then
+		digest_value="$(printf '%s\n' "$digest_sum" | awk 'NF >= 1 { print $1; exit }' | tr 'A-F' 'a-f')"
+		case "$digest_value" in
+			*[!0-9a-f]*|'') digest_value="";;
+		esac
+		if [ "${#digest_value}" -eq 64 ]; then
+			printf 'sha256:%s' "$digest_value"
+			return 0
+		fi
+	fi
+
+	if [ -n "$digest_tag" ] && [ "$digest_tag" != "latest" ]; then
 		digest_api="https://api.github.com/repos/${digest_repo}/releases/tags/${digest_tag}"
 	else
 		digest_api="https://api.github.com/repos/${digest_repo}/releases/latest"

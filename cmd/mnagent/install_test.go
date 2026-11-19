@@ -190,7 +190,8 @@ func TestInstallScriptKeepsKeySafeguards(t *testing.T) {
 		{"SHA-256 回退 shasum -a 256", "shasum -a 256"},
 		{"SHA-256 回退 openssl dgst -sha256", "openssl dgst -sha256"},
 		{"缺失时自动安装 nexttrace", "download_nexttrace"},
-		{"nexttrace 摘要取自 GitHub API", "fetch_github_asset_digest"},
+		{"nexttrace 摘要取自 GitHub 附件或 API", "fetch_github_asset_digest"},
+		{"优先下载 Release 的 .sha256 附件", "${digest_asset}.sha256"},
 		{"nexttrace 下载后比对 SHA-256", `[ "$nt_actual" != "$nt_expected" ]`},
 		{"通用二进制查找 find_binary", "find_binary()"},
 		{"GitHub Releases 直连下载", "download_nexttrace"},
@@ -237,6 +238,7 @@ func TestInstallScriptVerifiesMiaospeed(t *testing.T) {
 
 	for _, want := range []struct{ name, needle string }{
 		{"按指定 tag 取上游摘要", `fetch_github_asset_digest "AirportR/miaospeed" "$tar_name" "$miao_tag"`},
+		{"优先下载 Release 的 .sha256 附件", "${digest_asset}.sha256"},
 		{"摘要缺失即跳过安装", "无法获取 miaospeed"},
 		{"下载后比对 SHA-256", `[ "$miao_actual" != "$miao_expected" ]`},
 		{"按确切文件名取二进制", `miao_bin_name="miaospeed-${OS}-${miao_arch}"`},
