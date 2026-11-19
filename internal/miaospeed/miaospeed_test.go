@@ -9,6 +9,7 @@ import (
 	"bytes"
 	"compress/gzip"
 	"context"
+	"crypto/sha256"
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
@@ -514,8 +515,14 @@ func TestAutoInstallMiaospeedWithProxy(t *testing.T) {
 
 	// 启动模拟代理服务器
 	var requestedURLs []string
+	tarDigest := sha256.Sum256(tarBytes)
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		requestedURLs = append(requestedURLs, r.URL.String())
+		if strings.Contains(r.URL.Path, "/releases/tags/") {
+			w.Header().Set("Content-Type", "application/json")
+			fmt.Fprintf(w, `{"assets":[{"name":"miaospeed-linux-amd64-4.7.7.tar.gz","digest":"sha256:%x"}]}`, tarDigest)
+			return
+		}
 		if strings.Contains(r.URL.Path, "releases/latest") {
 			w.Header().Set("Content-Type", "application/json")
 			w.Write([]byte(`{"tag_name":"4.7.7"}`))
