@@ -287,6 +287,72 @@ func TestInstallScriptNonRootHintKeepsToken(t *testing.T) {
 	}
 }
 
+// TestInstallScriptStdinTokenHidesEcho 守护交互式读取令牌时关闭回显，并用 trap 恢复。
+func TestInstallScriptStdinTokenHidesEcho(t *testing.T) {
+	script := string(readInstallScript(t))
+	for _, want := range []string{
+		"stty -g",
+		"stty -echo",
+		`trap 'stty "$STTY_SAVED" 2>/dev/null || true' 0 1 2 15`,
+		`trap - 0 1 2 15`,
+	} {
+		if !containsActiveLine(script, want) {
+			t.Errorf("install.sh 缺少安全读取 stdin 令牌所需的 %q", want)
+		}
+	}
+}
+
+// TestURLCheckCharsetConsistent 守护 install.sh 与 install.ps1 的 URL 允许字符集一致：
+// 两边都必须拒绝空白/引号/反斜杠/%/$/反引号，同时允许同一组 URL 安全字符（含括号）。
+func TestURLCheckCharsetConsistent(t *testing.T) {
+	shellScript := string(readInstallScript(t))
+	psContent, err := os.ReadFile(filepath.Join(findRepoRoot(), "install.ps1"))
+	if err != nil {
+		t.Fatalf("读取 install.ps1 失败: %v", err)
+	}
+	psScript := string(psContent)
+
+	if !containsActiveLine(shellScript, `tr -d 'A-Za-z0-9._~:/?#@!&()*+,;=[]-'`) {
+		t.Error("install.sh 的 URL 允许字符集未包含括号，与 install.ps1 不一致")
+	}
+	if !containsActiveLine(psScript, `^[A-Za-z0-9._~:/?#\[\]@!&()*+,;=-]+$`) {
+		t.Error("install.ps1 的 URL 允许字符集应包含括号")
+	}
+}
+
+// TestInstallScriptQuotesFallbackHint 守护无 init 系统的兜底提示：路径与地址必须带引号，
+// 否则含空格的自定义 --prefix/令牌路径复制出来就是错的命令。
+func TestInstallScriptQuotesFallbackHint(t *testing.T) {
+	script := string(readInstallScript(t))
+	if !containsActiveLine(script, `"%s/mnagent" -bot "%s" -token-file "%s" -nexttrace "%s"`) {
+		t.Error("无 systemd/procd 时的运行提示应为参数加字面引号")
+	}
+}
+
+// TestInstallScriptAcceptsParenthesesInURL 验证 sh 版 URL 校验与 ps1 一致地允许括号。
+func TestInstallScriptAcceptsParenthesesInURL(t *testing.T) {
+	tmp := t.TempDir()
+	fakeBin := filepath.Join(tmp, "bin")
+	if err := os.MkdirAll(fakeBin, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	fakeAgent := filepath.Join(tmp, "mnagent-fake")
+	if err := os.WriteFile(fakeAgent, []byte("#!/bin/sh\nexit 0\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	env := installEnv(fakeBin, filepath.Join(tmp, "init"), filepath.Join(tmp, "token"),
+		"MNAGENT_PLATFORM=none", "MNAGENT_TOKEN=paren-token")
+	out, err := runInstallScript(t, filepath.Join(findRepoRoot(), "install.sh"), []string{
+		"--bot", "https://bot.example/agent(group)",
+		"--binary", fakeAgent,
+		"--prefix", filepath.Join(tmp, "install"),
+		"--no-install-nexttrace", "--no-install-miaospeed",
+	}, env, "")
+	if err != nil {
+		t.Fatalf("URL 中的括号应与 install.ps1 一样被接受: %v\n%s", err, out)
+	}
+}
+
 // TestInstallScriptSupportsOpenWrt 覆盖 OpenWrt 相关的关键实现：
 // procd 服务、BusyBox 回退、平台/init 目录开关、MIPS 字节序识别、sysupgrade 处理。
 func TestInstallScriptSupportsOpenWrt(t *testing.T) {

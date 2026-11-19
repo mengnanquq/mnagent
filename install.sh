@@ -61,7 +61,7 @@ validate_url_safe() {
 		http://*|https://*) ;;
 		*) die "${url_label} 必须是完整的 http(s) 地址：${url_value}";;
 	esac
-	url_leftover="$(printf '%s' "$url_value" | LC_ALL=C tr -d 'A-Za-z0-9._~:/?#@!&*+,;=[]-')"
+	url_leftover="$(printf '%s' "$url_value" | LC_ALL=C tr -d 'A-Za-z0-9._~:/?#@!&()*+,;=[]-')"
 	if [ -n "$url_leftover" ]; then
 		die "${url_label} 含不允许的字符（只允许 URL 安全字符，禁止空白、换行、引号、反斜杠、%、\$、反引号）"
 	fi
@@ -500,8 +500,26 @@ fi
 # 令牌可由 --token-stdin 或 MNAGENT_TOKEN 提供，避免明文出现在 argv/ps/命令历史中。
 # 注：'-' 的归一化已在解析参数后、继承旧 unit 之前完成（见上方）。
 if [ "$TOKEN_STDIN" = "yes" ] && [ -z "$TOKEN" ]; then
-	IFS= read -r TOKEN || die "从标准输入读取令牌失败（管道安装时 stdin 已被脚本占用，请改用 --token-file 或 MNAGENT_TOKEN）"
+	# 交互式终端输入令牌时关闭回显，避免令牌留在屏幕/终端记录里；
+	# 用 trap 0 保证读取失败、Ctrl-C 或 die 等任何退出路径都会恢复回显。
+	stty_restore="no"
+	if [ -t 0 ] && command -v stty >/dev/null 2>&1; then
+		STTY_SAVED="$(stty -g 2>/dev/null || true)"
+		if [ -n "${STTY_SAVED:-}" ]; then
+			trap 'stty "$STTY_SAVED" 2>/dev/null || true' 0 1 2 15
+			stty -echo 2>/dev/null && stty_restore="yes"
+		fi
+		printf '请输入接入令牌（输入不回显）：' >&2
+	fi
+	IFS= read -r TOKEN || {
+		[ "$stty_restore" = "yes" ] && stty "$STTY_SAVED" 2>/dev/null || true
+		die "从标准输入读取令牌失败（管道安装时 stdin 已被脚本占用，请改用 --token-file 或 MNAGENT_TOKEN）"
+	}
 	TOKEN="$(printf '%s' "$TOKEN" | tr -d '\r\n')"
+	if [ "$stty_restore" = "yes" ]; then
+		stty "$STTY_SAVED" 2>/dev/null || true
+	fi
+	trap - 0 1 2 15
 	[ -n "$TOKEN" ] || die "从标准输入读取到空令牌"
 	log "已从标准输入读取令牌"
 fi
@@ -1077,7 +1095,7 @@ case "$PLATFORM" in
 		;;
 	*)
 		warn "未检测到 systemd 或 OpenWrt(procd)：已安装二进制，请自行守护运行"
-		printf '    %s/mnagent -bot %s -token-file %s -nexttrace %s%s\n' \
+		printf '    "%s/mnagent" -bot "%s" -token-file "%s" -nexttrace "%s"%s\n' \
 			"$PREFIX" "$BOT_URL" "$TOKEN_FILE" "$NEXTTRACE_EXEC" "$AUTO_UPDATE_ARGS" >&2
 		if [ -n "$NEXTTRACE_PATH" ] && command -v setcap >/dev/null 2>&1; then
 			# 没有 systemd/procd 时只能靠二进制能力，手工前台运行也需要原始套接字权限。
