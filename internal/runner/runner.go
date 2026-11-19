@@ -359,6 +359,9 @@ type Logger interface {
 }
 
 func (a *Agent) Loop(ctx context.Context) error {
+	// 主循环返回（包括自更新重启路径）时主动取消内部协程，确保 heavyWorker/
+	// 心跳不会继续运行，也避免退出阶段白等 40s 在途任务。
+	ctx, cancel := context.WithCancel(ctx)
 	defer func() {
 		// 退出/重启时的所有网络写操作共享同一个 60s 停止预算，必须明显小于
 		// systemd 的 TimeoutStopSec=90s，否则服务会在回传途中被 SIGKILL。
@@ -383,6 +386,7 @@ func (a *Agent) Loop(ctx context.Context) error {
 			a.logger.Info("已回报 heavyQueue 中未执行的任务", "count", n)
 		}
 	}()
+	defer cancel() // LIFO：先取消内部协程，再执行上面的退出回报。
 	a.startHeartbeat(ctx)
 
 	if a.heavyQueue == nil {
