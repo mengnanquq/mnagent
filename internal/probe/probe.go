@@ -639,30 +639,16 @@ func (t *httpPhaseTimings) snapshot() (dnsMs, connMs, tlsMs, ttfbMs float64, rem
 
 // httpProbe 发起一次 HTTP(S) 请求并分阶段计时。
 func HTTPProbe(ctx context.Context, job model.Job, allowPrivate bool) (HTTPReport, error) {
-	raw := strings.TrimSpace(job.Target)
-	parsed, err := url.Parse(raw)
-	if err != nil || (parsed.Scheme != "http" && parsed.Scheme != "https") || parsed.Host == "" {
-		return HTTPReport{}, fmt.Errorf("无效的 URL：%s（需要 http:// 或 https:// 开头）", raw)
+	parsed, err := parseHTTPProbeURL(job.Target)
+	if err != nil {
+		return HTTPReport{}, err
 	}
 	timeout := probeTimeout(ctx, job.TimeoutMS)
 	report := HTTPReport{URL: parsed.String(), TLS: parsed.Scheme == "https"}
 
-	var (
-		timings   httpPhaseTimings
-		redirects int
-	)
+	timings := &httpPhaseTimings{}
 	start := time.Now()
-	trace := &httptrace.ClientTrace{
-		DNSStart:             func(httptrace.DNSStartInfo) { timings.startDNS() },
-		DNSDone:              func(httptrace.DNSDoneInfo) { timings.doneDNS() },
-		ConnectStart:         func(_, _ string) { timings.startConnect() },
-		ConnectDone:          func(_, _ string, _ error) { timings.doneConnect() },
-		TLSHandshakeStart:    func() { timings.startTLS() },
-		TLSHandshakeDone:     func(tls.ConnectionState, error) { timings.doneTLS() },
-		GotConn:              func(info httptrace.GotConnInfo) { timings.gotConn(info) },
-		GotFirstResponseByte: func() { timings.gotFirstByte() },
-	}
-	reqCtx, cancel := context.WithTimeout(httptrace.WithClientTrace(ctx, trace), timeout)
+	reqCtx, cancel := context.WithTimeout(httptrace.WithClientTrace(ctx, newHTTPProbeTrace(timings)), timeout)
 	defer cancel()
 
 	req, err := http.NewRequestWithContext(reqCtx, http.MethodGet, parsed.String(), nil)
@@ -672,56 +658,10 @@ func HTTPProbe(ctx context.Context, job model.Job, allowPrivate bool) (HTTPRepor
 	req.Header.Set("User-Agent", "mnagent/"+Version)
 
 	dialer := &net.Dialer{Timeout: timeout}
-	transport := &http.Transport{
-		// 明确禁用环境代理：HTTP_PROXY/HTTPS_PROXY 会把请求交给代理，
-		// 代理自行解析目标并建立连接，从而完全绕过下面按解析 IP 做的 SSRF 校验。
-		Proxy: nil,
-		DialContext: func(ctx context.Context, network, addr string) (net.Conn, error) {
-			host, port, err := net.SplitHostPort(addr)
-			if err != nil {
-				return nil, err
-			}
-
-			var ips []net.IP
-			if ip := net.ParseIP(host); ip != nil {
-				ips = []net.IP{ip}
-			} else {
-				dnsT0 := time.Now()
-				resolved, lookupErr := net.DefaultResolver.LookupIP(ctx, "ip", host)
-				if lookupErr != nil {
-					return nil, lookupErr
-				}
-				timings.observeDNS(time.Since(dnsT0))
-				ips = resolved
-			}
-
-			if len(ips) == 0 {
-				return nil, fmt.Errorf("无法解析目标主机: %s", host)
-			}
-			if !allowPrivate {
-				for _, ip := range ips {
-					if IsBlockedProbeIP(ip) {
-						return nil, fmt.Errorf("安全策略拦截：禁止探测私有或云元数据地址 (%s)", ip.String())
-					}
-				}
-			}
-
-			targetIP := ips[0]
-			for _, ip := range ips {
-				if ip.To4() != nil {
-					targetIP = ip
-					break
-				}
-			}
-
-			connT0 := time.Now()
-			c, dialErr := dialer.DialContext(ctx, network, net.JoinHostPort(targetIP.String(), port))
-			timings.observeConnect(time.Since(connT0))
-			return c, dialErr
-		},
-	}
+	transport := newHTTPProbeTransport(dialer, allowPrivate, timings)
 	defer transport.CloseIdleConnections()
 
+	var redirects int
 	client := &http.Client{
 		Transport: transport,
 		CheckRedirect: func(_ *http.Request, via []*http.Request) error {
@@ -739,12 +679,97 @@ func HTTPProbe(ctx context.Context, job model.Job, allowPrivate bool) (HTTPRepor
 	defer resp.Body.Close()
 
 	body, _ := io.ReadAll(io.LimitReader(resp.Body, httpMaxBodyBytes))
+	return buildHTTPReport(report, resp, body, timings, redirects, start), nil
+}
+
+// parseHTTPProbeURL 校验并解析 http(s) 目标。
+func parseHTTPProbeURL(raw string) (*url.URL, error) {
+	raw = strings.TrimSpace(raw)
+	parsed, err := url.Parse(raw)
+	if err != nil || (parsed.Scheme != "http" && parsed.Scheme != "https") || parsed.Host == "" {
+		return nil, fmt.Errorf("无效的 URL：%s（需要 http:// 或 https:// 开头）", raw)
+	}
+	return parsed, nil
+}
+
+// newHTTPProbeTrace 绑定分阶段计时回调；所有写入均由 httpPhaseTimings 内的锁保护。
+func newHTTPProbeTrace(timings *httpPhaseTimings) *httptrace.ClientTrace {
+	return &httptrace.ClientTrace{
+		DNSStart:             func(httptrace.DNSStartInfo) { timings.startDNS() },
+		DNSDone:              func(httptrace.DNSDoneInfo) { timings.doneDNS() },
+		ConnectStart:         func(_, _ string) { timings.startConnect() },
+		ConnectDone:          func(_, _ string, _ error) { timings.doneConnect() },
+		TLSHandshakeStart:    func() { timings.startTLS() },
+		TLSHandshakeDone:     func(tls.ConnectionState, error) { timings.doneTLS() },
+		GotConn:              func(info httptrace.GotConnInfo) { timings.gotConn(info) },
+		GotFirstResponseByte: func() { timings.gotFirstByte() },
+	}
+}
+
+// newHTTPProbeTransport 构造禁用环境代理的传输层，并在拨号前完成 SSRF 校验。
+func newHTTPProbeTransport(dialer *net.Dialer, allowPrivate bool, timings *httpPhaseTimings) *http.Transport {
+	return &http.Transport{
+		// 明确禁用环境代理：HTTP_PROXY/HTTPS_PROXY 会把请求交给代理，
+		// 代理自行解析目标并建立连接，从而完全绕过下面按解析 IP 做的 SSRF 校验。
+		Proxy: nil,
+		DialContext: func(ctx context.Context, network, addr string) (net.Conn, error) {
+			return dialHTTPProbeTarget(ctx, network, addr, dialer, allowPrivate, timings)
+		},
+	}
+}
+
+// dialHTTPProbeTarget 先解析并校验目标 IP，再按 IP 拨号，避免 DNS 重绑定绕过检查。
+func dialHTTPProbeTarget(ctx context.Context, network, addr string, dialer *net.Dialer, allowPrivate bool, timings *httpPhaseTimings) (net.Conn, error) {
+	host, port, err := net.SplitHostPort(addr)
+	if err != nil {
+		return nil, err
+	}
+
+	var ips []net.IP
+	if ip := net.ParseIP(host); ip != nil {
+		ips = []net.IP{ip}
+	} else {
+		dnsT0 := time.Now()
+		resolved, lookupErr := net.DefaultResolver.LookupIP(ctx, "ip", host)
+		if lookupErr != nil {
+			return nil, lookupErr
+		}
+		timings.observeDNS(time.Since(dnsT0))
+		ips = resolved
+	}
+	if len(ips) == 0 {
+		return nil, fmt.Errorf("无法解析目标主机: %s", host)
+	}
+	if !allowPrivate {
+		for _, ip := range ips {
+			if IsBlockedProbeIP(ip) {
+				return nil, fmt.Errorf("安全策略拦截：禁止探测私有或云元数据地址 (%s)", ip.String())
+			}
+		}
+	}
+
+	targetIP := ips[0]
+	for _, ip := range ips {
+		if ip.To4() != nil {
+			targetIP = ip
+			break
+		}
+	}
+	connT0 := time.Now()
+	c, dialErr := dialer.DialContext(ctx, network, net.JoinHostPort(targetIP.String(), port))
+	timings.observeConnect(time.Since(connT0))
+	return c, dialErr
+}
+
+// buildHTTPReport 汇总状态、TLS、耗时、响应头与正文摘要。
+func buildHTTPReport(report HTTPReport, resp *http.Response, body []byte, timings *httpPhaseTimings, redirects int, start time.Time) HTTPReport {
 	report.Status = resp.StatusCode
 	report.StatusText = resp.Status
 	report.Redirects = redirects
 	report.DNSMs, report.ConnectMs, report.TLSHandMs, report.TTFBMs, report.RemoteIP = timings.snapshot()
 	report.Proto = resp.Proto
 	report.TotalMs = sinceMs(start)
+
 	if resp.TLS != nil {
 		switch resp.TLS.Version {
 		case tls.VersionTLS13:
@@ -778,7 +803,7 @@ func HTTPProbe(ctx context.Context, job model.Job, allowPrivate bool) (HTTPRepor
 	if snippet := strings.TrimSpace(string(body)); snippet != "" {
 		report.BodySnippet = strings.TrimSpace(collapseWhitespace(snippet, 120))
 	}
-	return report, nil
+	return report
 }
 
 // sinceMs 返回自 t 起的毫秒数；t 为零值时返回 0。

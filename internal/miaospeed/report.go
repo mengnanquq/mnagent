@@ -666,44 +666,52 @@ func queryIPGeo(ctx context.Context, host string) (ip, geo string) {
 	if parsedIP != nil && (parsedIP.IsLoopback() || parsedIP.IsPrivate() || parsedIP.IsUnspecified()) {
 		return cleanHost, "本地直连"
 	}
-
 	if cachedIP, cachedGeo, ok := defaultGeoCache.get(cleanHost); ok {
 		return cachedIP, cachedGeo
 	}
 
-	targetIP := cleanHost
-	if parsedIP == nil {
-		lookupCtx, cancel := context.WithTimeout(ctx, 2*time.Second)
-		ips, err := net.DefaultResolver.LookupIP(lookupCtx, "ip", cleanHost)
-		cancel()
-		if err == nil && len(ips) > 0 {
-			targetIP = ips[0].String()
-		}
-	}
-
-	if fetch := geoLookupFuncs; len(fetch) > 0 {
-		for _, lookup := range fetch {
-			if ctx.Err() != nil {
-				break
-			}
-			if resolvedIP, resolvedGeo, ok := lookup(ctx, targetIP); ok {
-				if resolvedIP != "" {
-					targetIP = resolvedIP
-				}
-				if resolvedGeo != "" {
-					geo = resolvedGeo
-					break
-				}
-			}
-		}
-	}
-
+	targetIP := resolveGeoLookupIP(ctx, cleanHost, parsedIP)
+	targetIP, geo = lookupGeoText(ctx, targetIP)
 	ip = targetIP
 	if geo == "" && ip != "" {
 		geo = ip
 	}
 	defaultGeoCache.put(cleanHost, ip, geo)
 	return ip, geo
+}
+
+// resolveGeoLookupIP 把域名解析为 IP；已是 IP 时直接返回。
+func resolveGeoLookupIP(ctx context.Context, host string, parsedIP net.IP) string {
+	if parsedIP != nil {
+		return host
+	}
+	lookupCtx, cancel := context.WithTimeout(ctx, 2*time.Second)
+	defer cancel()
+	ips, err := net.DefaultResolver.LookupIP(lookupCtx, "ip", host)
+	if err != nil || len(ips) == 0 {
+		return host
+	}
+	return ips[0].String()
+}
+
+// lookupGeoText 依次尝试各 HTTPS GeoIP 数据源，返回最终 IP 与“国家 运营商”文案。
+func lookupGeoText(ctx context.Context, targetIP string) (string, string) {
+	for _, lookup := range geoLookupFuncs {
+		if ctx.Err() != nil {
+			break
+		}
+		resolvedIP, resolvedGeo, ok := lookup(ctx, targetIP)
+		if !ok {
+			continue
+		}
+		if resolvedIP != "" {
+			targetIP = resolvedIP
+		}
+		if resolvedGeo != "" {
+			return targetIP, resolvedGeo
+		}
+	}
+	return targetIP, ""
 }
 
 // geoLookupFuncs 是依次尝试的 GeoIP 数据源，全部使用 HTTPS，避免明文查询泄露节点地址。

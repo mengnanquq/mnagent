@@ -351,6 +351,27 @@ type miaospeedTestPlan struct {
 // buildMiaospeedTestPlan 根据任务参数解析期望执行的测速矩阵。
 // 支持 8 种测试类型：连通性、拓扑、多线程测速、单线程测速、上行速度、延迟、UDP类型、全量测试。
 func buildMiaospeedTestPlan(job model.Job, nodeCount ...int) miaospeedTestPlan {
+	modes := parseMiaospeedModes(miaospeedModeString(job))
+
+	count := 1
+	if len(nodeCount) > 0 && nodeCount[0] > 0 {
+		count = nodeCount[0]
+	}
+	// 多节点测试时将单节点下行测速时长收敛为 3s，兼顾精准度与整批耗时
+	downloadDuration := int64(5)
+	if count > 1 {
+		downloadDuration = 3
+	}
+
+	// 默认或明确指定为全量测试
+	if len(modes) == 0 || modes[ModeFull] {
+		return fullMiaospeedPlan(count, downloadDuration)
+	}
+	return selectedMiaospeedPlan(job, modes, downloadDuration)
+}
+
+// miaospeedModeString 从 Query / Protocol / Kind 中提取测速模式原文。
+func miaospeedModeString(job model.Job) string {
 	raw := strings.ToLower(strings.TrimSpace(job.Query))
 	if raw == "" {
 		raw = strings.ToLower(strings.TrimSpace(job.Protocol))
@@ -363,11 +384,14 @@ func buildMiaospeedTestPlan(job model.Job, nodeCount ...int) miaospeedTestPlan {
 			raw = strings.TrimPrefix(kind, "speed_")
 		}
 	}
+	return raw
+}
 
+// parseMiaospeedModes 把用户输入的别名归一化为内部模式集合。
+func parseMiaospeedModes(raw string) map[string]bool {
 	tokens := strings.FieldsFunc(raw, func(r rune) bool {
 		return r == ',' || r == ';' || r == ' ' || r == '|' || r == '/'
 	})
-
 	modes := make(map[string]bool)
 	for _, tok := range tokens {
 		switch tok {
@@ -389,146 +413,55 @@ func buildMiaospeedTestPlan(job model.Job, nodeCount ...int) miaospeedTestPlan {
 			modes[ModeFull] = true
 		}
 	}
+	return modes
+}
 
-	count := 1
-	if len(nodeCount) > 0 && nodeCount[0] > 0 {
-		count = nodeCount[0]
+// fullMiaospeedPlan 返回全量测试计划。
+func fullMiaospeedPlan(count int, downloadDuration int64) miaospeedTestPlan {
+	matrices := []slaveRequestMatrixEntry{
+		{Type: matrixRTTPing},
+		{Type: matrixHTTPPing},
+		{Type: matrixPacketLoss},
+		{Type: matrixHTTPCode},
+		{Type: matrixInboundGeoIP},
+		{Type: matrixOutboundGeoIP},
 	}
-	// 多节点测试时将单节点下行测速时长收敛为 3s，兼顾精准度与整批耗时
-	downloadDuration := int64(5)
-	if count > 1 {
-		downloadDuration = 3
+	// 单节点测速包含防劫持检测；多节点批量测速跳过 matrixHijack
+	//（miaospeed 内部 checkHijack 硬编码 2×3×7s=42s 超时且无视 TaskTimeout，会导致死节点卡住 42s，而多节点表格不展示该项）
+	if count <= 1 {
+		matrices = append(matrices, slaveRequestMatrixEntry{Type: matrixHijack})
 	}
+	matrices = append(matrices,
+		slaveRequestMatrixEntry{Type: matrixUDPType},
+		slaveRequestMatrixEntry{Type: matrixAverageSpeed},
+		slaveRequestMatrixEntry{Type: matrixMaxSpeed},
+	)
+	for _, platform := range mediaPlatforms() {
+		matrices = append(matrices, slaveRequestMatrixEntry{Type: "TEST_SCRIPT", Params: platform})
+	}
+	return miaospeedTestPlan{
+		ModeDescription:   "全量测试",
+		Matrices:          matrices,
+		Scripts:           buildDefaultMediaScripts(),
+		DownloadThreading: 4,
+		DownloadDuration:  downloadDuration,
+		STUNURL:           defaultSTUNServer,
+	}
+}
 
-	// 默认或明确指定为全量测试
-	if len(modes) == 0 || modes[ModeFull] {
-		matrices := []slaveRequestMatrixEntry{
-			{Type: matrixRTTPing},
-			{Type: matrixHTTPPing},
-			{Type: matrixPacketLoss},
-			{Type: matrixHTTPCode},
-			{Type: matrixInboundGeoIP},
-			{Type: matrixOutboundGeoIP},
-		}
-		// 单节点测速包含防劫持检测；多节点批量测速跳过 matrixHijack
-		//（miaospeed 内部 checkHijack 硬编码 2×3×7s=42s 超时且无视 TaskTimeout，会导致死节点卡住 42s，而多节点表格不展示该项）
-		if count <= 1 {
-			matrices = append(matrices, slaveRequestMatrixEntry{Type: matrixHijack})
-		}
-		matrices = append(matrices,
-			slaveRequestMatrixEntry{Type: matrixUDPType},
-			slaveRequestMatrixEntry{Type: matrixAverageSpeed},
-			slaveRequestMatrixEntry{Type: matrixMaxSpeed},
-			slaveRequestMatrixEntry{Type: "TEST_SCRIPT", Params: "youtube"},
-			slaveRequestMatrixEntry{Type: "TEST_SCRIPT", Params: "netflix"},
-			slaveRequestMatrixEntry{Type: "TEST_SCRIPT", Params: "disney"},
-			slaveRequestMatrixEntry{Type: "TEST_SCRIPT", Params: "primevideo"},
-			slaveRequestMatrixEntry{Type: "TEST_SCRIPT", Params: "spotify"},
-			slaveRequestMatrixEntry{Type: "TEST_SCRIPT", Params: "openai"},
-			slaveRequestMatrixEntry{Type: "TEST_SCRIPT", Params: "claude"},
-			slaveRequestMatrixEntry{Type: "TEST_SCRIPT", Params: "gemini"},
-			slaveRequestMatrixEntry{Type: "TEST_SCRIPT", Params: "bahamut"},
-			slaveRequestMatrixEntry{Type: "TEST_SCRIPT", Params: "bilibili"},
-			slaveRequestMatrixEntry{Type: "TEST_SCRIPT", Params: "tiktok"},
-			slaveRequestMatrixEntry{Type: "TEST_SCRIPT", Params: "wikipedia"},
-		)
-		return miaospeedTestPlan{
-			ModeDescription:   "全量测试",
-			Matrices:          matrices,
-			Scripts:           buildDefaultMediaScripts(),
-			DownloadThreading: 4,
-			DownloadDuration:  downloadDuration,
-			STUNURL:           defaultSTUNServer,
-		}
-	}
-
+// selectedMiaospeedPlan 按指定模式组合矩阵。
+func selectedMiaospeedPlan(job model.Job, modes map[string]bool, downloadDuration int64) miaospeedTestPlan {
 	matrixSet := make(map[string]bool)
-	var descriptions []string
-	plan := miaospeedTestPlan{
-		DownloadDuration: downloadDuration,
-	}
+	descriptions := make([]string, 0, 4)
+	plan := miaospeedTestPlan{DownloadDuration: downloadDuration}
+	applyMiaospeedModeMatrices(&plan, matrixSet, modes, &descriptions, job)
 
-	if modes[ModeConnectivity] {
-		descriptions = append(descriptions, "连通性测试")
-		matrixSet[matrixHTTPPing] = true
-		matrixSet[matrixRTTPing] = true
-		matrixSet[matrixMaxRTTPing] = true
-		matrixSet[matrixPacketLoss] = true
-		matrixSet[matrixHTTPCode] = true
-		matrixSet[matrixOutboundGeoIP] = true
-	}
-	if modes[ModeTopology] {
-		descriptions = append(descriptions, "拓扑测试")
-		matrixSet[matrixInboundGeoIP] = true
-		matrixSet[matrixOutboundGeoIP] = true
-		matrixSet[matrixHijack] = true
-		matrixSet[matrixRTTPing] = true
-		matrixSet[matrixHTTPPing] = true
-		matrixSet[matrixUDPType] = true
-		plan.STUNURL = defaultSTUNServer
-	}
-	if modes[ModeLatency] {
-		descriptions = append(descriptions, "延迟测试")
-		matrixSet[matrixRTTPing] = true
-		matrixSet[matrixHTTPPing] = true
-		matrixSet[matrixPacketLoss] = true
-		matrixSet[matrixMaxRTTPing] = true
-		matrixSet[matrixHTTPCode] = true
-		matrixSet[matrixOutboundGeoIP] = true
-	}
-	if modes[ModeUDP] {
-		descriptions = append(descriptions, "UDP类型测试")
-		matrixSet[matrixUDPType] = true
-		matrixSet[matrixRTTPing] = true
-		matrixSet[matrixHTTPPing] = true
-		matrixSet[matrixPacketLoss] = true
-		matrixSet[matrixHTTPCode] = true
-		matrixSet[matrixOutboundGeoIP] = true
-		plan.STUNURL = defaultSTUNServer
-	}
-	if modes[ModeMedia] {
-		descriptions = append(descriptions, "流媒体测试")
-		matrixSet[matrixRTTPing] = true
-		matrixSet[matrixHTTPPing] = true
-		matrixSet[matrixPacketLoss] = true
-		matrixSet[matrixHTTPCode] = true
-		matrixSet[matrixInboundGeoIP] = true
-		matrixSet[matrixOutboundGeoIP] = true
-		plan.Scripts = buildDefaultMediaScripts()
-	}
-	if modes[ModeSingleSpeed] {
-		descriptions = append(descriptions, "单线程测速")
-		matrixSet[matrixAverageSpeed] = true
-		matrixSet[matrixMaxSpeed] = true
-		matrixSet[matrixRTTPing] = true
-		matrixSet[matrixHTTPPing] = true
-		matrixSet[matrixPacketLoss] = true
-		matrixSet[matrixHTTPCode] = true
-		matrixSet[matrixOutboundGeoIP] = true
-		plan.DownloadThreading = 1
-	}
-	if modes[ModeMultiSpeed] {
-		descriptions = append(descriptions, "多线程测速")
-		matrixSet[matrixAverageSpeed] = true
-		matrixSet[matrixMaxSpeed] = true
-		matrixSet[matrixRTTPing] = true
-		matrixSet[matrixHTTPPing] = true
-		matrixSet[matrixPacketLoss] = true
-		matrixSet[matrixHTTPCode] = true
-		matrixSet[matrixOutboundGeoIP] = true
-		th := uint(4)
-		if job.Count > 1 && job.Count <= 16 {
-			th = uint(job.Count)
-		}
-		plan.DownloadThreading = th
-	}
-	orderedMatrixKeys := []string{
+	for _, key := range []string{
 		matrixRTTPing, matrixHTTPPing, matrixPacketLoss, matrixMaxRTTPing, matrixHTTPCode,
 		matrixInboundGeoIP, matrixOutboundGeoIP, matrixHijack,
 		matrixUDPType,
 		matrixAverageSpeed, matrixMaxSpeed,
-	}
-	for _, key := range orderedMatrixKeys {
+	} {
 		if matrixSet[key] {
 			plan.Matrices = append(plan.Matrices, slaveRequestMatrixEntry{Type: key})
 		}
@@ -536,9 +469,7 @@ func buildMiaospeedTestPlan(job model.Job, nodeCount ...int) miaospeedTestPlan {
 
 	// 流媒体测试脚本追加在基础连通性与 GeoIP 探测之后，确保各节点优先获取出站 IP 与地理位置
 	if modes[ModeMedia] {
-		for _, platform := range []string{
-			"youtube", "netflix", "disney", "primevideo", "spotify", "openai", "claude", "gemini", "bahamut", "bilibili", "tiktok", "wikipedia",
-		} {
+		for _, platform := range mediaPlatforms() {
 			plan.Matrices = append(plan.Matrices, slaveRequestMatrixEntry{Type: "TEST_SCRIPT", Params: platform})
 		}
 	}
@@ -546,8 +477,81 @@ func buildMiaospeedTestPlan(job model.Job, nodeCount ...int) miaospeedTestPlan {
 	return plan
 }
 
+// applyMiaospeedModeMatrices 汇总各模式所需的矩阵、脚本与时长参数。
+func applyMiaospeedModeMatrices(plan *miaospeedTestPlan, matrixSet map[string]bool, modes map[string]bool, descriptions *[]string, job model.Job) {
+	if modes[ModeConnectivity] {
+		*descriptions = append(*descriptions, "连通性测试")
+		markMatrices(matrixSet, matrixHTTPPing, matrixRTTPing, matrixMaxRTTPing, matrixPacketLoss, matrixHTTPCode, matrixOutboundGeoIP)
+	}
+	if modes[ModeTopology] {
+		*descriptions = append(*descriptions, "拓扑测试")
+		markMatrices(matrixSet, matrixInboundGeoIP, matrixOutboundGeoIP, matrixHijack, matrixRTTPing, matrixHTTPPing, matrixUDPType)
+		plan.STUNURL = defaultSTUNServer
+	}
+	if modes[ModeLatency] {
+		*descriptions = append(*descriptions, "延迟测试")
+		markMatrices(matrixSet, matrixRTTPing, matrixHTTPPing, matrixPacketLoss, matrixMaxRTTPing, matrixHTTPCode, matrixOutboundGeoIP)
+	}
+	if modes[ModeUDP] {
+		*descriptions = append(*descriptions, "UDP类型测试")
+		markMatrices(matrixSet, matrixUDPType, matrixRTTPing, matrixHTTPPing, matrixPacketLoss, matrixHTTPCode, matrixOutboundGeoIP)
+		plan.STUNURL = defaultSTUNServer
+	}
+	if modes[ModeMedia] {
+		*descriptions = append(*descriptions, "流媒体测试")
+		markMatrices(matrixSet, matrixRTTPing, matrixHTTPPing, matrixPacketLoss, matrixHTTPCode, matrixInboundGeoIP, matrixOutboundGeoIP)
+		plan.Scripts = buildDefaultMediaScripts()
+	}
+	if modes[ModeSingleSpeed] {
+		*descriptions = append(*descriptions, "单线程测速")
+		markMatrices(matrixSet, matrixAverageSpeed, matrixMaxSpeed, matrixRTTPing, matrixHTTPPing, matrixPacketLoss, matrixHTTPCode, matrixOutboundGeoIP)
+		plan.DownloadThreading = 1
+	}
+	if modes[ModeMultiSpeed] {
+		*descriptions = append(*descriptions, "多线程测速")
+		markMatrices(matrixSet, matrixAverageSpeed, matrixMaxSpeed, matrixRTTPing, matrixHTTPPing, matrixPacketLoss, matrixHTTPCode, matrixOutboundGeoIP)
+		th := uint(4)
+		if job.Count > 1 && job.Count <= 16 {
+			th = uint(job.Count)
+		}
+		plan.DownloadThreading = th
+	}
+}
+
+func markMatrices(set map[string]bool, keys ...string) {
+	for _, key := range keys {
+		set[key] = true
+	}
+}
+
+// mediaPlatforms 返回默认流媒体脚本平台列表（顺序同时决定结果展示顺序）。
+func mediaPlatforms() []string {
+	return []string{
+		"youtube", "netflix", "disney", "primevideo", "spotify", "openai", "claude", "gemini", "bahamut", "bilibili", "tiktok", "wikipedia",
+	}
+}
+
 // executeMiaospeedTask 连接 WebSocket、发送任务并读取结果。
 func executeMiaospeedTask(ctx context.Context, wsURL, origin, token string, nodes []MiaospeedNode, totalNodes int, job model.Job, log Logger, onProgress func(model.Progress)) (*MiaospeedReport, error) {
+	ws, err := connectMiaospeedWS(ctx, wsURL, origin)
+	if err != nil {
+		return nil, err
+	}
+	defer ws.Close()
+
+	plan := buildMiaospeedTestPlan(job, len(nodes))
+	req, err := buildMiaospeedSlaveRequest(job, nodes, plan, token)
+	if err != nil {
+		return nil, err
+	}
+	if err := websocket.JSON.Send(ws, req); err != nil {
+		return nil, fmt.Errorf("向 miaospeed 发送任务失败: %w", err)
+	}
+	return readMiaospeedTaskResponse(ctx, ws, nodes, totalNodes, plan, job, log, onProgress)
+}
+
+// connectMiaospeedWS 建立到本地 miaospeed 服务的 WebSocket 连接，并遵守 ctx 取消。
+func connectMiaospeedWS(ctx context.Context, wsURL, origin string) (*websocket.Conn, error) {
 	wsCfg, err := websocket.NewConfig(wsURL, origin)
 	if err != nil {
 		return nil, fmt.Errorf("配置 websocket 失败: %w", err)
@@ -564,7 +568,6 @@ func executeMiaospeedTask(ctx context.Context, wsURL, origin, token string, node
 		dialCh <- dialResult{conn: conn, err: err}
 	}()
 
-	var ws *websocket.Conn
 	select {
 	case <-ctx.Done():
 		go func() {
@@ -577,26 +580,21 @@ func executeMiaospeedTask(ctx context.Context, wsURL, origin, token string, node
 		if res.err != nil {
 			return nil, fmt.Errorf("连接 miaospeed 服务失败: %w", res.err)
 		}
-		ws = res.conn
+		return res.conn, nil
 	}
-	defer ws.Close()
+}
 
-	plan := buildMiaospeedTestPlan(job, len(nodes))
-
-	// 构造节点
+// buildMiaospeedSlaveRequest 组装并签名 miaospeed 测速请求。
+func buildMiaospeedSlaveRequest(job model.Job, nodes []MiaospeedNode, plan miaospeedTestPlan, token string) (slaveRequest, error) {
 	reqNodes := make([]slaveRequestNode, 0, len(nodes))
 	for _, n := range nodes {
-		reqNodes = append(reqNodes, slaveRequestNode{
-			Name:    n.Name,
-			Payload: n.Payload,
-		})
+		reqNodes = append(reqNodes, slaveRequestNode{Name: n.Name, Payload: n.Payload})
 	}
 
 	stunURL := plan.STUNURL
 	if stunURL == "" {
 		stunURL = defaultSTUNServer
 	}
-
 	scripts := plan.Scripts
 	if scripts == nil {
 		scripts = make([]slaveScript, 0)
@@ -621,9 +619,7 @@ func executeMiaospeedTask(ctx context.Context, wsURL, origin, token string, node
 			Invoker:   "mnagent",
 			Version:   "1.0",
 		},
-		Options: slaveRequestOptions{
-			Matrices: plan.Matrices,
-		},
+		Options: slaveRequestOptions{Matrices: plan.Matrices},
 		Configs: slaveRequestConfigs{
 			STUNURL:           stunURL,
 			DownloadURL:       defaultSpeedFile,
@@ -641,19 +637,16 @@ func executeMiaospeedTask(ctx context.Context, wsURL, origin, token string, node
 		RandomSequence: generateRandomHex(8),
 	}
 
-	// 签名
 	sig, err := signMiaoSpeedRequest(token, defaultBuildToken, req)
 	if err != nil {
-		return nil, fmt.Errorf("签名任务请求失败: %w", err)
+		return slaveRequest{}, fmt.Errorf("签名任务请求失败: %w", err)
 	}
 	req.Challenge = sig
+	return req, nil
+}
 
-	// 发送任务
-	if err := websocket.JSON.Send(ws, req); err != nil {
-		return nil, fmt.Errorf("向 miaospeed 发送任务失败: %w", err)
-	}
-
-	// 接收结果
+// readMiaospeedTaskResponse 持续读取进度与最终结果，超时/断线时保留已完成节点。
+func readMiaospeedTaskResponse(ctx context.Context, ws *websocket.Conn, nodes []MiaospeedNode, totalNodes int, plan miaospeedTestPlan, job model.Job, log Logger, onProgress func(model.Progress)) (*MiaospeedReport, error) {
 	startTime := time.Now()
 	var progressSlots []slaveEntrySlot
 	for {
@@ -684,59 +677,59 @@ func executeMiaospeedTask(ctx context.Context, wsURL, origin, token string, node
 		if log != nil {
 			log.Debug("收到 miaospeed 响应", "has_result", resp.Result != nil, "has_progress", resp.Progress != nil, "error", resp.Error)
 		}
-
 		if resp.Error != "" {
 			return nil, fmt.Errorf("miaospeed 任务执行报错: %s", resp.Error)
 		}
 
 		if resp.Progress != nil && resp.Progress.Record != nil {
 			progressSlots = append(progressSlots, *resp.Progress.Record)
-			if onProgress != nil {
-				curIdx := len(progressSlots)
-				if curIdx > len(nodes) {
-					curIdx = len(nodes)
-				}
-				curName := ""
-				var curNode *MiaospeedNode
-				if resp.Progress.Index >= 0 && resp.Progress.Index < len(nodes) {
-					curNode = &nodes[resp.Progress.Index]
-					curName = curNode.Name
-				}
-				singleReport := parseSingleSlotContext(ctx, *resp.Progress.Record, curNode, plan)
-				nodeRawBytes, _ := json.Marshal(singleReport)
-
-				stageDesc := "测速中"
-				if plan.ModeDescription != "" {
-					stageDesc = plan.ModeDescription + "中"
-				}
-
-				onProgress(model.Progress{
-					ID:       job.ID,
-					Current:  curIdx,
-					Total:    len(nodes),
-					NodeName: curName,
-					Stage:    stageDesc,
-					NodeData: nodeRawBytes,
-				})
-			}
+			reportMiaospeedProgress(ctx, job, plan, nodes, resp.Progress, len(progressSlots), onProgress)
 		}
-
 		if resp.Result != nil {
-			report := parseSlaveTaskResultContext(ctx, resp.Result, nodes, totalNodes, plan, time.Since(startTime))
-			return report, nil
+			return parseSlaveTaskResultContext(ctx, resp.Result, nodes, totalNodes, plan, time.Since(startTime)), nil
 		}
 	}
 
 	if len(progressSlots) > 0 {
 		resTask := &slaveTask{Results: progressSlots}
-		report := parseSlaveTaskResultContext(ctx, resTask, nodes, totalNodes, plan, time.Since(startTime))
-		return report, nil
+		return parseSlaveTaskResultContext(ctx, resTask, nodes, totalNodes, plan, time.Since(startTime)), nil
 	}
-
 	if ctx.Err() != nil {
 		return nil, ctx.Err()
 	}
 	return nil, errors.New("miaospeed 连接已关闭，但未收到结果数据")
+}
+
+// reportMiaospeedProgress 把单个节点进度转换为上层回调数据。
+func reportMiaospeedProgress(ctx context.Context, job model.Job, plan miaospeedTestPlan, nodes []MiaospeedNode, progress *slaveProgress, current int, onProgress func(model.Progress)) {
+	if onProgress == nil || progress == nil || progress.Record == nil {
+		return
+	}
+	curIdx := current
+	if curIdx > len(nodes) {
+		curIdx = len(nodes)
+	}
+	curName := ""
+	var curNode *MiaospeedNode
+	if progress.Index >= 0 && progress.Index < len(nodes) {
+		curNode = &nodes[progress.Index]
+		curName = curNode.Name
+	}
+	singleReport := parseSingleSlotContext(ctx, *progress.Record, curNode, plan)
+	nodeRawBytes, _ := json.Marshal(singleReport)
+
+	stageDesc := "测速中"
+	if plan.ModeDescription != "" {
+		stageDesc = plan.ModeDescription + "中"
+	}
+	onProgress(model.Progress{
+		ID:       job.ID,
+		Current:  curIdx,
+		Total:    len(nodes),
+		NodeName: curName,
+		Stage:    stageDesc,
+		NodeData: nodeRawBytes,
+	})
 }
 
 func getFreeLocalPort() (int, error) {
