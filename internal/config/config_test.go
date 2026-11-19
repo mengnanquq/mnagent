@@ -214,13 +214,17 @@ func TestParseConfigRejectsInsecureHTTPAndUnsafeChars(t *testing.T) {
 	}
 }
 
-// TestParseConfigValidatesProbeKind 验证本地探针类型在参数解析阶段就会校验。
-func TestParseConfigValidatesProbeKind(t *testing.T) {
-	args := []string{"-probe-target", "example.com", "-probe-kind", "nope"}
-	if _, err := ParseConfig(args, "dev"); err == nil {
-		t.Fatal("非法 -probe-kind 应在解析阶段报错")
+// TestParseConfigDefersProbeKindValidation 验证 -probe-kind 不在配置解析阶段报错：
+// 该参数只对本地探针有意义，由 cmd/mnagent 的本地探针路径校验。
+func TestParseConfigDefersProbeKindValidation(t *testing.T) {
+	cfg, err := ParseConfig([]string{"-probe-target", "example.com", "-probe-kind", "nope"}, "dev")
+	if err != nil {
+		t.Fatalf("配置解析层不应因 -probe-kind 直接失败: %v", err)
 	}
-	cfg, err := ParseConfig([]string{"-probe-target", "example.com", "-probe-kind", "dns"}, "dev")
+	if cfg.ProbeKind != "nope" {
+		t.Fatalf("ProbeKind 应原样保留待本地探针校验，实际 %q", cfg.ProbeKind)
+	}
+	cfg, err = ParseConfig([]string{"-probe-target", "example.com", "-probe-kind", "dns"}, "dev")
 	if err != nil {
 		t.Fatalf("合法 -probe-kind 不应报错: %v", err)
 	}

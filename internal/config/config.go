@@ -217,13 +217,9 @@ func ParseConfig(args []string, version string) (*Config, error) {
 	if *resultWait <= time.Second {
 		return nil, errors.New("-result-timeout 应大于 1 秒")
 	}
-	if strings.TrimSpace(*probeTarget) != "" {
-		switch strings.ToLower(strings.TrimSpace(*probeKind)) {
-		case "", "ping", "tcping", "trace", "http", "dns":
-		default:
-			return nil, fmt.Errorf("-probe-kind 取值非法：%q（可选：ping / tcping / trace / http / dns）", *probeKind)
-		}
-	}
+	// -probe-kind 的合法性不在这里校验：该参数只对本地探针路径有意义，
+	// 由 cmd/mnagent 的 validateLocalProbeKind 负责，避免配置解析层因为一个
+	// 与守护进程无关的参数直接失败。
 
 	var tokens *TokenSource
 	if !isUpdateCLI {
