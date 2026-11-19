@@ -1931,3 +1931,119 @@ func TestDecodeSlaveJSONOnlyOnCompleteBlocks(t *testing.T) {
 		t.Fatal("缓冲复用阈值必须明显小于单条响应上限，否则大缓冲会长期留在池中")
 	}
 }
+
+// TestGeoInflightMergesConcurrentLookups 验证同一 IP 的并发 GeoIP 查询只执行一次，
+// 所有等待者共享同一结果（手写 singleflight）。
+func TestGeoInflightMergesConcurrentLookups(t *testing.T) {
+	g := &geoInflight{calls: make(map[string]*geoCall)}
+	var calls atomic.Int32
+	const waiters = 8
+	start := make(chan struct{})
+	results := make(chan string, waiters)
+	done := make(chan struct{})
+	for i := 0; i < waiters; i++ {
+		go func() {
+			<-start
+			ip, geo := g.do(context.Background(), "203.0.113.9", func(context.Context) (string, string) {
+				calls.Add(1)
+				time.Sleep(20 * time.Millisecond)
+				return "203.0.113.9", "Test Geo"
+			})
+			results <- ip + "|" + geo
+		}()
+	}
+	close(start)
+	go func() {
+		for i := 0; i < waiters; i++ {
+			<-results
+		}
+		close(done)
+	}()
+	select {
+	case <-done:
+	case <-time.After(3 * time.Second):
+		t.Fatal("并发查询未在预期时间内完成")
+	}
+	if got := calls.Load(); got != 1 {
+		t.Fatalf("相同 IP 的并发查询应合并为 1 次，实际 %d 次", got)
+	}
+	if len(g.calls) != 0 {
+		t.Fatalf("查询结束后 inflight 表应清空，实际剩余 %d 项", len(g.calls))
+	}
+}
+
+// TestGeoCooldownWindow 验证 ipapi.co 的 429 冷却期为 10 分钟。
+func TestGeoCooldownWindow(t *testing.T) {
+	if geoRateLimitCooldown != 10*time.Minute {
+		t.Fatalf("限流冷却期 = %s，期望 10 分钟", geoRateLimitCooldown)
+	}
+	now := time.Unix(1000, 0)
+	c := &geoCooldown{now: func() time.Time { return now }}
+	if c.active() {
+		t.Fatal("未限流时不应处于冷却期")
+	}
+	c.block(geoRateLimitCooldown)
+	if !c.active() {
+		t.Fatal("429 后应立即进入冷却期")
+	}
+	now = now.Add(geoRateLimitCooldown - time.Second)
+	if !c.active() {
+		t.Fatal("冷却期未结束前不应恢复查询")
+	}
+	now = now.Add(2 * time.Second)
+	if c.active() {
+		t.Fatal("冷却期结束后应恢复查询")
+	}
+}
+
+// TestQueryIPGeoCanceledWaiterDoesNotCacheEmpty 验证等待共享结果的调用方被取消时
+// 不会把空结果写入 GeoIP 缓存，否则后续 30 分钟都会命中空数据。
+func TestQueryIPGeoCanceledWaiterDoesNotCacheEmpty(t *testing.T) {
+	old := geoLookupFuncs
+	defer func() { geoLookupFuncs = old }()
+
+	entered := make(chan struct{})
+	release := make(chan struct{})
+	geoLookupFuncs = []func(context.Context, string) (string, string, bool){
+		func(_ context.Context, targetIP string) (string, string, bool) {
+			close(entered)
+			<-release
+			return targetIP, "Test Geo", true
+		},
+	}
+	const host = "203.0.113.201"
+	leaderDone := make(chan struct{})
+	go func() {
+		queryIPGeo(context.Background(), host)
+		close(leaderDone)
+	}()
+	select {
+	case <-entered:
+	case <-time.After(2 * time.Second):
+		t.Fatal("首次 GeoIP 查询未开始")
+	}
+
+	// 第二个调用方等待共享结果，中途被取消。
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go func() {
+		time.Sleep(20 * time.Millisecond)
+		cancel()
+	}()
+	ip, geo := queryIPGeo(ctx, host)
+	if ip != host || geo != host {
+		t.Fatalf("等待中被取消时应返回解析结果兜底，实际 ip=%q geo=%q", ip, geo)
+	}
+	if _, _, ok := defaultGeoCache.get(host); ok {
+		t.Fatal("等待中被取消的查询不应写入 GeoIP 缓存")
+	}
+
+	close(release)
+	<-leaderDone
+	// 清理本用例写入的全局缓存，避免影响其它测试。
+	defaultGeoCache.mu.Lock()
+	if e, ok := defaultGeoCache.entries[host]; ok {
+		defaultGeoCache.removeLocked(host, e)
+	}
+	defaultGeoCache.mu.Unlock()
+}

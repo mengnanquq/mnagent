@@ -572,6 +572,10 @@ const (
 	geoCacheTTL = 30 * time.Minute
 	// geoLookupWorkers 限制报告生成时并发查询 GeoIP 的节点数。
 	geoLookupWorkers = 4
+	// geoRateLimitCooldown 是 GeoIP 数据源被限流（HTTP 429）后的冷却时长。
+	// 一个批次里往往有很多节点指向同一出口，冷却期内直接跳过该数据源，
+	// 避免每次都吃一个 429 白白拖慢整批报告。
+	geoRateLimitCooldown = 10 * time.Minute
 )
 
 // geoHTTPClient 是 GeoIP 查询共享的包级客户端，复用连接并统一超时。
@@ -604,6 +608,79 @@ func newGeoIPCache(capacity int, ttl time.Duration) *geoIPCache {
 }
 
 var defaultGeoCache = newGeoIPCache(geoCacheMaxEntries, geoCacheTTL)
+
+// geoCooldown 记录某个 GeoIP 数据源被限流后的冷却截止时间。
+type geoCooldown struct {
+	mu    sync.Mutex
+	until time.Time
+	now   func() time.Time
+}
+
+// active 报告冷却期是否仍在进行。
+func (c *geoCooldown) active() bool {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.now().Before(c.until)
+}
+
+// block 从现在起进入（或延长到）至少一个完整冷却期。
+func (c *geoCooldown) block(d time.Duration) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if until := c.now().Add(d); until.After(c.until) {
+		c.until = until
+	}
+}
+
+// geoIPAPICooldown 是 ipapi.co 的限流冷却状态。
+var geoIPAPICooldown = &geoCooldown{now: time.Now}
+
+// geoCall 是一次进行中的 GeoIP 查询；done 关闭后其字段对等待者可见。
+type geoCall struct {
+	done chan struct{}
+	ip   string
+	geo  string
+}
+
+// geoInflight 合并同一 IP 的并发 GeoIP 查询（手写 singleflight，避免引入新依赖）。
+// 首个调用方执行查询，其余等待者共享同一结果，避免同一 IP 被并发打到外部接口。
+type geoInflight struct {
+	mu    sync.Mutex
+	calls map[string]*geoCall
+}
+
+// do 在 key 上执行 fn；相同 key 的并发调用只执行一次 fn。
+// 等待者尊重自己的 ctx：ctx 取消时立即返回，不再等共享结果。
+func (g *geoInflight) do(ctx context.Context, key string, fn func(context.Context) (string, string)) (string, string) {
+	g.mu.Lock()
+	if call, ok := g.calls[key]; ok {
+		g.mu.Unlock()
+		select {
+		case <-call.done:
+			return call.ip, call.geo
+		case <-ctx.Done():
+			return "", ""
+		}
+	}
+	call := &geoCall{done: make(chan struct{})}
+	if g.calls == nil {
+		g.calls = make(map[string]*geoCall)
+	}
+	g.calls[key] = call
+	g.mu.Unlock()
+
+	// 共享查询沿用发起者的 ctx：发起者取消时所有等待者一起结束，
+	// 保证任务取消能立即生效，也不会遗留后台 goroutine。
+	ip, geo := fn(ctx)
+	call.ip, call.geo = ip, geo
+	g.mu.Lock()
+	delete(g.calls, key)
+	g.mu.Unlock()
+	close(call.done)
+	return ip, geo
+}
+
+var defaultGeoInflight = &geoInflight{calls: make(map[string]*geoCall)}
 
 func (c *geoIPCache) get(key string) (ip, geo string, ok bool) {
 	c.mu.Lock()
@@ -671,9 +748,20 @@ func queryIPGeo(ctx context.Context, host string) (ip, geo string) {
 	}
 
 	targetIP := resolveGeoLookupIP(ctx, cleanHost, parsedIP)
-	targetIP, geo = lookupGeoText(ctx, targetIP)
-	ip = targetIP
-	if geo == "" && ip != "" {
+	if ctx.Err() != nil {
+		// 任务已取消：不再访问外部 GeoIP 服务，直接用解析结果兜底。
+		return targetIP, targetIP
+	}
+	// 同一 IP 被多个节点并发引用时只查一次，结果共享给所有等待者。
+	ip, geo = defaultGeoInflight.do(ctx, targetIP, func(lookupCtx context.Context) (string, string) {
+		return lookupGeoText(lookupCtx, targetIP)
+	})
+	if ip == "" {
+		// 等待共享结果期间被取消：用解析结果兜底，且不写入缓存，
+		// 避免把空结果缓存 30 分钟后影响后续任务。
+		return targetIP, targetIP
+	}
+	if geo == "" {
 		geo = ip
 	}
 	defaultGeoCache.put(cleanHost, ip, geo)
@@ -732,23 +820,25 @@ type geoAPIResponse struct {
 }
 
 // fetchGeoAPI 请求一个 JSON GeoIP 接口，并拼接“国家 运营商”展示文案。
-func fetchGeoAPI(ctx context.Context, apiURL string) (ip, geo string, ok bool) {
+// status 返回 HTTP 状态码（未发出请求或网络错误时为 0），供调用方处理 429 限流。
+func fetchGeoAPI(ctx context.Context, apiURL string) (ip, geo string, status int, ok bool) {
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, apiURL, nil)
 	if err != nil {
-		return "", "", false
+		return "", "", 0, false
 	}
 	req.Header.Set("User-Agent", "Mozilla/5.0")
 	resp, err := geoHTTPClient.Do(req)
 	if err != nil {
-		return "", "", false
+		return "", "", 0, false
 	}
 	defer resp.Body.Close()
-	if resp.StatusCode != http.StatusOK {
-		return "", "", false
+	status = resp.StatusCode
+	if status != http.StatusOK {
+		return "", "", status, false
 	}
 	var info geoAPIResponse
 	if err := json.NewDecoder(io.LimitReader(resp.Body, 64*1024)).Decode(&info); err != nil || info.Error {
-		return "", "", false
+		return "", "", status, false
 	}
 	if info.IP != "" {
 		ip = info.IP
@@ -773,7 +863,7 @@ func fetchGeoAPI(ctx context.Context, apiURL string) (ip, geo string, ok bool) {
 	if len(parts) > 0 {
 		geo = strings.Join(parts, " ")
 	}
-	return ip, geo, true
+	return ip, geo, status, true
 }
 
 func lookupGeoIPLeak(ctx context.Context, targetIP string) (string, string, bool) {
@@ -781,15 +871,25 @@ func lookupGeoIPLeak(ctx context.Context, targetIP string) (string, string, bool
 	if strings.Contains(targetIP, ":") {
 		host = "ipv6.ipleak.net"
 	}
-	return fetchGeoAPI(ctx, "https://"+host+"/json/"+targetIP)
+	ip, geo, _, ok := fetchGeoAPI(ctx, "https://"+host+"/json/"+targetIP)
+	return ip, geo, ok
 }
 
 func lookupGeoIPSB(ctx context.Context, targetIP string) (string, string, bool) {
-	return fetchGeoAPI(ctx, "https://api.ip.sb/geoip/"+targetIP)
+	ip, geo, _, ok := fetchGeoAPI(ctx, "https://api.ip.sb/geoip/"+targetIP)
+	return ip, geo, ok
 }
 
+// lookupGeoIPAPI 查询 ipapi.co；遇到 429 后进入 10 分钟冷却期，冷却期内直接跳过。
 func lookupGeoIPAPI(ctx context.Context, targetIP string) (string, string, bool) {
-	return fetchGeoAPI(ctx, "https://ipapi.co/"+targetIP+"/json/")
+	if geoIPAPICooldown.active() {
+		return "", "", false
+	}
+	ip, geo, status, ok := fetchGeoAPI(ctx, "https://ipapi.co/"+targetIP+"/json/")
+	if status == http.StatusTooManyRequests {
+		geoIPAPICooldown.block(geoRateLimitCooldown)
+	}
+	return ip, geo, ok
 }
 
 // parseMatrixHijack 解析防劫持 JSON
