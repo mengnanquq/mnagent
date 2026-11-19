@@ -1,9 +1,11 @@
 package client
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
+	"log/slog"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -39,6 +41,24 @@ func waitFor(t *testing.T, what string, cond func() bool) {
 		time.Sleep(5 * time.Millisecond)
 	}
 	t.Fatalf("等待超时：%s", what)
+}
+
+// TestRejectJobFullQueueLogsWarning 验证 wsReject 队列满时丢弃结果会留下 Warn 日志，
+// 而不是静默丢任务。
+func TestRejectJobFullQueueLogsWarning(t *testing.T) {
+	var buf bytes.Buffer
+	old := slog.Default()
+	slog.SetDefault(slog.New(slog.NewTextHandler(&buf, &slog.HandlerOptions{Level: slog.LevelWarn})))
+	defer slog.SetDefault(old)
+
+	c := &Client{wsReject: make(chan model.Result, 1)}
+	c.rejectJob(&model.Job{ID: "j1", Kind: "trace"}, "队列已满")
+	c.rejectJob(&model.Job{ID: "j2", Kind: "trace"}, "队列已满")
+
+	logged := buf.String()
+	if !strings.Contains(logged, "level=WARN") || !strings.Contains(logged, "j2") {
+		t.Fatalf("队列满丢弃时应打印包含任务 ID 的 Warn 日志，实际：%q", logged)
+	}
 }
 
 // TestClientWSRoundTrip 覆盖：建立长连接 → 接收推送任务 → 进度/结果走长连接 → 心跳免发。

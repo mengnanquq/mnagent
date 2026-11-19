@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"log/slog"
 	"math/rand/v2"
 	"net"
 	"net/http"
@@ -225,7 +226,10 @@ func (c *Client) rejectJob(job *model.Job, reason string) {
 	select {
 	case c.wsReject <- res:
 	default:
-		// 连失败回报都排满时只能丢弃，避免反向阻塞读循环。
+		// 连失败回报都排满时只能丢弃，避免反向阻塞读循环；
+		// 但必须留下 Warn 日志，否则任务会静默丢失、无从排查。
+		slog.Warn("WebSocket 失败回传队列已满，丢弃任务结果",
+			"job", job.ID, "kind", job.Kind, "reason", reason)
 	}
 }
 
