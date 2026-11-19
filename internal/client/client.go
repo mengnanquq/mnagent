@@ -47,7 +47,8 @@ type Client struct {
 	wsOnce     sync.Once
 	ws         atomic.Pointer[websocket.Conn]
 	wsJobs     chan *model.Job
-	wsAck      atomic.Bool // 当前连接的机器人是否会确认结果（hello 声明）
+	wsReject   chan model.Result // 队列满时的失败结果，由独立协程回传，避免阻塞读循环
+	wsAck      atomic.Bool       // 当前连接的机器人是否会确认结果（hello 声明）
 
 	ackMu sync.Mutex
 	acks  map[string]chan struct{} // 等待机器人确认的结果 ID
@@ -86,6 +87,7 @@ func New(cfg *config.Config) *Client {
 		wsDisabled:    wsDisabledByEnv(),
 		wsHTTP:        newWSHTTPClient(),
 		wsJobs:        make(chan *model.Job, 64),
+		wsReject:      make(chan model.Result, 64),
 	}
 }
 

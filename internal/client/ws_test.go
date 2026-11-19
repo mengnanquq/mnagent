@@ -3,9 +3,11 @@ package client
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"strings"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -246,5 +248,67 @@ func TestClientWSResultAck(t *testing.T) {
 		case <-time.After(2 * time.Second):
 			t.Fatal("机器人未收到未执行任务的失败回报")
 		}
+	}
+}
+
+// TestClientWSQueueFullRejectsWithoutBlockingReadLoop 验证 wsJobs 满时读循环不会卡住，
+// 而是立即经独立协程回报“节点队列已满”的失败结果。
+func TestClientWSQueueFullRejectsWithoutBlockingReadLoop(t *testing.T) {
+	results := make(chan model.Result, 8)
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/ws" {
+			w.WriteHeader(http.StatusNoContent)
+			return
+		}
+		conn, err := websocket.Accept(w, r, nil)
+		if err != nil {
+			return
+		}
+		defer conn.CloseNow()
+		ctx := r.Context()
+		for i := 1; i <= 3; i++ {
+			b, _ := json.Marshal(wsMessage{Type: "job", Job: &model.Job{ID: fmt.Sprintf("q%d", i), Target: "1.1.1.1"}})
+			if err := conn.Write(ctx, websocket.MessageText, b); err != nil {
+				return
+			}
+		}
+		for {
+			_, data, err := conn.Read(ctx)
+			if err != nil {
+				return
+			}
+			var m wsMessage
+			_ = json.Unmarshal(data, &m)
+			if m.Type == "result" && m.Result != nil {
+				results <- *m.Result
+			}
+		}
+	}))
+	defer srv.Close()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	cli := newWSClient(srv.URL)
+	cli.wsJobs = make(chan *model.Job, 1) // 只容纳 1 个，后续立即触发背压
+
+	cli.startWS(ctx)
+	want := map[string]bool{"q2": true, "q3": true}
+	deadline := time.After(3 * time.Second)
+	for len(want) > 0 {
+		select {
+		case res := <-results:
+			if !want[res.ID] {
+				t.Fatalf("不应为任务 %s 回报失败: %+v", res.ID, res)
+			}
+			delete(want, res.ID)
+			if res.ExitCode != -1 || !strings.Contains(res.Error, "节点队列已满") {
+				t.Fatalf("队列满的失败结果异常: %+v", res)
+			}
+		case <-deadline:
+			t.Fatalf("读循环被阻塞，未及时回报队列满: 剩余 %v", want)
+		}
+	}
+	if got := len(cli.wsJobs); got != 1 {
+		t.Fatalf("wsJobs 应只保留 1 个任务，实际 %d", got)
 	}
 }

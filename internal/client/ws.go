@@ -146,6 +146,7 @@ func (c *Client) serveWS(ctx context.Context, conn *websocket.Conn) {
 	defer cancel()
 	c.wsAck.Store(false) // 等机器人 hello 声明支持后再启用结果确认
 	c.ws.Store(conn)
+	go c.wsRejectLoop(cctx)
 	defer func() {
 		c.ws.CompareAndSwap(conn, nil)
 		if ctx.Err() != nil {
@@ -206,8 +207,38 @@ func (c *Client) serveWS(ctx context.Context, conn *websocket.Conn) {
 		}
 		select {
 		case c.wsJobs <- msg.Job:
-		case <-cctx.Done():
+		default:
+			// 读循环绝不阻塞：runner 的 heavyQueue 满时若同步写入，会让整条
+			// WebSocket 停止读取（连 ping/ack 都无法处理）。队列满时立即回报
+			// 明确的失败结果，由独立协程回传。
+			c.rejectJob(msg.Job, "节点队列已满，任务未执行，请稍后重试")
+		}
+	}
+}
+
+// rejectJob 把“队列已满”的失败结果投入独立回传队列；该函数不阻塞 WebSocket 读循环。
+func (c *Client) rejectJob(job *model.Job, reason string) {
+	if job == nil || job.ID == "" {
+		return
+	}
+	res := model.Result{ID: job.ID, Kind: job.Kind, ExitCode: -1, Error: reason}
+	select {
+	case c.wsReject <- res:
+	default:
+		// 连失败回报都排满时只能丢弃，避免反向阻塞读循环。
+	}
+}
+
+// wsRejectLoop 串行回传队列满的失败结果，避免大量并发写同一条连接。
+func (c *Client) wsRejectLoop(ctx context.Context) {
+	for {
+		select {
+		case <-ctx.Done():
 			return
+		case res := <-c.wsReject:
+			sctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 30*time.Second)
+			_ = c.SendResult(sctx, res)
+			cancel()
 		}
 	}
 }
