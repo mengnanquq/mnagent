@@ -29,6 +29,12 @@ jobs:
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+      # 单元测试只在 prepare 跑一次；build matrix 只负责编译各平台产物。
+      - name: Test
+        run: go test ./...
       - name: Compute version
         id: version
         run: |
@@ -100,8 +106,6 @@ jobs:
       - name: Install UPX
         if: matrix.upx
         run: sudo apt-get update && sudo apt-get install -y upx
-      - name: Test
-        run: go test ./...
       - name: Derive signing public key
         env:
           MNAGENT_SIGNING_PRIVATE_KEY: ${{ secrets.MNAGENT_SIGNING_PRIVATE_KEY }}

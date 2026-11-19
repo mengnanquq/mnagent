@@ -91,11 +91,16 @@ func (c *Client) wsLoop(ctx context.Context) {
 			wait := backoff
 			switch status {
 			case http.StatusNotFound, http.StatusMethodNotAllowed, http.StatusBadRequest, http.StatusUpgradeRequired:
+				// 机器人/反代不支持 WebSocket：明确提示已降级到 HTTP 长轮询，
+				// 否则用户只会看到“在线状态时好时坏”而不知道原因。
 				wait = wsUnsupportedRetry
+				slog.Warn("机器人不支持 WebSocket，已降级为 HTTP 长轮询", "status", status, "retry_in", wait, "error", err)
 			case http.StatusUnauthorized:
 				wait = time.Minute
+				slog.Warn("WebSocket 握手鉴权失败，降级为 HTTP 长轮询", "status", status, "error", err)
 			default:
 				backoff = min(backoff*2, wsMaxBackoff)
+				slog.Debug("WebSocket 连接失败，稍后重试", "status", status, "retry_in", wait, "error", err)
 			}
 			jitter := time.Duration(rand.Int64N(int64(wait/4) + 1))
 			if !sleepCtx(ctx, wait+jitter) {
@@ -103,6 +108,7 @@ func (c *Client) wsLoop(ctx context.Context) {
 			}
 			continue
 		}
+		slog.Debug("WebSocket 长连接已建立", "endpoint", c.baseURL+"/ws")
 		started := time.Now()
 		c.serveWS(ctx, conn)
 		if time.Since(started) > time.Minute {

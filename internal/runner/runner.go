@@ -56,17 +56,17 @@ func (r *Runner) SetProgressReporter(fn func(model.Progress)) {
 	r.onProgress = fn
 }
 
-// newRunner 构建执行器，默认请求 JSON 输出。
+// NewRunner 构建执行器，默认请求 JSON 输出。
 func NewRunner(binary string, log Logger) *Runner {
-	return newRunnerFull(binary, "miaospeed", "", false, log)
+	return NewRunnerFull(binary, "miaospeed", "", false, log)
 }
 
-// newRunnerWithMiaospeed 构建执行器，可指定 miaospeed 可执行文件路径。
+// NewRunnerWithMiaospeed 构建执行器，可指定 miaospeed 可执行文件路径。
 func NewRunnerWithMiaospeed(binary, miaospeed string, log Logger) *Runner {
-	return newRunnerFull(binary, miaospeed, "", false, log)
+	return NewRunnerFull(binary, miaospeed, "", false, log)
 }
 
-// newRunnerFull 构建执行器，可指定 miaospeed 路径与 GitHub 代理前缀。
+// NewRunnerFull 构建执行器，可指定 miaospeed 路径与 GitHub 代理前缀。
 func NewRunnerFull(binary, miaospeed, ghProxy string, allowPrivate bool, log Logger) *Runner {
 	r := &Runner{
 		binary:             binary,
@@ -589,7 +589,7 @@ func NewUpdater(cfg *config.Config, log Logger) *updater.Updater {
 	return newUpdater(cfg, log)
 }
 
-// handleUpdateCLI 处理 --check-update / --apply-update / --skip-update。
+// HandleUpdateCLI 处理 --check-update / --apply-update / --skip-update。
 func HandleUpdateCLI(cfg *config.Config, log Logger) (handled bool, err error) {
 	u := newUpdater(cfg, log)
 	exe, _ := os.Executable()
@@ -727,7 +727,7 @@ func (a *Agent) execute(ctx context.Context, job model.Job) {
 		defer a.tracker.Unregister(job.ID)
 	}
 
-	run := a.runner.run(taskCtx, job)
+	run := a.runner.Run(taskCtx, job)
 	output, errText, exitCode := run.Output, run.ErrText, run.ExitCode
 
 	res := model.Result{ID: job.ID, Kind: probe.ProbeKind(job), Output: output, ExitCode: exitCode, Error: errText, Data: run.Data}
@@ -1131,32 +1131,4 @@ func NewAgent(cfg *config.Config, log Logger, cli *client.Client, rnr *Runner, u
 		update:  upd,
 		tracker: trk,
 	}
-}
-
-func newRunner(binary string, log Logger) *Runner {
-	return NewRunner(binary, log)
-}
-
-func newRunnerWithMiaospeed(binary, miaospeed string, log Logger) *Runner {
-	return NewRunnerWithMiaospeed(binary, miaospeed, log)
-}
-
-func newRunnerFull(binary, miaospeed, ghProxy string, allowPrivate bool, log Logger) *Runner {
-	return NewRunnerFull(binary, miaospeed, ghProxy, allowPrivate, log)
-}
-
-func (r *Runner) run(ctx context.Context, job model.Job) runResult {
-	return r.Run(ctx, job)
-}
-
-func (r *Runner) setProgressReporter(fn func(model.Progress)) {
-	r.SetProgressReporter(fn)
-}
-
-func (a *Agent) loop(ctx context.Context) error {
-	return a.Loop(ctx)
-}
-
-func handleUpdateCLI(cfg *config.Config, log Logger) (handled bool, err error) {
-	return HandleUpdateCLI(cfg, log)
 }

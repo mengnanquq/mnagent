@@ -332,3 +332,27 @@ func TestClientWSQueueFullRejectsWithoutBlockingReadLoop(t *testing.T) {
 		t.Fatalf("wsJobs 应只保留 1 个任务，实际 %d", got)
 	}
 }
+
+// TestWSFallbackLogsWarn 验证机器人不支持 WebSocket 时会输出降级告警日志，
+// 方便用户排查“为什么一直在走 HTTP 长轮询”。
+func TestWSFallbackLogsWarn(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		http.NotFound(w, r)
+	}))
+	defer srv.Close()
+
+	cli := newWSClient(srv.URL)
+	var buf bytes.Buffer
+	prev := slog.Default()
+	slog.SetDefault(slog.New(slog.NewTextHandler(&buf, &slog.HandlerOptions{Level: slog.LevelDebug})))
+	defer slog.SetDefault(prev)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 200*time.Millisecond)
+	defer cancel()
+	cli.wsLoop(ctx)
+
+	out := buf.String()
+	if !strings.Contains(out, "降级") || !strings.Contains(out, "WebSocket") {
+		t.Fatalf("WS 降级应输出 Warn 日志，实际日志：%s", out)
+	}
+}

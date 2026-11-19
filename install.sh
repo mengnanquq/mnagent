@@ -166,7 +166,15 @@ while [ $# -gt 0 ]; do
 			--user)        RUN_USER="${2:-}"; shift 2;;
 			--prefix)      PREFIX="${2:-}"; shift 2;;
 			--uninstall)   UNINSTALL="yes"; shift;;
-			--auto-update)  AUTO_UPDATE="yes"; shift;;
+			--auto-update)
+				case "${2:-}" in
+					yes|true|1) AUTO_UPDATE="yes"; shift 2;;
+					no|false|0) AUTO_UPDATE="no"; shift 2;;
+					"") AUTO_UPDATE="yes"; shift;;
+					-*) AUTO_UPDATE="yes"; shift;;
+					*) die "参数 --auto-update 的取值无效：${2}（只支持 yes 或 no）";;
+				esac
+				;;
 			--no-auto-update) AUTO_UPDATE="no"; shift;;
 			--update-interval) UPDATE_INTERVAL="${2:-}"; shift 2;;
 			--install-nexttrace)

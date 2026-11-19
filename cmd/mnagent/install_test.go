@@ -557,3 +557,37 @@ func TestWindowsInstallScript(t *testing.T) {
 		t.Error("install.ps1 不应再用通配符取 miaospeed 压缩包内“第一个匹配”文件")
 	}
 }
+
+// TestInstallScriptAutoUpdateOptionalValue 验证 --auto-update [yes|no] 的解析与文档一致，
+// 并且非法取值会给出明确提示。
+func TestInstallScriptAutoUpdateOptionalValue(t *testing.T) {
+	script := string(readInstallScript(t))
+	for _, needle := range []string{"--auto-update)", "yes|true|1)", "no|false|0)", "--auto-update 的取值无效"} {
+		if !strings.Contains(script, needle) {
+			t.Errorf("install.sh 的 --auto-update 解析缺少 %q", needle)
+		}
+	}
+	if strings.Contains(script, `--auto-update)  AUTO_UPDATE="yes"; shift;;`) {
+		t.Error("install.sh 仍在使用不支持可选值的旧 --auto-update 解析")
+	}
+}
+
+// TestReleaseWorkflowRunsTestsOnlyInPrepare 验证 release.yml 只在 prepare 阶段跑一次
+// go test，避免每个构建 matrix 重复执行。
+func TestReleaseWorkflowRunsTestsOnlyInPrepare(t *testing.T) {
+	content, err := os.ReadFile(filepath.Join(findRepoRoot(), ".github", "workflows", "release.yml"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	workflow := string(content)
+	const testCmd = "go test ./..."
+	if got := strings.Count(workflow, testCmd); got != 1 {
+		t.Fatalf("release.yml 中 %q 出现 %d 次，期望只在 prepare 出现 1 次", testCmd, got)
+	}
+	prepareIdx := strings.Index(workflow, "\n  prepare:")
+	buildIdx := strings.Index(workflow, "\n  build:")
+	testIdx := strings.Index(workflow, testCmd)
+	if prepareIdx < 0 || buildIdx < 0 || testIdx < 0 || !(prepareIdx < testIdx && testIdx < buildIdx) {
+		t.Fatalf("go test 应位于 prepare 阶段（prepare=%d test=%d build=%d）", prepareIdx, testIdx, buildIdx)
+	}
+}
