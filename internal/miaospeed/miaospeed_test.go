@@ -19,6 +19,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 
@@ -1481,8 +1482,18 @@ func TestMultiNodePlanSkipsHijackAndIncludesFastIPScript(t *testing.T) {
 }
 
 // TestExecuteMiaospeedTaskPreservesPartialProgressOnTimeout 验证当多节点测速中途超时或断开时，已测完的节点结果不会丢失。
+// 用进度回调 + 通道同步代替固定 150ms 超时：确认收到前两条进度后马上断开连接，
+// 既模拟“第 3 个节点卡住”，又不会因机器快慢而少收一条进度。
 func TestExecuteMiaospeedTaskPreservesPartialProgressOnTimeout(t *testing.T) {
+	// 进度回调里会解析单节点报告并做 GeoIP 查询，换成不发外部请求的桩，
+	// 避免测试耗时被外部 GeoIP 接口左右。
+	stubGeoLookups(t)
+
 	token := "secret-token"
+	stop := make(chan struct{})
+	var stopOnce sync.Once
+	closeStop := func() { stopOnce.Do(func() { close(stop) }) }
+
 	handler := websocket.Handler(func(ws *websocket.Conn) {
 		var req slaveRequest
 		if err := websocket.JSON.Receive(ws, &req); err != nil {
@@ -1504,12 +1515,13 @@ func TestExecuteMiaospeedTaskPreservesPartialProgressOnTimeout(t *testing.T) {
 				},
 			})
 		}
-		// 模拟第 3 个节点卡住直到客户端上下文超时
-		time.Sleep(500 * time.Millisecond)
+		// 模拟第 3 个节点卡住：等客户端确认收到 2 条进度后再断链。
+		<-stop
 	})
 
 	server := httptest.NewServer(handler)
 	defer server.Close()
+	defer closeStop()
 
 	wsURL := "ws://" + server.Listener.Addr().String() + "/"
 	origin := "http://" + server.Listener.Addr().String() + "/"
@@ -1519,10 +1531,22 @@ func TestExecuteMiaospeedTaskPreservesPartialProgressOnTimeout(t *testing.T) {
 		{Name: "Node-3-Stuck", Protocol: "vless", Server: "3.3.3.3:443"},
 	}
 
-	ctx, cancel := context.WithTimeout(context.Background(), 150*time.Millisecond)
+	// 总超时只作为保护：真正触发断开的是第 2 条进度到达后的通道关闭。
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 
-	report, err := executeMiaospeedTask(ctx, wsURL, origin, token, nodes, 3, model.Job{ID: "partial-test"}, nil, nil)
+	var progressCount atomic.Int32
+	onProgress := func(model.Progress) {
+		// 第 2 条进度到达后立刻取消任务（等价于原用例的 150ms 到期），
+		// 同时断开连接：既不依赖固定时长，也不会走到真实 GeoIP 外部查询。
+		if progressCount.Add(1) == 2 {
+			cancel()
+			closeStop()
+		}
+	}
+
+	report, err := executeMiaospeedTask(ctx, wsURL, origin, token, nodes, 3, model.Job{ID: "partial-test"}, nil, onProgress)
+	closeStop()
 	if err != nil {
 		t.Fatalf("期望在有已完成节点进度时返回部分结果而非报错丢弃，实际 err=%v", err)
 	}
