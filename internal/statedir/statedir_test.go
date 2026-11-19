@@ -1,12 +1,27 @@
 package statedir
 
 import (
+	"bytes"
 	"os"
 	"path/filepath"
 	"runtime"
 	"strings"
 	"testing"
 )
+
+// TestWarnfWritesToWarnWriter 验证属主校验等告警能被运维看见（默认输出到 stderr）。
+func TestWarnfWritesToWarnWriter(t *testing.T) {
+	var buf bytes.Buffer
+	old := warnWriter
+	warnWriter = &buf
+	defer func() { warnWriter = old }()
+
+	warnf("状态目录属主校验失败：%s", "bad owner")
+	got := buf.String()
+	if !strings.Contains(got, "WARN [statedir] 状态目录属主校验失败：bad owner") {
+		t.Fatalf("告警内容异常：%q", got)
+	}
+}
 
 func TestEnsurePrivateRejectsUnsafeDirs(t *testing.T) {
 	base := t.TempDir()

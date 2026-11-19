@@ -5,10 +5,23 @@ package statedir
 import (
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"runtime"
 )
+
+// warnWriter 是状态目录告警的输出目标，默认为 stderr；测试可替换以断言告警内容。
+var warnWriter io.Writer = os.Stderr
+
+// warnf 输出一条带 WARN 前缀的告警。状态目录被拒绝时仍会退回下一个候选目录，
+// 但用户需要知道发生了什么以及如何修复，否则会困惑于「跳过版本记录失效」。
+func warnf(format string, args ...any) {
+	if warnWriter == nil {
+		return
+	}
+	fmt.Fprintf(warnWriter, "WARN [statedir] "+format+"\n", args...)
+}
 
 // candidates 返回按优先级排列的候选目录：系统级目录优先，非特权运行时退回当前用户的缓存目录。
 func candidates() []string {
@@ -67,6 +80,13 @@ func ensurePrivate(dir string) error {
 		return fmt.Errorf("%s 允许其他用户写入，拒绝使用", dir)
 	}
 	if err := checkDirOwner(dir, fi); err != nil {
+		// 属主异常通常来自手工拷贝/迁移目录：直接给出可执行的修复命令，
+		// 同时仍然拒绝使用该目录（退回下一个候选目录）。
+		if runtime.GOOS == "windows" {
+			warnf("状态目录属主校验失败：%v", err)
+		} else {
+			warnf("状态目录属主校验失败：%v；修复后可执行 chown root:root %q 并重启服务", err, dir)
+		}
 		return err
 	}
 	// 确认当前进程确实能在其中写文件

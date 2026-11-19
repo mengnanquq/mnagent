@@ -135,4 +135,5 @@ mnagent -apply-update latest         # 立即升级到最新版本并平滑重�
 - **报错 `无法启动 nexttrace/miaospeed`**：运行 `mnagent -apply-update latest` 触发依赖自动补全下载；网络受限环境请配置 `-gh-proxy`。
 - **Ping 探针报套接字权限不足**：systemd 需配置 `AmbientCapabilities=CAP_NET_RAW CAP_NET_ADMIN`（重新执行安装脚本会自动修复）；OpenWrt 需以 root 运行。
 - **提示 `目标地址属于受限私有/元数据地址`**：默认防御 SSRF 拦截了局域网或云元数据地址；自建内网探测需添加 `-allow-private-probes`。
+- **日志提示 `状态目录属主校验失败`**：状态目录（Linux 默认为 `/var/lib/mnagent`）被改成其他用户所有，Agent 会拒绝使用它并退回当前用户的缓存目录（此时跳过版本记录等状态会丢失）。执行 `sudo chown root:root /var/lib/mnagent` 后重启服务即可修复；该目录还要求权限不含组/其他用户的写位（`chmod 755` 或 `700` 均可）。
 - **更新后无法启动**：Linux / OpenWrt 上每次替换都会把上一版本保留为 `<二进制路径>.prev`（Windows 为 `.old`，启动时自动清理），可手工 `mv` 回去并重启服务；服务端远程升级只接受更高版本，如需回滚请使用本地 `-apply-update <tag>`。
