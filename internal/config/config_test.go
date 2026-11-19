@@ -4,6 +4,7 @@ import (
 	"log/slog"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 )
 
@@ -168,5 +169,47 @@ func TestParseConfigAllowRemoteDowngrade(t *testing.T) {
 	}
 	if !cfg.AllowRemoteDowngrade {
 		t.Fatal("-allow-remote-downgrade 应开启远程降级")
+	}
+}
+
+// TestParseConfigRejectsInsecureHTTPAndUnsafeChars 验证 -bot 的明文 HTTP 策略与严格字符校验。
+func TestParseConfigRejectsInsecureHTTPAndUnsafeChars(t *testing.T) {
+	base := []string{"-token", "t", "-nexttrace", "/bin/echo"}
+
+	// 明文 HTTP 连接公网地址默认拒绝；显式开关后允许并打印警告。
+	if _, err := ParseConfig(append([]string{"-bot", "http://bot.example.com/agent"}, base...), "dev"); err == nil || !strings.Contains(err.Error(), "allow-insecure-http") {
+		t.Fatalf("公网明文 HTTP 应被拒绝并提示开关，实际: %v", err)
+	}
+	if _, err := ParseConfig(append([]string{"-bot", "http://bot.example.com/agent", "-allow-insecure-http"}, base...), "dev"); err != nil {
+		t.Fatalf("显式 -allow-insecure-http 后应允许: %v", err)
+	}
+
+	// 回环与内网地址使用明文 HTTP 始终允许。
+	for _, endpoint := range []string{
+		"http://127.0.0.1:8080/agent",
+		"http://[::1]:8080/agent",
+		"http://localhost:8080/agent",
+		"http://192.168.1.10:8080/agent",
+		"http://10.0.0.5/agent",
+	} {
+		if _, err := ParseConfig(append([]string{"-bot", endpoint}, base...), "dev"); err != nil {
+			t.Errorf("回环/内网明文 HTTP 应允许 %q: %v", endpoint, err)
+		}
+	}
+
+	// 空白、换行、引号、反斜杠、反引号与控制字符一律拒绝（即使是 HTTPS）。
+	for _, endpoint := range []string{
+		"https://bot.example.com/agent path",
+		"https://bot.example.com/agent\n",
+		"https://bot.example.com/a\"b",
+		"https://bot.example.com/a'b",
+		"https://bot.example.com/a`b",
+		"https://bot.example.com/a\\b",
+		"https://bot.example.com/a\x01b",
+		"https://bot.example.com/a\tb",
+	} {
+		if _, err := ParseConfig(append([]string{"-bot", endpoint}, base...), "dev"); err == nil {
+			t.Errorf("非法 -bot 应被拒绝: %q", endpoint)
+		}
 	}
 }

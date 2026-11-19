@@ -5,12 +5,14 @@ import (
 	"flag"
 	"fmt"
 	"log/slog"
+	"net"
 	"net/url"
 	"os"
 	"path/filepath"
 	"runtime"
 	"strings"
 	"time"
+	"unicode"
 
 	"github.com/mengnanquq/mnagent/internal/dep"
 	"github.com/mengnanquq/mnagent/internal/updater"
@@ -51,6 +53,9 @@ type Config struct {
 	// AllowRemoteDowngrade 允许服务端下发的升级指令把 agent 降级到旧版本。
 	// 默认只接受严格高于当前版本的目标；本地 -apply-update 不受此限制。
 	AllowRemoteDowngrade bool
+
+	// AllowInsecureHTTP 允许 -bot 使用明文 HTTP 连接公网地址（默认仅允许回环/内网）。
+	AllowInsecureHTTP bool
 }
 
 // DefaultTokenFile 根据操作系统平台返回默认的令牌文件路径。
@@ -174,6 +179,7 @@ func ParseConfig(args []string, version string) (*Config, error) {
 		probeKind    = fs.String("probe-kind", "ping", "本地探针类型：ping / tcping / trace / http / dns")
 		allowPrivate = fs.Bool("allow-private-probes", false, "允许探测内网私有地址与链路本地地址（默认禁止，防范 SSRF/云元数据盗取）")
 		allowDown    = fs.Bool("allow-remote-downgrade", false, "允许服务端远程下发降级到旧版本（默认只接受更高版本；本地 -apply-update 不受限）")
+		allowHTTP    = fs.Bool("allow-insecure-http", false, "允许 -bot 使用明文 HTTP 连接公网地址（默认仅允许回环/内网，明文传输令牌有被窃听风险）")
 	)
 	if err := fs.Parse(args); err != nil {
 		return nil, err
@@ -185,14 +191,13 @@ func ParseConfig(args []string, version string) (*Config, error) {
 
 	isUpdateCLI := *checkUpd || strings.TrimSpace(*applyUpd) != "" || strings.TrimSpace(*skipUpd) != "" || strings.TrimSpace(*diagJob) != "" || *runDiag || strings.TrimSpace(*probeTarget) != ""
 
-	endpoint := strings.TrimRight(strings.TrimSpace(*botURL), "/")
+	endpoint := strings.TrimRight(*botURL, "/")
 	if endpoint == "" && !isUpdateCLI {
 		return nil, errors.New("必须指定 -bot（例如 https://mnbot.example.org/agent）")
 	}
 	if endpoint != "" {
-		parsed, err := url.Parse(endpoint)
-		if err != nil || (parsed.Scheme != "http" && parsed.Scheme != "https") || parsed.Host == "" {
-			return nil, fmt.Errorf("-bot 必须是完整的 http(s) 地址，收到 %q", *botURL)
+		if err := validateBotEndpoint(endpoint, *allowHTTP); err != nil {
+			return nil, err
 		}
 	}
 	if *minBackoff <= 0 || *maxBackoff < *minBackoff {
@@ -268,5 +273,41 @@ func ParseConfig(args []string, version string) (*Config, error) {
 		ProbeKind:            strings.ToLower(strings.TrimSpace(*probeKind)),
 		AllowPrivateProbes:   *allowPrivate,
 		AllowRemoteDowngrade: *allowDown,
+		AllowInsecureHTTP:    *allowHTTP,
 	}, nil
+}
+
+// validateBotEndpoint 严格校验 -bot：禁止空白、换行、引号、反斜杠与控制字符，
+// 避免这些字符被原样写进服务单元/命令行；同时默认拒绝用明文 HTTP 连接公网地址
+// （令牌与探测结果会明文暴露），仅回环/内网 IP 与 localhost 例外。
+func validateBotEndpoint(raw string, allowInsecureHTTP bool) error {
+	for _, r := range raw {
+		if unicode.IsSpace(r) || unicode.IsControl(r) || r == '\\' || r == '"' || r == '\'' || r == '`' {
+			return fmt.Errorf("-bot 含有非法字符 %q：地址中不允许空白、换行、引号、反斜杠或控制字符", r)
+		}
+	}
+	parsed, err := url.Parse(raw)
+	if err != nil || (parsed.Scheme != "http" && parsed.Scheme != "https") || parsed.Host == "" || parsed.Hostname() == "" {
+		return fmt.Errorf("-bot 必须是完整的 http(s) 地址，收到 %q", raw)
+	}
+	if parsed.Scheme == "http" && !isLocalHTTPHost(parsed.Hostname()) {
+		if !allowInsecureHTTP {
+			return fmt.Errorf("-bot 使用明文 HTTP 连接非回环/内网地址 %q 会被拒绝（令牌与任务内容可能被窃听）；确需使用请显式加 -allow-insecure-http", parsed.Host)
+		}
+		fmt.Fprintf(os.Stderr, "警告：-bot 使用明文 HTTP 连接 %s，令牌与任务内容可能被窃听，请仅在可信网络使用\n", parsed.Host)
+	}
+	return nil
+}
+
+// isLocalHTTPHost 判断明文 HTTP 的目标是否为回环/内网地址（含 localhost）。
+func isLocalHTTPHost(host string) bool {
+	host = strings.ToLower(strings.Trim(host, "[]"))
+	if host == "localhost" || strings.HasSuffix(host, ".localhost") {
+		return true
+	}
+	ip := net.ParseIP(host)
+	if ip == nil {
+		return false
+	}
+	return ip.IsLoopback() || ip.IsPrivate() || ip.IsLinkLocalUnicast()
 }
