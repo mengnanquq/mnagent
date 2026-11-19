@@ -213,3 +213,18 @@ func TestParseConfigRejectsInsecureHTTPAndUnsafeChars(t *testing.T) {
 		}
 	}
 }
+
+// TestParseConfigValidatesProbeKind 验证本地探针类型在参数解析阶段就会校验。
+func TestParseConfigValidatesProbeKind(t *testing.T) {
+	args := []string{"-probe-target", "example.com", "-probe-kind", "nope"}
+	if _, err := ParseConfig(args, "dev"); err == nil {
+		t.Fatal("非法 -probe-kind 应在解析阶段报错")
+	}
+	cfg, err := ParseConfig([]string{"-probe-target", "example.com", "-probe-kind", "dns"}, "dev")
+	if err != nil {
+		t.Fatalf("合法 -probe-kind 不应报错: %v", err)
+	}
+	if cfg.ProbeKind != "dns" {
+		t.Fatalf("ProbeKind = %q，期望 dns", cfg.ProbeKind)
+	}
+}

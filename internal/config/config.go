@@ -215,6 +215,13 @@ func ParseConfig(args []string, version string) (*Config, error) {
 	if *resultWait <= time.Second {
 		return nil, errors.New("-result-timeout 应大于 1 秒")
 	}
+	if strings.TrimSpace(*probeTarget) != "" {
+		switch strings.ToLower(strings.TrimSpace(*probeKind)) {
+		case "", "ping", "tcping", "trace", "http", "dns":
+		default:
+			return nil, fmt.Errorf("-probe-kind 取值非法：%q（可选：ping / tcping / trace / http / dns）", *probeKind)
+		}
+	}
 
 	var tokens *TokenSource
 	if !isUpdateCLI {

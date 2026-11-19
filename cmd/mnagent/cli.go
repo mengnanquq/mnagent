@@ -166,25 +166,71 @@ func handleDiagCLI(cfg *config.Config, log *slog.Logger) error {
 	return nil
 }
 
+// normalizeLocalProbeKind 归一化本地 -probe-kind，空值默认 ping。
+func normalizeLocalProbeKind(kind string) string {
+	kind = strings.ToLower(strings.TrimSpace(kind))
+	if kind == "" {
+		return "ping"
+	}
+	return kind
+}
+
+// validateLocalProbeKind 校验本地探针类型，避免把拼写错误静默当成 trace 执行。
+func validateLocalProbeKind(kind string) error {
+	switch kind {
+	case "ping", "tcping", "trace", "http", "dns":
+		return nil
+	default:
+		return fmt.Errorf("不支持的 -probe-kind：%q（可选：ping / tcping / trace / http / dns）", kind)
+	}
+}
+
+// normalizeProbeTarget 对 http 探针自动补全 https://：用户本地手敲 example.com 时
+// 不应该只因为缺少 scheme 就报错。
+func normalizeProbeTarget(kind, target string) string {
+	target = strings.TrimSpace(target)
+	if kind == "http" && target != "" && !strings.Contains(target, "://") {
+		return "https://" + target
+	}
+	return target
+}
+
+// localProbeQuery 返回探针默认查询参数；DNS 探针必须使用合法的记录类型。
+func localProbeQuery(kind string) string {
+	if kind == "dns" {
+		return "A"
+	}
+	return "full"
+}
+
+// buildLocalProbeJob 根据 CLI 参数构造本地探针任务。
+func buildLocalProbeJob(cfg *config.Config) (model.Job, error) {
+	kind := normalizeLocalProbeKind(cfg.ProbeKind)
+	if err := validateLocalProbeKind(kind); err != nil {
+		return model.Job{}, err
+	}
+	return model.Job{
+		ID:        "cli-probe",
+		Kind:      kind,
+		Target:    normalizeProbeTarget(kind, cfg.ProbeTarget),
+		Query:     localProbeQuery(kind),
+		TimeoutMS: 30000,
+	}, nil
+}
+
 // handleProbeCLI 本地执行探针任务，直接在终端打印结构化诊断结果。
 func handleProbeCLI(ctx context.Context, cfg *config.Config, log *slog.Logger) error {
 	rnr := runner.NewRunnerFull(cfg.Binary, cfg.MiaospeedBinary, cfg.GHProxy, cfg.AllowPrivateProbes, log)
-	kind := cfg.ProbeKind
-	if kind == "" {
-		kind = "ping"
+	job, err := buildLocalProbeJob(cfg)
+	if err != nil {
+		return err
 	}
 
 	fmt.Println("================================================================")
-	fmt.Printf("  ⚡ mnagent 本地网络探针执行: [%s] -> %s\n", strings.ToUpper(kind), cfg.ProbeTarget)
+	fmt.Printf("  ⚡ mnagent 本地网络探针执行: [%s] -> %s\n", strings.ToUpper(job.Kind), job.Target)
 	fmt.Println("================================================================")
 
-	res := rnr.Run(ctx, model.Job{
-		ID:        "cli-probe",
-		Kind:      kind,
-		Target:    cfg.ProbeTarget,
-		Query:     "full",
-		TimeoutMS: 30000,
-	})
+	res := rnr.Run(ctx, job)
 
 	if res.ExitCode != 0 {
 		fmt.Printf("  ❌ 执行失败 (Exit Code %d)\n", res.ExitCode)
