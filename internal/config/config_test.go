@@ -113,10 +113,16 @@ func TestParseConfig(t *testing.T) {
 	if _, err := ParseConfig([]string{"-bot", "https://x/agent", "-token", "t", "-nexttrace", "/nonexistent/nexttrace"}, "dev"); err == nil {
 		t.Fatal("找不到的 nexttrace 应报错")
 	}
+	if _, err := ParseConfig([]string{"-bot", "https://x/agent", "-token", "t", "-nexttrace", "/bin/echo", "-result-timeout", "1s"}, "dev"); err == nil {
+		t.Fatal("过短的 -result-timeout 应报错")
+	}
 
 	cfg, err := ParseConfig([]string{"-bot", "https://x/agent/", "-token", "t", "-nexttrace", "/bin/echo"}, "dev")
 	if err != nil {
 		t.Fatal(err)
+	}
+	if cfg.ResultTimeout != DefaultResultTimeout {
+		t.Fatalf("默认结果回传超时 = %s，期望 %s", cfg.ResultTimeout, DefaultResultTimeout)
 	}
 	if cfg.BotURL != "https://x/agent" {
 		t.Fatalf("BotURL 未去除末尾斜杠: %q", cfg.BotURL)

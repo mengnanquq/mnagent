@@ -146,6 +146,6 @@ func runWithContext(ctx context.Context, args []string) error {
 		"version", version, "bot", cfg.BotURL,
 		"nexttrace", cfg.Binary, "miaospeed", cfg.MiaospeedBinary,
 		"token_from", tokenFrom,
-		"poll_timeout", cfg.PollTimeout, "auto_update", cfg.AutoUpdate)
+		"poll_timeout", cfg.PollTimeout, "result_timeout", cfg.ResultTimeout, "auto_update", cfg.AutoUpdate)
 	return agent.Loop(ctx)
 }

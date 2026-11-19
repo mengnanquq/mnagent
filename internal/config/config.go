@@ -18,9 +18,10 @@ import (
 
 // 默认参数。
 const (
-	DefaultMinBackoff = time.Second
-	DefaultMaxBackoff = time.Minute
-	DefaultPollWait   = 40 * time.Second // 机器人侧长轮询最多保持 20 秒。
+	DefaultMinBackoff    = time.Second
+	DefaultMaxBackoff    = time.Minute
+	DefaultPollWait      = 40 * time.Second // 机器人侧长轮询最多保持 20 秒。
+	DefaultResultTimeout = 5 * time.Minute  // /results 上传可能很大（16MB），慢速网络下需要更长时限。
 )
 
 // Config 是进程启动参数解析后的运行配置。
@@ -32,6 +33,7 @@ type Config struct {
 	MinBackoff      time.Duration
 	MaxBackoff      time.Duration
 	PollTimeout     time.Duration
+	ResultTimeout   time.Duration
 	LogLevel        slog.Level
 
 	AutoUpdate         bool
@@ -157,6 +159,7 @@ func ParseConfig(args []string, version string) (*Config, error) {
 		minBackoff   = fs.Duration("min-backoff", DefaultMinBackoff, "轮询失败后的最小重试间隔")
 		maxBackoff   = fs.Duration("max-backoff", DefaultMaxBackoff, "轮询失败后的最大重试间隔")
 		pollWait     = fs.Duration("poll-timeout", DefaultPollWait, "单次长轮询的客户端超时")
+		resultWait   = fs.Duration("result-timeout", DefaultResultTimeout, "单次结果回传（含大体积 /results 上传）的客户端超时")
 		autoUpdate   = fs.Bool("auto-update", false, "自动更新：定期检查 GitHub Releases，有新版本时下载并重启服务")
 		updateIntv   = fs.Duration("update-interval", updater.DefaultInterval, "自动更新检查间隔")
 		checkUpd     = fs.Bool("check-update", false, "检查一次更新后退出（不下载）")
@@ -197,6 +200,9 @@ func ParseConfig(args []string, version string) (*Config, error) {
 	}
 	if *pollWait <= time.Second {
 		return nil, errors.New("-poll-timeout 应大于 1 秒")
+	}
+	if *resultWait <= time.Second {
+		return nil, errors.New("-result-timeout 应大于 1 秒")
 	}
 
 	var tokens *TokenSource
@@ -248,6 +254,7 @@ func ParseConfig(args []string, version string) (*Config, error) {
 		MinBackoff:           *minBackoff,
 		MaxBackoff:           *maxBackoff,
 		PollTimeout:          *pollWait,
+		ResultTimeout:        *resultWait,
 		LogLevel:             ParseLogLevel(*logLevel),
 		AutoUpdate:           *autoUpdate,
 		UpdateInterval:       *updateIntv,

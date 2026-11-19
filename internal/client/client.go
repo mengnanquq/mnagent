@@ -35,6 +35,9 @@ type Client struct {
 	host    string
 	tokens  *config.TokenSource
 	http    *http.Client
+	// results 使用独立客户端：/results 可能上传 16MB，慢速网络下不能沿用长轮询的短超时。
+	resultsHTTP   *http.Client
+	resultTimeout time.Duration
 
 	paused atomic.Bool // 更新期间暂停轮询，避免新旧版本交替领取任务。
 
@@ -64,6 +67,10 @@ func New(cfg *config.Config) *Client {
 		TLSHandshakeTimeout:   10 * time.Second,
 		ExpectContinueTimeout: 1 * time.Second,
 	}
+	resultTimeout := cfg.ResultTimeout
+	if resultTimeout <= 0 {
+		resultTimeout = config.DefaultResultTimeout
+	}
 	return &Client{
 		baseURL: cfg.BotURL,
 		tokens:  cfg.Tokens,
@@ -71,9 +78,14 @@ func New(cfg *config.Config) *Client {
 			Transport: transport,
 			Timeout:   cfg.PollTimeout,
 		},
-		wsDisabled: wsDisabledByEnv(),
-		wsHTTP:     newWSHTTPClient(),
-		wsJobs:     make(chan *model.Job, 64),
+		resultsHTTP: &http.Client{
+			Transport: transport,
+			Timeout:   resultTimeout,
+		},
+		resultTimeout: resultTimeout,
+		wsDisabled:    wsDisabledByEnv(),
+		wsHTTP:        newWSHTTPClient(),
+		wsJobs:        make(chan *model.Job, 64),
 	}
 }
 
@@ -159,14 +171,18 @@ func (c *Client) SendResult(ctx context.Context, res model.Result) error {
 			case <-time.After(time.Duration(attempt-1) * time.Second):
 			}
 		}
-		resp, err := c.do(ctx, http.MethodPost, "/results", payload)
+		// 每次上传单独限时：结果体可达 16MB，慢速网络需要远长于长轮询的时限。
+		attemptCtx, cancel := context.WithTimeout(ctx, c.resultTimeout)
+		resp, err := c.doWith(c.resultsHTTP, attemptCtx, http.MethodPost, "/results", payload)
 		if err != nil {
+			cancel()
 			lastErr = err
 			continue
 		}
 		status := resp.StatusCode
 		snippet := readSnippet(resp.Body)
 		resp.Body.Close()
+		cancel()
 		if status == http.StatusNoContent || status == http.StatusOK {
 			return nil
 		}
@@ -238,8 +254,13 @@ func (c *Client) heartbeat(ctx context.Context) error {
 	return c.Heartbeat(ctx)
 }
 
-// do 发送一次带鉴权头的请求。
+// do 发送一次带鉴权头的请求（长轮询等短请求共用默认客户端）。
 func (c *Client) do(ctx context.Context, method, path string, body []byte) (*http.Response, error) {
+	return c.doWith(c.http, ctx, method, path, body)
+}
+
+// doWith 使用指定 HTTP 客户端发送一次带鉴权头的请求。
+func (c *Client) doWith(cli *http.Client, ctx context.Context, method, path string, body []byte) (*http.Response, error) {
 	token, err := c.tokens.Get()
 	if err != nil {
 		return nil, err
@@ -259,7 +280,7 @@ func (c *Client) do(ctx context.Context, method, path string, body []byte) (*htt
 	if body != nil {
 		req.Header.Set("Content-Type", "application/json")
 	}
-	return c.http.Do(req)
+	return cli.Do(req)
 }
 
 // readSnippet 读取响应片段用于错误提示（不打印可能很长的正文）。

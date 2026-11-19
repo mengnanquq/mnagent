@@ -115,6 +115,27 @@ func TestClientPollUnauthorized(t *testing.T) {
 	}
 }
 
+// TestClientSendResultUsesLongTimeout 验证 /results 使用独立的长超时：
+// 即使 PollTimeout 很短（大结果上传在慢速网络下会超过它），回传仍应成功。
+func TestClientSendResultUsesLongTimeout(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/results" {
+			t.Errorf("请求路径不符: %s", r.URL.Path)
+		}
+		time.Sleep(250 * time.Millisecond)
+		w.WriteHeader(http.StatusNoContent)
+	}))
+	defer srv.Close()
+
+	cfg := testConfig(srv.URL, nil)
+	cfg.PollTimeout = 50 * time.Millisecond
+	cfg.ResultTimeout = 2 * time.Second
+	c := New(cfg)
+	if err := c.SendResult(context.Background(), model.Result{ID: "big", Kind: "miaospeed", ExitCode: 0}); err != nil {
+		t.Fatalf("大结果回传不应受长轮询超时（%s）限制: %v", cfg.PollTimeout, err)
+	}
+}
+
 // TestClientSendResultRetries 验证回传失败会退避重试。
 func TestClientSendResultRetries(t *testing.T) {
 	var calls atomic.Int64

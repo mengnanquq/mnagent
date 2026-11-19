@@ -682,7 +682,11 @@ func (a *Agent) execute(ctx context.Context, job model.Job) {
 
 	// 回传不依赖任务上下文：即使任务超时或进程正在退出，也尽量让机器人拿到结果，
 	// 否则用户要一直等到超时。
-	sendCtx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	resultTimeout := config.DefaultResultTimeout
+	if a.cfg != nil && a.cfg.ResultTimeout > 0 {
+		resultTimeout = a.cfg.ResultTimeout
+	}
+	sendCtx, cancel := context.WithTimeout(context.Background(), resultTimeout)
 	defer cancel()
 	res := model.Result{ID: job.ID, Kind: probe.ProbeKind(job), Output: output, ExitCode: exitCode, Error: errText, Data: run.Data}
 	if err := a.client.SendResult(sendCtx, res); err != nil {
@@ -854,7 +858,11 @@ func (a *Agent) handleUpgradeJob(ctx context.Context, job model.Job) {
 }
 
 func (a *Agent) sendUpgradeResult(job model.Job, exitCode int, output, errText string) {
-	sendCtx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	resultTimeout := config.DefaultResultTimeout
+	if a.cfg != nil && a.cfg.ResultTimeout > 0 {
+		resultTimeout = a.cfg.ResultTimeout
+	}
+	sendCtx, cancel := context.WithTimeout(context.Background(), resultTimeout)
 	defer cancel()
 	res := model.Result{
 		ID:       job.ID,

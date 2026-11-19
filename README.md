@@ -92,6 +92,7 @@ mnagent -apply-update latest         # 立即升级到最新版本并平滑重�
 | **`-token-file <path>`** | 平台默认路径 | 令牌持久化文件；动态读取，**线上轮换令牌无需重启服务** |
 | **`-auto-update`** | `false` | 是否开启后台定时自动检查并升级（一键脚本安装默认开启） |
 | **`-gh-proxy <url>`** | — | GitHub 代理加速前缀（支持环境变量 `GH_PROXY`） |
+| **`-result-timeout`** | `5m` | 单次结果回传（含大体积 `/results` 上传）的客户端超时 |
 | **`-allow-private-probes`** | `false` | 放行对内网私有网段与云元数据地址的探测（默认严格拦截） |
 | **`-allow-remote-downgrade`** | `false` | 允许服务端远程指令把 Agent 降级到旧版本（默认只接受高于当前版本的目标；本地 `-apply-update` 不受限） |
 | **`-log-level`** | `info` | 日志级别：`debug` / `info` / `warn` / `error` |
