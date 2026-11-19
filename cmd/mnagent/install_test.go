@@ -115,7 +115,7 @@ func TestInstallScriptSyntax(t *testing.T) {
 	if err != nil {
 		t.Fatalf("--help 执行失败: %v\n%s", err, out)
 	}
-	for _, want := range []string{"--bot", "--token", "--uninstall", "OpenWrt", "--miaospeed", "--miaospeed-version", "--sha256", "--from-source"} {
+	for _, want := range []string{"--bot", "--token", "--token-file", "--token-stdin", "--uninstall", "OpenWrt", "--miaospeed", "--miaospeed-version", "--sha256", "--from-source"} {
 		if !strings.Contains(string(out), want) {
 			t.Fatalf("--help 未提及 %s: %s", want, out)
 		}
@@ -130,7 +130,7 @@ func TestInstallScriptSupportsOpenWrt(t *testing.T) {
 		{"procd 服务标记", "USE_PROCD=1"},
 		{"procd 实例定义", "procd_open_instance"},
 		{"procd 命令行参数", "procd_set_param command"},
-		{"procd 传递 miaospeed 参数", "-miaospeed $MIAOSPEED_EXEC"},
+		{"procd 传递 miaospeed 参数", `-miaospeed "$MIAOSPEED_EXEC"`},
 		{"procd 环境注入 PATH 补齐 /usr/local/bin", `procd_set_param env PATH="/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"`},
 		{"procd 崩溃自动重启", "procd_set_param respawn"},
 		{"procd 日志进 syslog", "procd_set_param stdout 1"},
@@ -197,11 +197,16 @@ func TestInstallScriptKeepsKeySafeguards(t *testing.T) {
 		{"OpenWrt 优先 opkg 安装 nexttrace", "opkg install nexttrace"},
 		{"自动安装 miaospeed 来源", "AirportR/miaospeed"},
 		{"自动安装 miaospeed 继承 gh-proxy", `apply_gh_proxy "$url"`},
-		{"systemd 传递 miaospeed 参数", "-miaospeed $MIAOSPEED_EXEC"},
+		{"systemd 传递 miaospeed 参数", `-miaospeed "$MIAOSPEED_EXEC"`},
 		{"GitHub 代理参数解析", "--gh-proxy"},
 		{"GitHub 代理函数定义", "apply_gh_proxy"},
-		{"服务参数继承代理", `AUTO_UPDATE_ARGS="$AUTO_UPDATE_ARGS -gh-proxy $GH_PROXY"`},
+		{"服务参数继承代理", `AUTO_UPDATE_ARGS="$AUTO_UPDATE_ARGS -gh-proxy \"$GH_PROXY\""`},
 		{"下载文件时显示进度条", "curl -#"},
+		{"严格校验 --bot URL", `validate_url_safe "$BOT_URL" "--bot"`},
+		{"严格校验 --gh-proxy URL", `validate_url_safe "$GH_PROXY" "--gh-proxy"`},
+		{"支持环境变量令牌", `TOKEN="$MNAGENT_TOKEN"`},
+		{"支持从 stdin 读取令牌", "--token-stdin"},
+		{"systemd 单元为参数加引号", `ExecStart="$PREFIX/mnagent" -bot "$BOT_URL"`},
 		{"systemd 默认以 root 运行", `[ -n "$RUN_USER" ] || RUN_USER="root"`},
 	} {
 		if !containsActiveLine(script, want.needle) {
@@ -302,6 +307,9 @@ func TestWindowsInstallScript(t *testing.T) {
 		{"参数定义 -Bot", "[string]$Bot"},
 		{"参数定义 -Token", "[string]$Token"},
 		{"参数定义 -TokenFile", "[string]$TokenFile"},
+		{"严格校验 -Bot URL", "Assert-UrlSafe $Bot"},
+		{"严格校验 -GhProxy URL", "Assert-UrlSafe $GhProxy"},
+		{"支持环境变量令牌", "$env:MNAGENT_TOKEN"},
 		{"参数定义 -Uninstall", "[switch]$Uninstall"},
 	}
 

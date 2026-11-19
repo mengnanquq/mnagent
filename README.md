@@ -30,16 +30,18 @@ Agent 通过 HTTPS **主动长轮询**接收服务端下发的网络探测与节
 
 ### Linux / OpenWrt / macOS
 ```sh
-(curl -fsSL https://raw.githubusercontent.com/mengnanquq/mnagent/main/install.sh \
-  || wget -qO- https://raw.githubusercontent.com/mengnanquq/mnagent/main/install.sh) \
-  | sh -s -- --bot https://<服务端地址>/agent --token <令牌>
+(curl -fsSL https://github.com/mengnanquq/mnagent/releases/download/v0.3.101/install.sh \
+  || wget -qO- https://github.com/mengnanquq/mnagent/releases/download/v0.3.101/install.sh) \
+  | sh -s -- --bot https://<服务端地址>/agent --token-file /etc/mnagent/token
 ```
 
 ### Windows (以管理员身份打开 PowerShell)
 ```powershell
-& ([scriptblock]::Create((irm https://raw.githubusercontent.com/mengnanquq/mnagent/main/install.ps1))) -Bot "https://<服务端地址>/agent" -Token "<令牌>"
+& ([scriptblock]::Create((irm https://github.com/mengnanquq/mnagent/releases/download/v0.3.101/install.ps1))) -Bot "https://<服务端地址>/agent" -TokenFile "C:\ProgramData\mnagent\token"
 ```
 
+> 安装脚本随每个 Release 作为附件发布；请把上面的 `v0.3.101` 换成要安装的 release tag。为避免令牌出现在进程 argv 与命令历史中，推荐 `--token-file`（Linux）或 `-TokenFile`（Windows），也支持环境变量 `MNAGENT_TOKEN` 与 Linux 下的 `--token-stdin`。`--token` 仅为兼容旧命令保留，使用时会打印警告。
+>
 > **网络受限 / 国内加速**：
 > 在安装参数中附加 `--gh-proxy https://gh-proxy.com/`（Windows 添加 `-GhProxy "https://gh-proxy.com/"`），脚本自身、Agent 更新以及依赖下载均会自动经由加速代理。
 >

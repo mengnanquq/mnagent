@@ -39,6 +39,23 @@ param(
 
 $ErrorActionPreference = "Stop"
 
+# 严格校验会写入服务 ImagePath 的 URL：只允许 URL 安全字符，拒绝空白、换行、引号、
+# 反斜杠、%、$、反引号与控制字符，避免命令/参数注入。
+function Assert-UrlSafe([string]$value, [string]$name) {
+    if ([string]::IsNullOrWhiteSpace($value)) {
+        throw "$name 不能为空"
+    }
+    if ($value -match '[\s"''\\%$`]') {
+        throw "$name 含不允许的字符（禁止空白、换行、引号、反斜杠、%、`$、反引号）: $value"
+    }
+    if ($value.IndexOfAny([char[]](0..31) + [char]127) -ge 0) {
+        throw "$name 含控制字符: $value"
+    }
+    if ($value -notmatch '^[A-Za-z0-9._~:/?#\[\]@!&()*+,;=-]+$') {
+        throw "$name 含 URL 安全字符之外的字符: $value"
+    }
+}
+
 # 默认安装路径确定（优先真正的 64 位 Program Files 目录）
 $programFilesDir = ${env:ProgramW6432}
 if (-not $programFilesDir) { $programFilesDir = $env:ProgramFiles }
@@ -152,11 +169,19 @@ if (-not ($Bot -match '^https?://.+')) {
     Write-Error "错误：-Bot 必须是合法的 http/https 地址，收到: $Bot"
     exit 1
 }
+Assert-UrlSafe $Bot "-Bot"
+if (-not [string]::IsNullOrWhiteSpace($GhProxy)) {
+    Assert-UrlSafe $GhProxy "-GhProxy"
+}
 
 if ([string]::IsNullOrWhiteSpace($Token) -and [string]::IsNullOrWhiteSpace($TokenFile)) {
-    Write-Error "错误：必须指定 -Token 或 -TokenFile"
-    Show-Usage
-    exit 1
+    if (-not [string]::IsNullOrWhiteSpace($env:MNAGENT_TOKEN)) {
+        $Token = $env:MNAGENT_TOKEN
+    } else {
+        Write-Error "错误：必须指定 -Token、-TokenFile 或环境变量 MNAGENT_TOKEN"
+        Show-Usage
+        exit 1
+    }
 }
 
 # 默认启用状态处理

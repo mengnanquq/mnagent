@@ -139,6 +139,10 @@ jobs:
         with:
           path: dist
           merge-multiple: true
+      - name: Add installer scripts to release assets
+        run: |
+          cp install.sh install.ps1 dist/
+          (cd dist && sha256sum install.sh install.ps1 > installers.sha256)
       - name: Publish release
         env:
           GH_TOKEN: ${{ github.token }}

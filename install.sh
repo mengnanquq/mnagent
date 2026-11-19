@@ -3,7 +3,7 @@
 #
 # 机器人的 /host add 会生成这样的命令，在目标主机上执行即可：
 #   (curl -fsSL <脚本地址> || wget -qO- <脚本地址>) | sh -s -- \
-#     --bot https://<机器人地址>/agent --token <令牌>
+#     --bot https://<机器人地址>/agent --token-file /etc/mnagent/token
 # 令牌即身份：机器人按令牌识别主机，主机上不需要（也不接受）名称参数。
 #
 # 支持两类平台：
@@ -24,6 +24,8 @@ INIT_DIR="${MNAGENT_INIT_DIR:-}"
 
 BOT_URL=""
 TOKEN=""
+TOKEN_FROM_ARG="no"
+TOKEN_STDIN="no"
 TOKEN_FILE="/etc/mnagent/token"
 NEXTTRACE_BIN="nexttrace"
 MIAOSPEED_BIN="miaospeed"
@@ -47,15 +49,37 @@ log()  { printf '\033[1;32m==>\033[0m %s\n' "$*"; }
 warn() { printf '\033[1;33m警告:\033[0m %s\n' "$*" >&2; }
 die()  { printf '\033[1;31m错误:\033[0m %s\n' "$*" >&2; exit 1; }
 
+# validate_url_safe <值> <参数名>：URL 只允许安全字符，禁止空白、换行、引号、反斜杠、%、$、反引号等。
+# 这些值会被写入 systemd/procd 命令行，必须从源头阻断命令注入与单元文件注入。
+validate_url_safe() {
+	url_value="$1"
+	url_label="$2"
+	[ -n "$url_value" ] || die "${url_label} 不能为空"
+	case "$url_value" in
+		http://*|https://*) ;;
+		*) die "${url_label} 必须是完整的 http(s) 地址：${url_value}";;
+	esac
+	url_leftover="$(printf '%s' "$url_value" | LC_ALL=C tr -d 'A-Za-z0-9._~:/?#@!&*+,;=[]-')"
+	if [ -n "$url_leftover" ]; then
+		die "${url_label} 含不允许的字符（只允许 URL 安全字符，禁止空白、换行、引号、反斜杠、%、\$、反引号）"
+	fi
+}
+
+# strip_quotes <值>：兼容旧版单元中带引号的参数，升级时正确继承。
+strip_quotes() {
+	printf '%s' "$1" | sed -e 's/^"//' -e 's/"$//' -e "s/^'//" -e "s/'$//"
+}
+
 usage() {
 	cat <<'EOF'
 用法：
-  (curl -fsSL <脚本地址> || wget -qO- <脚本地址>) | sh -s -- --bot <机器人地址>/agent --token <令牌>
+  (curl -fsSL <脚本地址> || wget -qO- <脚本地址>) | sh -s -- --bot <机器人地址>/agent --token-file <令牌文件>
 
 参数：
   --bot <url>          机器人 agent 端点基地址（必填，如 https://mnbot.example.org/agent）
-  --token <token>      接入令牌（必填；也可省略，前提是 --token-file 已存在）
-  --token-file <path>  令牌文件路径（默认 /etc/mnagent/token）
+  --token <token>      接入令牌（不推荐：会出现在 argv/命令历史；优先用 --token-file、MNAGENT_TOKEN 或 --token-stdin）
+  --token-file <path>  令牌文件路径（默认 /etc/mnagent/token；推荐，升级时会保留）
+  --token-stdin        从标准输入读取令牌（仅脚本文件执行时可用，例如 sh install.sh --token-stdin < token.txt）
   --nexttrace <path>   nexttrace 可执行文件路径或名称（默认 nexttrace）
   --miaospeed <path>   miaospeed 可执行文件路径或名称（默认 miaospeed）
   --miaospeed-version <tag> 安装的 miaospeed 版本，默认 latest（取最新 Release）
@@ -81,6 +105,7 @@ usage() {
   MNAGENT_INIT_DIR=<dir>                  覆盖 init/unit 脚本所在目录
   MNAGENT_REPO=<owner/repo>               覆盖 Release 来源仓库
   GH_PROXY=<url>                          GitHub 代理前缀（如 https://gh-proxy.com/）
+  MNAGENT_TOKEN=<token>                   接入令牌（避免出现在 argv；与 --token-file 二选一）
 EOF
 }
 
@@ -106,7 +131,8 @@ fi
 while [ $# -gt 0 ]; do
 	case "$1" in
 		--bot)         BOT_URL="${2:-}"; shift 2;;
-		--token)       TOKEN="${2:-}"; shift 2;;
+		--token)       TOKEN="${2:-}"; TOKEN_FROM_ARG="yes"; shift 2;;
+		--token-stdin) TOKEN_STDIN="yes"; shift;;
 		--token-file)  TOKEN_FILE="${2:-}"; shift 2;;
 			--nexttrace)   NEXTTRACE_BIN="${2:-}"; shift 2;;
 			--miaospeed)   MIAOSPEED_BIN="${2:-}"; shift 2;;
@@ -401,34 +427,34 @@ fi
 
 if [ -n "$existing_cmd" ]; then
 	if [ -z "$BOT_URL" ]; then
-		extracted_bot="$(printf '%s' "$existing_cmd" | grep -o -- '-bot [^ ]*' | head -n1 | awk '{print $2}' || true)"
+		extracted_bot="$(strip_quotes "$(printf '%s' "$existing_cmd" | grep -o -- '-bot [^ ]*' | head -n1 | awk '{print $2}' || true)")"
 		if [ -n "$extracted_bot" ]; then
 			BOT_URL="$extracted_bot"
 			log "已从现有服务配置继承 --bot 地址: $BOT_URL"
 		fi
 	fi
 	if [ -z "$TOKEN" ] && [ ! -s "$TOKEN_FILE" ]; then
-		extracted_token_file="$(printf '%s' "$existing_cmd" | grep -o -- '-token-file [^ ]*' | head -n1 | awk '{print $2}' || true)"
+		extracted_token_file="$(strip_quotes "$(printf '%s' "$existing_cmd" | grep -o -- '-token-file [^ ]*' | head -n1 | awk '{print $2}' || true)")"
 		if [ -n "$extracted_token_file" ] && [ -f "$extracted_token_file" ]; then
 			TOKEN_FILE="$extracted_token_file"
 			log "已从现有服务配置继承 --token-file 路径: $TOKEN_FILE"
 		fi
 	fi
 	if [ -z "$GH_PROXY" ]; then
-		extracted_proxy="$(printf '%s' "$existing_cmd" | grep -o -- '-gh-proxy [^ ]*' | head -n1 | awk '{print $2}' || true)"
+		extracted_proxy="$(strip_quotes "$(printf '%s' "$existing_cmd" | grep -o -- '-gh-proxy [^ ]*' | head -n1 | awk '{print $2}' || true)")"
 		if [ -n "$extracted_proxy" ]; then
 			GH_PROXY="$extracted_proxy"
 			log "已从现有服务配置继承 --gh-proxy 代理: $GH_PROXY"
 		fi
 	fi
 	if [ "$NEXTTRACE_BIN" = "nexttrace" ]; then
-		extracted_nt="$(printf '%s' "$existing_cmd" | grep -o -- '-nexttrace [^ ]*' | head -n1 | awk '{print $2}' || true)"
+		extracted_nt="$(strip_quotes "$(printf '%s' "$existing_cmd" | grep -o -- '-nexttrace [^ ]*' | head -n1 | awk '{print $2}' || true)")"
 		if [ -n "$extracted_nt" ]; then
 			NEXTTRACE_BIN="$extracted_nt"
 		fi
 	fi
 	if [ "$MIAOSPEED_BIN" = "miaospeed" ]; then
-		extracted_miao="$(printf '%s' "$existing_cmd" | grep -o -- '-miaospeed [^ ]*' | head -n1 | awk '{print $2}' || true)"
+		extracted_miao="$(strip_quotes "$(printf '%s' "$existing_cmd" | grep -o -- '-miaospeed [^ ]*' | head -n1 | awk '{print $2}' || true)")"
 		if [ -n "$extracted_miao" ]; then
 			MIAOSPEED_BIN="$extracted_miao"
 		fi
@@ -436,12 +462,25 @@ if [ -n "$existing_cmd" ]; then
 fi
 
 [ -n "$BOT_URL" ] || die "缺少 --bot"
-case "$BOT_URL" in
-	http://*|https://*) ;;
-	*) die "--bot 必须是完整的 http(s) 地址：$BOT_URL";;
-esac
-# 主机名允许中英文（机器人侧 /host add 可直接写“香港节点”），
-# 但必须挡住会被写进服务单元/命令行的特殊字符。
+validate_url_safe "$BOT_URL" "--bot"
+if [ -n "$GH_PROXY" ]; then
+	validate_url_safe "$GH_PROXY" "--gh-proxy"
+fi
+
+# 令牌可由 --token-stdin 或 MNAGENT_TOKEN 提供，避免明文出现在 argv/ps/命令历史中。
+if [ "$TOKEN_STDIN" = "yes" ] && [ -z "$TOKEN" ]; then
+	IFS= read -r TOKEN || die "从标准输入读取令牌失败（管道安装时 stdin 已被脚本占用，请改用 --token-file 或 MNAGENT_TOKEN）"
+	TOKEN="$(printf '%s' "$TOKEN" | tr -d '\r\n')"
+	[ -n "$TOKEN" ] || die "从标准输入读取到空令牌"
+	log "已从标准输入读取令牌"
+fi
+if [ -z "$TOKEN" ] && [ -n "${MNAGENT_TOKEN:-}" ]; then
+	TOKEN="$MNAGENT_TOKEN"
+	log "已从环境变量 MNAGENT_TOKEN 读取令牌"
+fi
+if [ "$TOKEN_FROM_ARG" = "yes" ]; then
+	warn "使用 --token 会把令牌暴露在进程 argv 与命令历史中，建议改用 --token-file、MNAGENT_TOKEN 或 --token-stdin"
+fi
 
 # ---------- 安装二进制 ----------
 
@@ -863,10 +902,10 @@ MIAOSPEED_EXEC="${MIAOSPEED_PATH:-$MIAOSPEED_BIN}"
 # 自动更新参数：启用时追加到服务命令（systemd 与 procd 共用）。
 AUTO_UPDATE_ARGS=""
 if [ "$AUTO_UPDATE" = "yes" ]; then
-	AUTO_UPDATE_ARGS=" -auto-update -update-interval $UPDATE_INTERVAL"
+	AUTO_UPDATE_ARGS=" -auto-update -update-interval \"$UPDATE_INTERVAL\""
 fi
 if [ -n "$GH_PROXY" ]; then
-	AUTO_UPDATE_ARGS="$AUTO_UPDATE_ARGS -gh-proxy $GH_PROXY"
+	AUTO_UPDATE_ARGS="$AUTO_UPDATE_ARGS -gh-proxy \"$GH_PROXY\""
 fi
 
 # ---------- 安装服务 ----------
@@ -884,7 +923,7 @@ Wants=network-online.target
 Type=simple
 User=$RUN_USER
 Group=$RUN_GROUP
-ExecStart=$PREFIX/mnagent -bot $BOT_URL -token-file $TOKEN_FILE -nexttrace $NEXTTRACE_EXEC -miaospeed $MIAOSPEED_EXEC$AUTO_UPDATE_ARGS
+ExecStart="$PREFIX/mnagent" -bot "$BOT_URL" -token-file "$TOKEN_FILE" -nexttrace "$NEXTTRACE_EXEC" -miaospeed "$MIAOSPEED_EXEC"$AUTO_UPDATE_ARGS
 	# nexttrace 需要可写的主目录来存放配置与 IP 库；ProtectSystem=strict 下只有
 	# StateDirectory 指向的目录可写。
 	StateDirectory=mnagent
@@ -932,11 +971,11 @@ USE_PROCD=1
 
 	start_service() {
 		procd_open_instance
-		procd_set_param command $PREFIX/mnagent \\
-			-bot $BOT_URL \\
-			-token-file $TOKEN_FILE \\
-			-nexttrace $NEXTTRACE_EXEC \\
-			-miaospeed $MIAOSPEED_EXEC$AUTO_UPDATE_ARGS
+		procd_set_param command "$PREFIX/mnagent" \\
+			-bot "$BOT_URL" \\
+			-token-file "$TOKEN_FILE" \\
+			-nexttrace "$NEXTTRACE_EXEC" \\
+			-miaospeed "$MIAOSPEED_EXEC"$AUTO_UPDATE_ARGS
 		procd_set_param env PATH="/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
 		procd_set_param respawn
 		procd_set_param stdout 1
