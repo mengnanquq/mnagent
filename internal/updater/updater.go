@@ -717,24 +717,14 @@ func (u *Updater) Skip(version string, forDur time.Duration) error {
 
 // DetectPlatformArch 探测当前系统与架构对应的 Release 命名。
 func DetectPlatformArch() (platform, arch string) {
-	platform = runtime.GOOS
-	switch runtime.GOARCH {
-	case "arm":
-		arch = "armv7"
-	case "mipsle":
-		arch = "mipsle"
-	case "mips":
-		arch = "mips"
-	case "mips64le":
-		arch = "mips64le"
-	case "mips64":
-		arch = "mips64"
-	case "riscv64":
-		arch = "riscv64"
-	default:
-		arch = runtime.GOARCH
-	}
-	return platform, arch
+	return runtime.GOOS, ReleaseArch(runtime.GOARCH)
+}
+
+// ReleaseArch 把 Go 的 GOARCH 映射为 Release 资产名中的架构段。
+// Release 工作流直接使用 GOARCH 生成 mnagent_<os>_<goarch>，因此 32 位 ARM
+// 的产物是 mnagent_linux_arm，而不是 armv7。
+func ReleaseArch(goarch string) string {
+	return goarch
 }
 
 // ReplaceExecutable 将 newFile 原子替换到 targetPath。

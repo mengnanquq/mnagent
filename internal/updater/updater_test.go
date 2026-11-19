@@ -11,6 +11,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"regexp"
 	"runtime"
 	"strings"
 	"sync/atomic"
@@ -450,6 +451,74 @@ func TestUpdaterAssetNameWindows(t *testing.T) {
 	u.Arch = "arm64"
 	if got := u.AssetName(); got != "mnagent_windows_arm64.exe" {
 		t.Fatalf("AssetName = %q, want mnagent_windows_arm64.exe", got)
+	}
+}
+
+// TestReleaseArchMatchesAssets 验证 32 位 ARM 使用产物名 arm，而不是 nexttrace 依赖的 armv7。
+func TestReleaseArchMatchesAssets(t *testing.T) {
+	cases := map[string]string{
+		"amd64": "amd64", "arm64": "arm64", "arm": "arm",
+		"mipsle": "mipsle", "mips": "mips", "mips64le": "mips64le",
+		"mips64": "mips64", "riscv64": "riscv64",
+	}
+	for goarch, want := range cases {
+		if got := ReleaseArch(goarch); got != want {
+			t.Fatalf("ReleaseArch(%q) = %q，期望 %q", goarch, got, want)
+		}
+	}
+	if ReleaseArch("arm") == "armv7" {
+		t.Fatal("32 位 ARM 资产名不能映射为 armv7，否则自更新必然 404")
+	}
+}
+
+// TestReleaseWorkflowAssetsMatchUpdater 解析 release.yml 的 matrix，确认 updater 生成的
+// 资产名与发布产物完全一致（含 Windows .exe 后缀），避免再次出现 arm/armv7 之类的 404。
+func TestReleaseWorkflowAssetsMatchUpdater(t *testing.T) {
+	root := filepath.Join("..", "..")
+	raw, err := os.ReadFile(filepath.Join(root, ".github", "workflows", "release.yml"))
+	if err != nil {
+		t.Fatalf("读取 release.yml 失败：%v", err)
+	}
+	matrixPattern := regexp.MustCompile(`(?m)^\s*-\s*\{\s*goos:\s*([a-z0-9]+)\s*,\s*goarch:\s*([a-z0-9]+)`)
+	matches := matrixPattern.FindAllStringSubmatch(string(raw), -1)
+	if len(matches) == 0 {
+		t.Fatal("未从 release.yml 解析到任何构建 matrix")
+	}
+	seen := make(map[string]bool, len(matches))
+	for _, m := range matches {
+		goos, goarch := m[1], m[2]
+		u := &Updater{Platform: goos, Arch: ReleaseArch(goarch)}
+		want := "mnagent_" + goos + "_" + goarch
+		if goos == "windows" {
+			want += ".exe"
+		}
+		if got := u.AssetName(); got != want {
+			t.Errorf("release.yml 产物 %s 与 updater.AssetName()=%s 不一致", want, got)
+		}
+		seen[want] = true
+	}
+	for _, required := range []string{"mnagent_linux_amd64", "mnagent_linux_arm", "mnagent_linux_mipsle", "mnagent_windows_amd64.exe"} {
+		if !seen[required] {
+			t.Errorf("release.yml matrix 缺少必要产物 %s", required)
+		}
+	}
+
+	// install.sh 的架构映射必须与发布产物一致：armv7l/armv6l 等一律下载 mnagent_linux_arm。
+	install, err := os.ReadFile(filepath.Join(root, "install.sh"))
+	if err != nil {
+		t.Fatalf("读取 install.sh 失败：%v", err)
+	}
+	foundArm := false
+	for _, line := range strings.Split(string(install), "\n") {
+		if strings.Contains(line, "armv7l") {
+			foundArm = true
+			if !strings.Contains(line, `ARCH="arm"`) {
+				t.Errorf("install.sh 的 ARM 架构应映射为 arm，实际：%s", strings.TrimSpace(line))
+			}
+		}
+	}
+	if !foundArm {
+		t.Error("install.sh 未找到 ARM 架构映射")
 	}
 }
 
