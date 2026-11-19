@@ -18,6 +18,7 @@ import (
 	"os"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"golang.org/x/net/icmp"
@@ -512,6 +513,111 @@ func shortDialError(err error) string {
 
 // ---------- http ----------
 
+// httpPhaseTimings 收集 HTTP 分阶段耗时。httptrace 回调与自定义 DialContext
+// 可能在不同 goroutine 上并发执行，所有字段都必须加锁，且只记录首次观测值
+// （重定向时会出现多次拨号，报告只展示第一次）。
+type httpPhaseTimings struct {
+	mu sync.Mutex
+
+	dnsStart, connStart, tlsStart, writeStart time.Time
+	dnsMs, connMs, tlsMs, ttfbMs              float64
+	dnsSet, connSet, tlsSet, ttfbSet          bool
+	remoteAddr                                string
+}
+
+func durationMs(d time.Duration) float64 { return float64(d.Microseconds()) / 1000 }
+
+func (t *httpPhaseTimings) startDNS() {
+	t.mu.Lock()
+	t.dnsStart = time.Now()
+	t.mu.Unlock()
+}
+
+func (t *httpPhaseTimings) doneDNS() {
+	t.mu.Lock()
+	if !t.dnsSet {
+		t.dnsSet = true
+		t.dnsMs = sinceMs(t.dnsStart)
+	}
+	t.mu.Unlock()
+}
+
+func (t *httpPhaseTimings) observeDNS(d time.Duration) {
+	t.mu.Lock()
+	if !t.dnsSet {
+		t.dnsSet = true
+		t.dnsMs = durationMs(d)
+	}
+	t.mu.Unlock()
+}
+
+func (t *httpPhaseTimings) startConnect() {
+	t.mu.Lock()
+	t.connStart = time.Now()
+	t.mu.Unlock()
+}
+
+func (t *httpPhaseTimings) doneConnect() {
+	t.mu.Lock()
+	if !t.connSet {
+		t.connSet = true
+		t.connMs = sinceMs(t.connStart)
+	}
+	t.mu.Unlock()
+}
+
+func (t *httpPhaseTimings) observeConnect(d time.Duration) {
+	t.mu.Lock()
+	if !t.connSet {
+		t.connSet = true
+		t.connMs = durationMs(d)
+	}
+	t.mu.Unlock()
+}
+
+func (t *httpPhaseTimings) startTLS() {
+	t.mu.Lock()
+	t.tlsStart = time.Now()
+	t.mu.Unlock()
+}
+
+func (t *httpPhaseTimings) doneTLS() {
+	t.mu.Lock()
+	if !t.tlsSet {
+		t.tlsSet = true
+		t.tlsMs = sinceMs(t.tlsStart)
+	}
+	t.mu.Unlock()
+}
+
+func (t *httpPhaseTimings) gotConn(info httptrace.GotConnInfo) {
+	t.mu.Lock()
+	t.writeStart = time.Now()
+	if info.Conn != nil && info.Conn.RemoteAddr() != nil {
+		addr := info.Conn.RemoteAddr().String()
+		if host, _, err := net.SplitHostPort(addr); err == nil {
+			addr = host
+		}
+		t.remoteAddr = addr
+	}
+	t.mu.Unlock()
+}
+
+func (t *httpPhaseTimings) gotFirstByte() {
+	t.mu.Lock()
+	if !t.ttfbSet {
+		t.ttfbSet = true
+		t.ttfbMs = sinceMs(t.writeStart)
+	}
+	t.mu.Unlock()
+}
+
+func (t *httpPhaseTimings) snapshot() (dnsMs, connMs, tlsMs, ttfbMs float64, remoteAddr string) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	return t.dnsMs, t.connMs, t.tlsMs, t.ttfbMs, t.remoteAddr
+}
+
 // httpProbe 发起一次 HTTP(S) 请求并分阶段计时。
 func HTTPProbe(ctx context.Context, job model.Job, allowPrivate bool) (HTTPReport, error) {
 	raw := strings.TrimSpace(job.Target)
@@ -523,37 +629,19 @@ func HTTPProbe(ctx context.Context, job model.Job, allowPrivate bool) (HTTPRepor
 	report := HTTPReport{URL: parsed.String(), TLS: parsed.Scheme == "https"}
 
 	var (
-		dnsStart, connStart, tlsStart, writeStart time.Time
-		dnsMs, connMs, tlsMs, ttfbMs              float64
-		remoteAddr                                string
-		redirects                                 int
+		timings   httpPhaseTimings
+		redirects int
 	)
 	start := time.Now()
 	trace := &httptrace.ClientTrace{
-		DNSStart: func(httptrace.DNSStartInfo) { dnsStart = time.Now() },
-		DNSDone: func(httptrace.DNSDoneInfo) {
-			if dnsMs == 0 {
-				dnsMs = sinceMs(dnsStart)
-			}
-		},
-		ConnectStart: func(_, _ string) { connStart = time.Now() },
-		ConnectDone: func(_, _ string, _ error) {
-			if connMs == 0 {
-				connMs = sinceMs(connStart)
-			}
-		},
-		TLSHandshakeStart: func() { tlsStart = time.Now() },
-		TLSHandshakeDone:  func(tls.ConnectionState, error) { tlsMs = sinceMs(tlsStart) },
-		GotConn: func(info httptrace.GotConnInfo) {
-			writeStart = time.Now()
-			if info.Conn != nil && info.Conn.RemoteAddr() != nil {
-				remoteAddr = info.Conn.RemoteAddr().String()
-				if host, _, err := net.SplitHostPort(remoteAddr); err == nil {
-					remoteAddr = host
-				}
-			}
-		},
-		GotFirstResponseByte: func() { ttfbMs = sinceMs(writeStart) },
+		DNSStart:             func(httptrace.DNSStartInfo) { timings.startDNS() },
+		DNSDone:              func(httptrace.DNSDoneInfo) { timings.doneDNS() },
+		ConnectStart:         func(_, _ string) { timings.startConnect() },
+		ConnectDone:          func(_, _ string, _ error) { timings.doneConnect() },
+		TLSHandshakeStart:    func() { timings.startTLS() },
+		TLSHandshakeDone:     func(tls.ConnectionState, error) { timings.doneTLS() },
+		GotConn:              func(info httptrace.GotConnInfo) { timings.gotConn(info) },
+		GotFirstResponseByte: func() { timings.gotFirstByte() },
 	}
 	reqCtx, cancel := context.WithTimeout(httptrace.WithClientTrace(ctx, trace), timeout)
 	defer cancel()
@@ -584,7 +672,7 @@ func HTTPProbe(ctx context.Context, job model.Job, allowPrivate bool) (HTTPRepor
 				if lookupErr != nil {
 					return nil, lookupErr
 				}
-				dnsMs = float64(time.Since(dnsT0).Microseconds()) / 1000
+				timings.observeDNS(time.Since(dnsT0))
 				ips = resolved
 			}
 
@@ -609,7 +697,7 @@ func HTTPProbe(ctx context.Context, job model.Job, allowPrivate bool) (HTTPRepor
 
 			connT0 := time.Now()
 			c, dialErr := dialer.DialContext(ctx, network, net.JoinHostPort(targetIP.String(), port))
-			connMs = float64(time.Since(connT0).Microseconds()) / 1000
+			timings.observeConnect(time.Since(connT0))
 			return c, dialErr
 		},
 	}
@@ -635,9 +723,8 @@ func HTTPProbe(ctx context.Context, job model.Job, allowPrivate bool) (HTTPRepor
 	report.Status = resp.StatusCode
 	report.StatusText = resp.Status
 	report.Redirects = redirects
-	report.RemoteIP = remoteAddr
+	report.DNSMs, report.ConnectMs, report.TLSHandMs, report.TTFBMs, report.RemoteIP = timings.snapshot()
 	report.Proto = resp.Proto
-	report.DNSMs, report.ConnectMs, report.TLSHandMs, report.TTFBMs = dnsMs, connMs, tlsMs, ttfbMs
 	report.TotalMs = sinceMs(start)
 	if resp.TLS != nil {
 		switch resp.TLS.Version {

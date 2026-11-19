@@ -12,8 +12,10 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
+	"time"
 )
 
 // TestProbeKindRouting 覆盖任务类型归一化与分类。
@@ -393,5 +395,32 @@ func TestHTTPProbeConnectionFailureClearsData(t *testing.T) {
 	}
 	if len(outcome.Data) != 0 {
 		t.Fatalf("连接失败时不应返回零值 Data，实际：%s", string(outcome.Data))
+	}
+}
+
+// TestHTTPPhaseTimingsConcurrentObservation 验证 httptrace 回调与 DialContext
+// 并发写入 dns/conn 耗时不会产生数据竞争，并且只记录第一次观测值。
+func TestHTTPPhaseTimingsConcurrentObservation(t *testing.T) {
+	var timings httpPhaseTimings
+	var wg sync.WaitGroup
+	for i := 0; i < 8; i++ {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			timings.startDNS()
+			timings.observeDNS(time.Duration(i+1) * time.Millisecond)
+			timings.doneDNS()
+			timings.startConnect()
+			timings.observeConnect(time.Duration(i+10) * time.Millisecond)
+			timings.doneConnect()
+		}(i)
+	}
+	wg.Wait()
+	dnsMs, connMs, _, _, _ := timings.snapshot()
+	if dnsMs <= 0 || connMs <= 0 {
+		t.Fatalf("并发记录后耗时异常: dns=%f conn=%f", dnsMs, connMs)
+	}
+	if dnsMs > 8 || connMs > 18 {
+		t.Fatalf("应只记录首次拨号耗时，实际 dns=%f conn=%f", dnsMs, connMs)
 	}
 }
