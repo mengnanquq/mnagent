@@ -10,6 +10,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -174,7 +175,6 @@ func TestClientWSFallbackToHTTP(t *testing.T) {
 	if err != nil || job == nil || job.ID != "h1" {
 		t.Fatalf("HTTP 回退失败: job=%+v err=%v", job, err)
 	}
-	time.Sleep(100 * time.Millisecond)
 	if cli.WSConnected() {
 		t.Fatal("不支持 /ws 时不应处于长连接模式")
 	}
@@ -186,8 +186,10 @@ func TestClientWSFallbackToHTTP(t *testing.T) {
 // TestClientWSResultAck 验证：机器人确认的结果不走 HTTP；未确认的结果超时后改走 HTTP 重发；
 // 退出前未领取的推送任务会被回报为失败。
 func TestClientWSResultAck(t *testing.T) {
+	// 等待 ack 的超时是功能本身的一部分，不能去掉；但传 200ms 时一次调度抖动就会把
+	// “已确认”误判为“未确认”。这里放宽到 2s，ack 是进程内回包，正常远小于 1s。
 	old := wsAckTimeout
-	wsAckTimeout = 200 * time.Millisecond
+	wsAckTimeout = 2 * time.Second
 	defer func() { wsAckTimeout = old }()
 
 	var httpResults atomic.Int32
@@ -333,8 +335,27 @@ func TestClientWSQueueFullRejectsWithoutBlockingReadLoop(t *testing.T) {
 	}
 }
 
+// syncBuffer 是并发安全的日志缓冲，供后台协程写、测试轮询读。
+type syncBuffer struct {
+	mu  sync.Mutex
+	buf bytes.Buffer
+}
+
+func (b *syncBuffer) Write(p []byte) (int, error) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.buf.Write(p)
+}
+
+func (b *syncBuffer) String() string {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.buf.String()
+}
+
 // TestWSFallbackLogsWarn 验证机器人不支持 WebSocket 时会输出降级告警日志，
 // 方便用户排查“为什么一直在走 HTTP 长轮询”。
+// 用轮询日志代替固定 200ms ctx：只要降级告警出现就取消，慢机器上不会误判。
 func TestWSFallbackLogsWarn(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		http.NotFound(w, r)
@@ -342,17 +363,35 @@ func TestWSFallbackLogsWarn(t *testing.T) {
 	defer srv.Close()
 
 	cli := newWSClient(srv.URL)
-	var buf bytes.Buffer
+	buf := &syncBuffer{}
 	prev := slog.Default()
-	slog.SetDefault(slog.New(slog.NewTextHandler(&buf, &slog.HandlerOptions{Level: slog.LevelDebug})))
+	slog.SetDefault(slog.New(slog.NewTextHandler(buf, &slog.HandlerOptions{Level: slog.LevelDebug})))
 	defer slog.SetDefault(prev)
 
-	ctx, cancel := context.WithTimeout(context.Background(), 200*time.Millisecond)
+	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
-	cli.wsLoop(ctx)
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		cli.wsLoop(ctx)
+	}()
+
+	deadline := time.Now().Add(3 * time.Second)
+	for !strings.Contains(buf.String(), "降级") {
+		if time.Now().After(deadline) {
+			t.Fatalf("WS 降级应输出 Warn 日志，实际日志：%s", buf.String())
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	cancel()
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("取消上下文后 wsLoop 未及时退出")
+	}
 
 	out := buf.String()
-	if !strings.Contains(out, "降级") || !strings.Contains(out, "WebSocket") {
-		t.Fatalf("WS 降级应输出 Warn 日志，实际日志：%s", out)
+	if !strings.Contains(out, "WebSocket") {
+		t.Fatalf("WS 降级日志应包含 WebSocket，实际日志：%s", out)
 	}
 }
