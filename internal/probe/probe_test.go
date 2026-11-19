@@ -16,6 +16,9 @@ import (
 	"sync/atomic"
 	"testing"
 	"time"
+
+	"golang.org/x/net/icmp"
+	"golang.org/x/net/ipv4"
 )
 
 // TestProbeKindRouting 覆盖任务类型归一化与分类。
@@ -423,4 +426,63 @@ func TestHTTPPhaseTimingsConcurrentObservation(t *testing.T) {
 	if dnsMs > 8 || connMs > 18 {
 		t.Fatalf("应只记录首次拨号耗时，实际 dns=%f conn=%f", dnsMs, connMs)
 	}
+}
+
+// TestParseEchoReplyValidatesPayloadCookie 验证 ping 回包必须携带本次请求的随机 cookie，
+// 避免原始套接字把同机其它 ping 进程的回包误算为成功。
+func TestParseEchoReplyValidatesPayloadCookie(t *testing.T) {
+	payload := []byte("cookie12-rest-of-payload-padding")
+	reply, err := (&icmp.Message{
+		Type: ipv4.ICMPTypeEchoReply,
+		Body: &icmp.Echo{Seq: 7, Data: payload},
+	}).Marshal(nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !parseEchoReply(reply, false, true, 7, payload) {
+		t.Fatal("匹配序号与随机载荷的回包应被接受")
+	}
+	if parseEchoReply(reply, false, true, 8, payload) {
+		t.Fatal("序号不匹配的回包应被拒绝")
+	}
+	wrong := append([]byte(nil), payload...)
+	wrong[0] ^= 0xff
+	if parseEchoReply(reply, false, true, 7, wrong) {
+		t.Fatal("随机 cookie 不匹配的回包应被拒绝")
+	}
+	if parseEchoReply(reply, false, true, 7, payload[:4]) {
+		t.Fatal("回包载荷长度与请求不一致时应被拒绝")
+	}
+}
+
+// TestProbeCanceledSentMatchesAttempts 验证取消后 Sent 等于实际 Attempts 数量，
+// 避免提前退出时把未尝试的次数全部算成丢包。
+func TestProbeCanceledSentMatchesAttempts(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	t.Run("tcping", func(t *testing.T) {
+		report, err := TCPingProbe(ctx, model.Job{Target: "127.0.0.1", Port: 443, Count: 4, TimeoutMS: 2000}, true)
+		if err != nil {
+			t.Fatalf("取消时不应返回致命错误: %v", err)
+		}
+		if report.Sent != len(report.Attempts) {
+			t.Fatalf("Sent=%d 与 Attempts=%d 不一致", report.Sent, len(report.Attempts))
+		}
+	})
+
+	t.Run("ping", func(t *testing.T) {
+		conn, _, err := ListenICMP(false)
+		if err != nil {
+			t.Skipf("本机无法创建 ICMP 套接字，跳过：%v", err)
+		}
+		conn.Close()
+		report, err := PingProbe(ctx, model.Job{Target: "127.0.0.1", Count: 4, TimeoutMS: 2000}, true)
+		if err != nil {
+			t.Fatalf("取消时不应返回致命错误: %v", err)
+		}
+		if report.Sent != len(report.Attempts) {
+			t.Fatalf("Sent=%d 与 Attempts=%d 不一致", report.Sent, len(report.Attempts))
+		}
+	})
 }

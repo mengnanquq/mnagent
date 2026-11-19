@@ -5,7 +5,9 @@ import (
 )
 
 import (
+	"bytes"
 	"context"
+	"crypto/rand"
 	"crypto/tls"
 	"encoding/json"
 	"errors"
@@ -224,6 +226,13 @@ func PingProbe(ctx context.Context, job model.Job, allowPrivate bool) (LatencyRe
 	}
 	report := LatencyReport{Kind: KindPing, Target: target, Resolved: resolved, Sent: count}
 
+	// 每次探测使用独立随机载荷（前 8 字节为 cookie），原始套接字可能收到
+	// 同机其它 ping 进程的回包，只校验序号/ID 不足以防误判。
+	payload := make([]byte, pingPayloadSize)
+	if _, err := rand.Read(payload[:8]); err != nil {
+		return report, fmt.Errorf("生成 ping 随机载荷失败：%w", err)
+	}
+
 	conn, udpSocket, listenErr := ListenICMP(ipv6)
 	if listenErr != nil {
 		return report, fmt.Errorf("无法创建 ICMP 套接字：%w", listenErr)
@@ -246,7 +255,7 @@ func PingProbe(ctx context.Context, job model.Job, allowPrivate bool) (LatencyRe
 			break
 		}
 		start := time.Now()
-		if err := writeEcho(conn, ip, ipv6, udpSocket, i); err != nil {
+		if err := writeEcho(conn, ip, ipv6, udpSocket, i, payload); err != nil {
 			report.Attempts = append(report.Attempts, LatencyAttempt{Index: i + 1, Error: err.Error()})
 			continue
 		}
@@ -259,7 +268,7 @@ func PingProbe(ctx context.Context, job model.Job, allowPrivate bool) (LatencyRe
 				attempt.Error = echoErrorText(readErr)
 				break
 			}
-			if !parseEchoReply(buf[:n], ipv6, udpSocket, i) {
+			if !parseEchoReply(buf[:n], ipv6, udpSocket, i, payload) {
 				continue // 其它序号/其它报文，继续等待本次回包
 			}
 			attempt.OK = true
@@ -271,6 +280,9 @@ func PingProbe(ctx context.Context, job model.Job, allowPrivate bool) (LatencyRe
 			sleepCtx(ctx, time.Until(start.Add(probeInterval)))
 		}
 	}
+	// 取消或提前退出时，实际尝试次数可能少于计划次数：Sent 必须与明细一致，
+	// 否则丢包率会被算成 100%。
+	report.Sent = len(report.Attempts)
 	fillLatencyStats(&report)
 	return report, nil
 }
@@ -315,9 +327,9 @@ func icmpNetworks(isV6 bool) []string {
 	return []string{"udp4", "ip4:icmp"}
 }
 
-// writeEcho 发送一个 echo 请求；序号用于匹配回包。
+// writeEcho 发送一个 echo 请求；序号与随机载荷用于匹配回包。
 // 非特权（udp）套接字必须用 *net.UDPAddr，原始套接字用 *net.IPAddr。
-func writeEcho(conn *icmp.PacketConn, ip net.IP, isV6, udpSocket bool, seq int) error {
+func writeEcho(conn *icmp.PacketConn, ip net.IP, isV6, udpSocket bool, seq int, payload []byte) error {
 	var typ icmp.Type = ipv4.ICMPTypeEcho
 	if isV6 {
 		typ = ipv6.ICMPTypeEchoRequest
@@ -327,7 +339,7 @@ func writeEcho(conn *icmp.PacketConn, ip net.IP, isV6, udpSocket bool, seq int) 
 		Body: &icmp.Echo{
 			ID:   os.Getpid() & 0xffff,
 			Seq:  seq,
-			Data: make([]byte, pingPayloadSize),
+			Data: payload,
 		},
 	}
 	data, err := message.Marshal(nil)
@@ -344,7 +356,7 @@ func writeEcho(conn *icmp.PacketConn, ip net.IP, isV6, udpSocket bool, seq int) 
 
 // parseEchoReply 判断回包是否为本次请求的 echo reply。
 // 往返时间由调用方在本地计时（不依赖回包内容，避免时钟/ID 差异）。
-func parseEchoReply(data []byte, isV6, udpSocket bool, seq int) bool {
+func parseEchoReply(data []byte, isV6, udpSocket bool, seq int, payload []byte) bool {
 	proto := 1
 	var want icmp.Type = ipv4.ICMPTypeEchoReply
 	if isV6 {
@@ -362,6 +374,12 @@ func parseEchoReply(data []byte, isV6, udpSocket bool, seq int) bool {
 	// 非特权 ICMP 由内核分配 ID；原始套接字会收到全机 ICMP 报文，需校验进程 ID。
 	if !udpSocket && echo.ID != (os.Getpid()&0xffff) {
 		return false
+	}
+	// 校验载荷中的随机 cookie，避免把同机其它 ping 进程的回包算成本次结果。
+	if len(payload) > 0 {
+		if len(echo.Data) != len(payload) || !bytes.Equal(echo.Data, payload) {
+			return false
+		}
 	}
 	return true
 }
@@ -455,6 +473,7 @@ func TCPingProbe(ctx context.Context, job model.Job, allowPrivate bool) (Latency
 			sleepCtx(ctx, wait)
 		}
 	}
+	report.Sent = len(report.Attempts)
 	fillLatencyStats(&report)
 	return report, nil
 }
