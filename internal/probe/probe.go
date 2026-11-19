@@ -566,7 +566,9 @@ func HTTPProbe(ctx context.Context, job model.Job, allowPrivate bool) (HTTPRepor
 
 	dialer := &net.Dialer{Timeout: timeout}
 	transport := &http.Transport{
-		Proxy: http.ProxyFromEnvironment,
+		// 明确禁用环境代理：HTTP_PROXY/HTTPS_PROXY 会把请求交给代理，
+		// 代理自行解析目标并建立连接，从而完全绕过下面按解析 IP 做的 SSRF 校验。
+		Proxy: nil,
 		DialContext: func(ctx context.Context, network, addr string) (net.Conn, error) {
 			host, port, err := net.SplitHostPort(addr)
 			if err != nil {

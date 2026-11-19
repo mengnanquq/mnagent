@@ -12,6 +12,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync/atomic"
 	"testing"
 )
 
@@ -137,6 +138,53 @@ func TestPingProbeLocalhost(t *testing.T) {
 	}
 	if report.Resolved != "127.0.0.1" {
 		t.Fatalf("解析结果异常: %q", report.Resolved)
+	}
+}
+
+// TestHTTPProbeIgnoresEnvironmentProxy 验证 HTTP 探针不会使用 HTTP_PROXY/HTTPS_PROXY：
+// 环境代理会让请求由代理自行解析并连接目标，从而绕过按解析 IP 做的 SSRF 校验。
+func TestHTTPProbeIgnoresEnvironmentProxy(t *testing.T) {
+	var proxyHits atomic.Int32
+	proxy := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		proxyHits.Add(1)
+		w.WriteHeader(http.StatusBadGateway)
+	}))
+	defer proxy.Close()
+	t.Setenv("HTTP_PROXY", proxy.URL)
+	t.Setenv("HTTPS_PROXY", proxy.URL)
+	t.Setenv("NO_PROXY", "")
+
+	// 监听 0.0.0.0 并以 http://0.0.0.0:<port> 访问：该主机名不会被 Go 的
+	// ProxyFromEnvironment 当作回环地址跳过，能真实暴露“走环境代理”的行为。
+	ln, err := net.Listen("tcp", "0.0.0.0:0")
+	if err != nil {
+		t.Skipf("无法监听 0.0.0.0: %v", err)
+	}
+	srv := httptest.NewUnstartedServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	}))
+	srv.Listener.Close()
+	srv.Listener = ln
+	srv.Start()
+	defer srv.Close()
+
+	report, err := HTTPProbe(context.Background(), model.Job{Target: srv.URL, TimeoutMS: 5000}, true)
+	if err != nil {
+		t.Fatalf("应直连目标而不走环境代理，实际失败: %v", err)
+	}
+	if report.Status != http.StatusOK {
+		t.Fatalf("应直连目标得到 200，实际状态 %d（可能被环境代理转发）", report.Status)
+	}
+	if hits := proxyHits.Load(); hits != 0 {
+		t.Fatalf("HTTP 探针不应使用环境代理，代理却收到 %d 次请求", hits)
+	}
+
+	// 即使设置了代理，内网/元数据地址仍必须被 SSRF 守卫拦截。
+	if _, err := HTTPProbe(context.Background(), model.Job{Target: "http://169.254.169.254/latest/meta-data/", TimeoutMS: 1000}, false); err == nil || !strings.Contains(err.Error(), "安全策略拦截") {
+		t.Fatalf("设置代理后仍应拦截元数据地址，实际: %v", err)
+	}
+	if hits := proxyHits.Load(); hits != 0 {
+		t.Fatalf("被拦截的目标不应经过环境代理，代理收到 %d 次请求", hits)
 	}
 }
 
