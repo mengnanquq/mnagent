@@ -35,7 +35,8 @@ func TestFilterBlockedNodes(t *testing.T) {
 		{Name: "empty", Server: ""},
 	}
 	kept, removed := filterBlockedNodes(context.Background(), nodes)
-	want := map[string]bool{"pub-ip": true, "pub-domain": true, "unresolvable": true}
+	// 域名解析失败一律 fail-closed 剔除，只保留能确认安全的节点。
+	want := map[string]bool{"pub-ip": true, "pub-domain": true}
 	if len(kept) != len(want) {
 		t.Fatalf("应保留 %d 个节点，实际 %d：%+v", len(want), len(kept), kept)
 	}
@@ -46,5 +47,10 @@ func TestFilterBlockedNodes(t *testing.T) {
 	}
 	if removed != len(nodes)-len(want) {
 		t.Fatalf("剔除数量错误：%d", removed)
+	}
+	for _, n := range kept {
+		if n.Name == "unresolvable" {
+			t.Fatal("域名无法解析的节点应被 fail-closed 剔除")
+		}
 	}
 }

@@ -32,8 +32,9 @@ var lookupNodeIPs = func(ctx context.Context, host string) ([]net.IP, error) {
 }
 
 // filterBlockedNodes 剔除服务器地址指向私有、保留或云元数据地址的节点，返回保留的节点与剔除数量。
-// 域名无法解析的节点予以保留（miaospeed 自身也会连接失败），避免因 DNS 抖动误杀正常节点；
-// 无法识别服务器地址的节点一律剔除，防止借畸形配置绕过检查。
+// 域名解析失败时按 fail-closed 处理：无法确认目标是否安全就直接剔除，绝不把未经校验的域名
+// 交给 miaospeed 去解析连接（否则 DNS 抖动或解析差异都可能绕过 SSRF 守卫）。
+// 无法识别服务器地址的节点同样一律剔除，防止借畸形配置绕过检查。
 func filterBlockedNodes(ctx context.Context, nodes []MiaospeedNode) ([]MiaospeedNode, int) {
 	hostSet := make(map[string]bool)
 	for _, n := range nodes {
@@ -72,8 +73,9 @@ func filterBlockedNodes(ctx context.Context, nodes []MiaospeedNode) ([]Miaospeed
 			rctx, cancel := context.WithTimeout(ctx, nodeResolveTimeout)
 			defer cancel()
 			ips, err := lookupNodeIPs(rctx, h)
-			isBlocked := false
-			if err == nil {
+			// 解析失败或没有返回任何地址：无法验证安全性，按 fail-closed 剔除。
+			isBlocked := err != nil || len(ips) == 0
+			if !isBlocked {
 				for _, ip := range ips {
 					if probe.IsBlockedProbeIP(ip) {
 						isBlocked = true

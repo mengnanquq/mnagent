@@ -228,10 +228,10 @@ func RunJob(ctx context.Context, binary, ghProxy string, job model.Job, log Logg
 		var removed int
 		allNodes, removed = filterBlockedNodes(ctx, allNodes)
 		if removed > 0 && log != nil {
-			log.Warn("已剔除指向私有内网或元数据地址的节点", "removed", removed, "kept", len(allNodes))
+			log.Warn("已剔除存在安全风险的节点（私有/保留/元数据地址或域名无法解析）", "removed", removed, "kept", len(allNodes))
 		}
 		if len(allNodes) == 0 {
-			return "", nil, fmt.Errorf("安全拦截：全部 %d 个节点的服务器地址均指向私有内网、保留或云元数据地址，已拒绝测速", removed)
+			return "", nil, fmt.Errorf("安全拦截：全部 %d 个节点的服务器地址均指向私有内网、保留或云元数据地址，或域名无法解析，已拒绝测速（已剔除 %d 个）", removed, removed)
 		}
 	}
 
