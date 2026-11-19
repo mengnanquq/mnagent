@@ -184,7 +184,13 @@ func TestUpdateNextTrace(t *testing.T) {
 	targetPath := filepath.Join(tmpDir, "bin", "nexttrace")
 
 	content := bytes.Repeat([]byte("F"), 150*1024) // 150KB
+	sum := sha256.Sum256(content)
+	digest := hex.EncodeToString(sum[:])
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if strings.Contains(r.URL.Path, "/repos/nxtrace/NTrace-core/releases/tags/v1.7.4") {
+			fmt.Fprintf(w, `{"assets":[{"name":"nexttrace_linux_amd64","digest":"sha256:%s"}]}`, digest)
+			return
+		}
 		if strings.Contains(r.URL.Path, "releases/download") {
 			w.Header().Set("Content-Type", "application/octet-stream")
 			w.Write(content)
@@ -239,7 +245,13 @@ func TestUpdateMiaospeed(t *testing.T) {
 	_ = tw.Close()
 	_ = gw.Close()
 
+	miaoSum := sha256.Sum256(buf.Bytes())
+	miaoDigest := hex.EncodeToString(miaoSum[:])
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if strings.Contains(r.URL.Path, "/repos/AirportR/miaospeed/releases/tags/4.7.7") {
+			fmt.Fprintf(w, `{"assets":[{"name":"miaospeed-linux-amd64-4.7.7.tar.gz","digest":"sha256:%s"}]}`, miaoDigest)
+			return
+		}
 		if strings.Contains(r.URL.Path, ".tar.gz") {
 			w.Header().Set("Content-Type", "application/gzip")
 			w.Write(buf.Bytes())
@@ -296,7 +308,13 @@ func TestUpdateMiaospeedWindowsZip(t *testing.T) {
 	_, _ = binWriter.Write(miaoContent)
 	_ = zw.Close()
 
+	zipSum := sha256.Sum256(buf.Bytes())
+	zipDigest := hex.EncodeToString(zipSum[:])
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if strings.Contains(r.URL.Path, "/repos/AirportR/miaospeed/releases/tags/4.7.7") {
+			fmt.Fprintf(w, `{"assets":[{"name":"miaospeed-windows-amd64-4.7.7.zip","digest":"sha256:%s"}]}`, zipDigest)
+			return
+		}
 		if strings.Contains(r.URL.Path, ".zip") {
 			w.Header().Set("Content-Type", "application/zip")
 			w.Write(buf.Bytes())
@@ -491,5 +509,73 @@ func TestUpdateNextTraceVerifiesDigest(t *testing.T) {
 	}
 	if _, err := dm.UpdateNextTrace(context.Background(), target, "v1.7.4/../../x", nil); err == nil {
 		t.Fatal("非法版本号应被拒绝")
+	}
+}
+
+// TestUpdateNextTraceDigestMissingAborts 验证摘要缺失时 fail-closed：
+// API 404、附件未带 digest、API 完全不可达都必须中止安装，且不得覆盖已有二进制。
+func TestUpdateNextTraceDigestMissingAborts(t *testing.T) {
+	content := bytes.Repeat([]byte("N"), 150*1024)
+	cases := []struct {
+		name    string
+		handler http.HandlerFunc
+	}{
+		{"API 404", func(w http.ResponseWriter, r *http.Request) { http.NotFound(w, r) }},
+		{"附件未提供 digest", func(w http.ResponseWriter, r *http.Request) {
+			if strings.Contains(r.URL.Path, "/releases/tags/") {
+				_, _ = w.Write([]byte(`{"assets":[{"name":"nexttrace_linux_amd64","digest":null}]}`))
+				return
+			}
+			_, _ = w.Write(content)
+		}},
+		{"digest 格式非法", func(w http.ResponseWriter, r *http.Request) {
+			if strings.Contains(r.URL.Path, "/releases/tags/") {
+				_, _ = w.Write([]byte(`{"assets":[{"name":"nexttrace_linux_amd64","digest":"sha256:deadbeef"}]}`))
+				return
+			}
+			_, _ = w.Write(content)
+		}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			srv := httptest.NewServer(tc.handler)
+			defer srv.Close()
+
+			dm := newDependencyManager(srv.URL)
+			dm.apiBaseURL = srv.URL
+			dm.githubBaseURL = srv.URL
+			dm.goos = "linux"
+			dm.goarch = "amd64"
+			target := filepath.Join(t.TempDir(), "nexttrace")
+			if err := os.WriteFile(target, []byte("old-binary"), 0755); err != nil {
+				t.Fatal(err)
+			}
+
+			_, err := dm.UpdateNextTrace(context.Background(), target, "v1.7.4", nil)
+			if err == nil || !strings.Contains(err.Error(), "SHA-256 摘要") {
+				t.Fatalf("摘要缺失应中止安装，实际 err=%v", err)
+			}
+			got, err := os.ReadFile(target)
+			if err != nil || string(got) != "old-binary" {
+				t.Fatalf("摘要缺失时不得覆盖已有二进制: content=%q err=%v", string(got), err)
+			}
+		})
+	}
+
+	// API 完全不可达（连接被拒绝）同样必须 fail-closed。
+	dead := httptest.NewServer(http.NotFoundHandler())
+	deadURL := dead.URL
+	dead.Close()
+	dm := newDependencyManager("")
+	dm.apiBaseURL = deadURL
+	dm.githubBaseURL = deadURL
+	dm.goos = "linux"
+	dm.goarch = "amd64"
+	target := filepath.Join(t.TempDir(), "nexttrace")
+	if _, err := dm.UpdateNextTrace(context.Background(), target, "v1.7.4", nil); err == nil {
+		t.Fatal("API 不可达时应中止安装")
+	}
+	if _, err := os.Stat(target); err == nil {
+		t.Fatal("API 不可达时不应写入目标文件")
 	}
 }

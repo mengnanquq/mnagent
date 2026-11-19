@@ -474,7 +474,8 @@ func privateBinPath(name, fallback string) string {
 }
 
 // fetchAssetDigest 通过 GitHub API（直连，不走 gh-proxy）获取指定 Release 附件的 SHA-256 摘要。
-// 返回空串表示无法获得摘要（API 不可达、限流或未提供 digest），由调用方降级为仅记录警告。
+// 拿不到有效摘要（API 不可达、限流、附件不存在或未提供 digest）一律返回错误：
+// 这些依赖以 root 运行，宁可拒绝安装也不能跳过完整性校验。
 func (dm *DependencyManager) fetchAssetDigest(ctx context.Context, repo, tag, assetName string) (string, error) {
 	targetURL := fmt.Sprintf("%s/repos/%s/releases/tags/%s", strings.TrimRight(dm.apiBaseURL, "/"), repo, url.PathEscape(tag))
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, targetURL, nil)
@@ -511,18 +512,23 @@ func (dm *DependencyManager) fetchAssetDigest(ctx context.Context, repo, tag, as
 		if d, ok := strings.CutPrefix(strings.ToLower(a.Digest), "sha256:"); ok && len(d) == 64 {
 			return d, nil
 		}
-		return "", nil
+		return "", fmt.Errorf("Release %s 的附件 %s 未提供 SHA-256 digest", tag, assetName)
 	}
 	return "", fmt.Errorf("Release %s 中不存在附件 %s", tag, assetName)
 }
 
-// downloadVerified 下载附件到 destPath，并在能拿到上游 SHA-256 摘要时强制校验；摘要不一致即报错。
+// downloadVerified 下载附件到 destPath，并强制校验上游 SHA-256 摘要；摘要拿不到或不一致即报错。
 func (dm *DependencyManager) downloadVerified(ctx context.Context, repo, tag, assetName, downloadURL, destPath string, log Logger) (int64, error) {
 	digest, digestErr := dm.fetchAssetDigest(ctx, repo, tag, assetName)
-	if digest == "" && log != nil {
-		log.Warn("无法获取依赖的上游 SHA-256 摘要，将跳过完整性校验", "asset", assetName, "error", digestErr)
+	if digest == "" {
+		if digestErr == nil {
+			digestErr = errors.New("上游未提供摘要")
+		}
+		return 0, fmt.Errorf("无法获取 %s 的上游 SHA-256 摘要，已中止安装：%w", assetName, digestErr)
 	}
-
+	if log != nil {
+		log.Debug("已获取依赖的上游 SHA-256 摘要", "asset", assetName, "digest", digest)
+	}
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, downloadURL, nil)
 	if err != nil {
 		return 0, err
@@ -553,11 +559,9 @@ func (dm *DependencyManager) downloadVerified(ctx context.Context, repo, tag, as
 	if err != nil {
 		return 0, fmt.Errorf("写入 %s 失败：%w", assetName, err)
 	}
-	if digest != "" {
-		actual := hex.EncodeToString(hasher.Sum(nil))
-		if subtle.ConstantTimeCompare([]byte(actual), []byte(digest)) != 1 {
-			return 0, fmt.Errorf("%s SHA-256 完整性校验失败：期望 %s，实际 %s (防篡改拦截)", assetName, digest, actual)
-		}
+	actual := hex.EncodeToString(hasher.Sum(nil))
+	if subtle.ConstantTimeCompare([]byte(actual), []byte(digest)) != 1 {
+		return 0, fmt.Errorf("%s SHA-256 完整性校验失败：期望 %s，实际 %s (防篡改拦截)", assetName, digest, actual)
 	}
 	return written, nil
 }
