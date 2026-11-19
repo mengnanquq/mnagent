@@ -30,17 +30,21 @@ Agent 通过 HTTPS **主动长轮询**接收服务端下发的网络探测与节
 
 ### Linux / OpenWrt / macOS
 ```sh
-(curl -fsSL https://github.com/mengnanquq/mnagent/releases/download/v0.3.101/install.sh \
-  || wget -qO- https://github.com/mengnanquq/mnagent/releases/download/v0.3.101/install.sh) \
-  | sh -s -- --bot https://<服务端地址>/agent --token-file /etc/mnagent/token
+(curl -fsSL https://github.com/mengnanquq/mnagent/releases/latest/download/install.sh \
+  || wget -qO- https://github.com/mengnanquq/mnagent/releases/latest/download/install.sh) \
+  | MNAGENT_TOKEN='<令牌>' sh -s -- --bot https://<服务端地址>/agent
 ```
+
+> 非 root 用户请写成 `| sudo env MNAGENT_TOKEN='<令牌>' sh -s -- ...`（sudo 默认会清空环境变量，必须显式保留；不要用 `sudo` 包住整个管道，否则脚本会从终端而不是管道读取）。
 
 ### Windows (以管理员身份打开 PowerShell)
 ```powershell
-& ([scriptblock]::Create((irm https://github.com/mengnanquq/mnagent/releases/download/v0.3.101/install.ps1))) -Bot "https://<服务端地址>/agent" -TokenFile "C:\ProgramData\mnagent\token"
+$env:MNAGENT_TOKEN = '<令牌>'
+& ([scriptblock]::Create((irm https://github.com/mengnanquq/mnagent/releases/latest/download/install.ps1))) -Bot "https://<服务端地址>/agent"
+Remove-Item Env:MNAGENT_TOKEN
 ```
 
-> 安装脚本随每个 Release 作为附件发布；请把上面的 `v0.3.101` 换成要安装的 release tag。为避免令牌出现在进程 argv 与命令历史中，推荐 `--token-file`（Linux）或 `-TokenFile`（Windows），也支持环境变量 `MNAGENT_TOKEN` 与 Linux 下的 `--token-stdin`。`--token` 仅为兼容旧命令保留，使用时会打印警告。
+> 安装脚本从 **v0.3.102** 起随每个 Release 作为附件发布（`releases/latest/download/install.sh` 与 `install.ps1`）。更早的 Release 没有这两个附件，可改用 raw main 分支的脚本：`https://raw.githubusercontent.com/mengnanquq/mnagent/main/install.sh`（Windows 对应 `install.ps1`）。为避免令牌出现在进程 argv 与命令历史中，推荐环境变量 `MNAGENT_TOKEN`、`--token-file`（Linux）或 `-TokenFile`（Windows，需先存在令牌文件），也支持 Linux 下的 `--token-stdin`。`--token` 仅为兼容旧命令保留，使用时会打印警告。
 >
 > **网络受限 / 国内加速**：
 > 在安装参数中附加 `--gh-proxy https://gh-proxy.com/`（Windows 添加 `-GhProxy "https://gh-proxy.com/"`），脚本自身、Agent 更新以及依赖下载均会自动经由加速代理。
