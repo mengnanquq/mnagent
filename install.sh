@@ -119,16 +119,35 @@ for arg in "$@"; do
 	esac
 done
 
-# 需要 root：非 root 时若脚本为本地文件则通过 sudo 自我提权重跑，管道执行则直接给出提示避免读空 stdin。
+# 需要 root：非 root 时若脚本为本地文件则通过 sudo 自我提权重跑；管道执行时无法重放
+# 已被 sh 读走的脚本，只能给出可复制的提示（不重新下载脚本：避免以 root 执行与用户
+# 实际审查内容不一致的远端文件）。
 if [ "$(id -u)" != "0" ]; then
 	if command -v sudo >/dev/null 2>&1 && [ -f "$0" ]; then
 		log "需要 root 权限，正在通过 sudo 重新执行"
-		if sudo sh "$0" "$@"; then
+		reexec_ok="no"
+		if [ -n "${MNAGENT_TOKEN:-}" ]; then
+			# sudo 默认清空环境：优先 --preserve-env 按变量名传递，令牌不会出现在 ps 的 argv 中；
+			# 若安全策略不允许保留环境，再回退到显式赋值（仅短暂存在于 sudo 的 argv）。
+			if sudo --preserve-env=MNAGENT_TOKEN sh "$0" "$@"; then
+				reexec_ok="yes"
+			elif sudo env MNAGENT_TOKEN="$MNAGENT_TOKEN" sh "$0" "$@"; then
+				reexec_ok="yes"
+			fi
+		elif sudo sh "$0" "$@"; then
+			reexec_ok="yes"
+		fi
+		if [ "$reexec_ok" = "yes" ]; then
 			exit 0
 		fi
 		die "提权失败：请以 root 运行（或用 sudo -i 后再执行本条命令）"
 	fi
-	die "需要 root 权限（管道安装请用 curl ... | sudo sh -s -- ...；OpenWrt 请以 root 登录）"
+	if [ -n "${MNAGENT_TOKEN:-}" ]; then
+		die "需要 root 权限。sudo 默认会清空 MNAGENT_TOKEN，请显式保留该变量后重试（下面的 \$MNAGENT_TOKEN 由当前 shell 展开，不会打印令牌明文）：
+  (curl -fsSL <脚本地址> || wget -qO- <脚本地址>) | sudo env MNAGENT_TOKEN=\"\$MNAGENT_TOKEN\" sh -s -- <原有安装参数>
+也可以先 sudo -i 进入 root shell，再原样执行不带 sudo 的安装命令；OpenWrt 请以 root 登录。"
+	fi
+	die "需要 root 权限（管道安装请用 curl ... | sudo sh -s -- ...；若用 MNAGENT_TOKEN 传令牌，必须写成 sudo env MNAGENT_TOKEN=\"\$MNAGENT_TOKEN\" sh -s -- ...，否则 sudo 会清空该变量；OpenWrt 请以 root 登录）"
 fi
 
 while [ $# -gt 0 ]; do

@@ -267,6 +267,26 @@ func TestInstallScriptNormalizesTokenStdinBeforeInherit(t *testing.T) {
 	}
 }
 
+// TestInstallScriptNonRootHintKeepsToken 守护非 root 提示：令牌来自 MNAGENT_TOKEN 时，
+// 提示的 sudo 命令必须保留该环境变量（sudo 默认会清空），且不能打印令牌明文。
+func TestInstallScriptNonRootHintKeepsToken(t *testing.T) {
+	script := string(readInstallScript(t))
+	if !containsActiveLine(script, `sudo --preserve-env=MNAGENT_TOKEN sh "$0"`) {
+		t.Error("本机脚本提权时应使用 sudo --preserve-env=MNAGENT_TOKEN 保留环境变量")
+	}
+	if !containsActiveLine(script, `sudo env MNAGENT_TOKEN="$MNAGENT_TOKEN" sh "$0"`) {
+		t.Error("应提供 sudo env MNAGENT_TOKEN=... 的回退提权方式")
+	}
+	if !containsActiveLine(script, `sudo env MNAGENT_TOKEN=\"\$MNAGENT_TOKEN\" sh -s --`) {
+		t.Error("非 root 提示应给出保留 MNAGENT_TOKEN 的 sudo 命令，并用 $MNAGENT_TOKEN 占位而不是令牌明文")
+	}
+	for _, line := range strings.Split(script, "\n") {
+		if strings.Contains(line, "die ") && strings.Contains(line, "MNAGENT_TOKEN") && strings.Contains(line, "$MNAGENT_TOKEN\"") && !strings.Contains(line, `\$MNAGENT_TOKEN`) {
+			t.Fatalf("提示中不要展开令牌明文，应使用 $MNAGENT_TOKEN 占位: %s", line)
+		}
+	}
+}
+
 // TestInstallScriptSupportsOpenWrt 覆盖 OpenWrt 相关的关键实现：
 // procd 服务、BusyBox 回退、平台/init 目录开关、MIPS 字节序识别、sysupgrade 处理。
 func TestInstallScriptSupportsOpenWrt(t *testing.T) {
