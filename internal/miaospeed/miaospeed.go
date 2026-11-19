@@ -648,7 +648,7 @@ func executeMiaospeedTask(ctx context.Context, wsURL, origin, token string, node
 		case <-ctx.Done():
 			if len(progressSlots) > 0 {
 				resTask := &slaveTask{Results: progressSlots}
-				return parseSlaveTaskResult(resTask, nodes, totalNodes, plan, time.Since(startTime)), nil
+				return parseSlaveTaskResultContext(ctx, resTask, nodes, totalNodes, plan, time.Since(startTime)), nil
 			}
 			return nil, ctx.Err()
 		default:
@@ -689,7 +689,7 @@ func executeMiaospeedTask(ctx context.Context, wsURL, origin, token string, node
 					curNode = &nodes[resp.Progress.Index]
 					curName = curNode.Name
 				}
-				singleReport := parseSingleSlot(*resp.Progress.Record, curNode, plan)
+				singleReport := parseSingleSlotContext(ctx, *resp.Progress.Record, curNode, plan)
 				nodeRawBytes, _ := json.Marshal(singleReport)
 
 				stageDesc := "测速中"
@@ -709,14 +709,14 @@ func executeMiaospeedTask(ctx context.Context, wsURL, origin, token string, node
 		}
 
 		if resp.Result != nil {
-			report := parseSlaveTaskResult(resp.Result, nodes, totalNodes, plan, time.Since(startTime))
+			report := parseSlaveTaskResultContext(ctx, resp.Result, nodes, totalNodes, plan, time.Since(startTime))
 			return report, nil
 		}
 	}
 
 	if len(progressSlots) > 0 {
 		resTask := &slaveTask{Results: progressSlots}
-		report := parseSlaveTaskResult(resTask, nodes, totalNodes, plan, time.Since(startTime))
+		report := parseSlaveTaskResultContext(ctx, resTask, nodes, totalNodes, plan, time.Since(startTime))
 		return report, nil
 	}
 

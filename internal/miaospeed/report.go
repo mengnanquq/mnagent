@@ -1,6 +1,7 @@
 package miaospeed
 
 import (
+	"container/list"
 	"context"
 	"encoding/json"
 	"fmt"
@@ -165,7 +166,13 @@ func formatBytesPerSec(bps float64) string {
 }
 
 // parseSingleSlot 提取单个节点的 slot 数据为 MiaospeedReport。
+// 保留无 ctx 包装供旧调用与测试使用；实际查询走 parseSingleSlotContext。
 func parseSingleSlot(slot slaveEntrySlot, node *MiaospeedNode, plan miaospeedTestPlan) MiaospeedReport {
+	return parseSingleSlotContext(context.Background(), slot, node, plan)
+}
+
+// parseSingleSlotContext 带 ctx 解析节点结果，GeoIP 查询可随任务取消立即返回。
+func parseSingleSlotContext(ctx context.Context, slot slaveEntrySlot, node *MiaospeedNode, plan miaospeedTestPlan) MiaospeedReport {
 	rep := MiaospeedReport{
 		TestMode:        plan.ModeDescription,
 		DownloadThreads: int(plan.DownloadThreading),
@@ -198,7 +205,7 @@ func parseSingleSlot(slot slaveEntrySlot, node *MiaospeedNode, plan miaospeedTes
 			if rep.InboundGeo == rep.NodeName || rep.InboundGeo == rep.Server || rep.InboundGeo == "" || len(strings.TrimSpace(rep.InboundGeo)) <= 3 || !strings.Contains(rep.InboundGeo, " ") {
 				if node != nil && node.Server != "" && !isLocalHost(node.Server) {
 					sHost := extractHost(node.Server)
-					if resolvedIP, resolvedGeo := queryIPGeo(sHost); resolvedGeo != "" && resolvedGeo != "本地直连" {
+					if resolvedIP, resolvedGeo := queryIPGeo(ctx, sHost); resolvedGeo != "" && resolvedGeo != "本地直连" {
 						rep.InboundGeo = resolvedGeo
 						if resolvedIP != "" {
 							inIP = resolvedIP
@@ -233,7 +240,7 @@ func parseSingleSlot(slot slaveEntrySlot, node *MiaospeedNode, plan miaospeedTes
 
 	if rep.InboundGeo == "" && node != nil && node.Server != "" && !isLocalHost(node.Server) {
 		sHost := extractHost(node.Server)
-		if resolvedIP, resolvedGeo := queryIPGeo(sHost); resolvedGeo != "" && resolvedGeo != "本地直连" {
+		if resolvedIP, resolvedGeo := queryIPGeo(ctx, sHost); resolvedGeo != "" && resolvedGeo != "本地直连" {
 			rep.InboundGeo = resolvedGeo
 			if resolvedIP != "" && !strings.Contains(rep.InboundGeo, resolvedIP) && !strings.Contains(rep.InboundGeo, "(") {
 				rep.InboundGeo = fmt.Sprintf("%s (%s)", rep.InboundGeo, resolvedIP)
@@ -243,7 +250,7 @@ func parseSingleSlot(slot slaveEntrySlot, node *MiaospeedNode, plan miaospeedTes
 
 	// 出站 GeoIP 兜底 1: 出站 IP 有值但 OutboundGeo 为空时，通过本地 IP 归属地库查询
 	if rep.OutboundGeo == "" && rep.OutboundIP != "" && !isLocalHost(rep.OutboundIP) {
-		if _, resolvedGeo := queryIPGeo(rep.OutboundIP); resolvedGeo != "" && resolvedGeo != "本地直连" {
+		if _, resolvedGeo := queryIPGeo(ctx, rep.OutboundIP); resolvedGeo != "" && resolvedGeo != "本地直连" {
 			rep.OutboundGeo = resolvedGeo
 		}
 	}
@@ -346,6 +353,12 @@ func inferOutboundGeoFromMedia(media map[string]string) string {
 
 // parseSlaveTaskResult 将 miaospeed 任务返回结果整理为 MiaospeedReport。
 func parseSlaveTaskResult(task *slaveTask, nodes []MiaospeedNode, totalNodes int, plan miaospeedTestPlan, duration time.Duration) *MiaospeedReport {
+	return parseSlaveTaskResultContext(context.Background(), task, nodes, totalNodes, plan, duration)
+}
+
+// parseSlaveTaskResultContext 带 ctx 整理测速结果；逐节点 GeoIP 查询使用受限并发（4），
+// 避免数百个节点串行查询导致报告长时间无法生成。
+func parseSlaveTaskResultContext(ctx context.Context, task *slaveTask, nodes []MiaospeedNode, totalNodes int, plan miaospeedTestPlan, duration time.Duration) *MiaospeedReport {
 	if totalNodes <= 0 {
 		totalNodes = len(nodes)
 	}
@@ -354,31 +367,23 @@ func parseSlaveTaskResult(task *slaveTask, nodes []MiaospeedNode, totalNodes int
 		if len(nodes) > 0 {
 			n = &nodes[0]
 		}
-		rep := parseSingleSlot(slaveEntrySlot{}, n, plan)
+		rep := parseSingleSlotContext(ctx, slaveEntrySlot{}, n, plan)
 		rep.TotalNodes = totalNodes
 		rep.DurationMs = duration.Milliseconds()
 		rep.RawResults = task.Results
 		return &rep
 	}
 
-	var firstNode *MiaospeedNode
-	if len(nodes) > 0 {
-		firstNode = &nodes[0]
-	}
-	mainRep := parseSingleSlot(task.Results[0], firstNode, plan)
+	reports := parseSlotsConcurrently(ctx, task.Results, nodes, plan)
+	mainRep := reports[0]
 	mainRep.TotalNodes = totalNodes
 	mainRep.DurationMs = duration.Milliseconds()
 	mainRep.RawResults = task.Results
 
-	// 多节点结果同步封装为 SubReports
-	if len(task.Results) > 1 {
-		mainRep.SubReports = make([]MiaospeedReport, 0, len(task.Results))
-		for i, slot := range task.Results {
-			var nodePtr *MiaospeedNode
-			if i < len(nodes) {
-				nodePtr = &nodes[i]
-			}
-			sub := parseSingleSlot(slot, nodePtr, plan)
+	// 多节点结果同步封装为 SubReports（保持与 task.Results 相同顺序）。
+	if len(reports) > 1 {
+		mainRep.SubReports = make([]MiaospeedReport, 0, len(reports))
+		for _, sub := range reports {
 			sub.DurationMs = duration.Milliseconds()
 			sub.TotalNodes = totalNodes
 			mainRep.SubReports = append(mainRep.SubReports, sub)
@@ -386,6 +391,41 @@ func parseSlaveTaskResult(task *slaveTask, nodes []MiaospeedNode, totalNodes int
 	}
 
 	return &mainRep
+}
+
+// parseSlotsConcurrently 以固定并发度解析节点结果，输出顺序与输入一致。
+func parseSlotsConcurrently(ctx context.Context, slots []slaveEntrySlot, nodes []MiaospeedNode, plan miaospeedTestPlan) []MiaospeedReport {
+	reports := make([]MiaospeedReport, len(slots))
+	if len(slots) == 0 {
+		return reports
+	}
+	sem := make(chan struct{}, geoLookupWorkers)
+	var wg sync.WaitGroup
+	for i := range slots {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			select {
+			case sem <- struct{}{}:
+				defer func() { <-sem }()
+			case <-ctx.Done():
+				// 任务已取消：仍生成基础报告（ctx 已取消，远程 GeoIP 查询会立即跳过），
+				// 保证已收到的进度不丢失。
+				reports[i] = parseSingleSlotContext(ctx, slots[i], nodeAt(nodes, i), plan)
+				return
+			}
+			reports[i] = parseSingleSlotContext(ctx, slots[i], nodeAt(nodes, i), plan)
+		}(i)
+	}
+	wg.Wait()
+	return reports
+}
+
+func nodeAt(nodes []MiaospeedNode, i int) *MiaospeedNode {
+	if i < 0 || i >= len(nodes) {
+		return nil
+	}
+	return &nodes[i]
 }
 
 // parseMatrixFloat 提取形如 `{"Value":12.3}` 或裸数值 `12.3` 的浮点数。
@@ -525,145 +565,135 @@ func isLocalHost(addr string) bool {
 	return ip != nil && (ip.IsLoopback() || ip.IsUnspecified())
 }
 
-var (
-	geoCacheMu  sync.RWMutex
-	geoCacheMap = make(map[string]struct{ ip, geo string })
+const (
+	// geoCacheMaxEntries 限制 GeoIP 缓存条目数，低内存设备上也不会无限增长。
+	geoCacheMaxEntries = 512
+	// geoCacheTTL 让缓存定期失效，避免 IP 归属地变化后长期展示旧数据。
+	geoCacheTTL = 30 * time.Minute
+	// geoLookupWorkers 限制报告生成时并发查询 GeoIP 的节点数。
+	geoLookupWorkers = 4
 )
 
-// queryIPGeo 主动查询 IP 或域名的地理位置与运营商（带线程安全内存缓存）。
-func queryIPGeo(host string) (ip, geo string) {
+// geoHTTPClient 是 GeoIP 查询共享的包级客户端，复用连接并统一超时。
+var geoHTTPClient = &http.Client{Timeout: 3 * time.Second}
+
+type geoCacheEntry struct {
+	ip      string
+	geo     string
+	expires time.Time
+	elem    *list.Element
+}
+
+type geoIPCache struct {
+	mu       sync.Mutex
+	entries  map[string]*geoCacheEntry
+	order    *list.List // 前端最新、后端最旧
+	capacity int
+	ttl      time.Duration
+	now      func() time.Time
+}
+
+func newGeoIPCache(capacity int, ttl time.Duration) *geoIPCache {
+	return &geoIPCache{
+		entries:  make(map[string]*geoCacheEntry),
+		order:    list.New(),
+		capacity: capacity,
+		ttl:      ttl,
+		now:      time.Now,
+	}
+}
+
+var defaultGeoCache = newGeoIPCache(geoCacheMaxEntries, geoCacheTTL)
+
+func (c *geoIPCache) get(key string) (ip, geo string, ok bool) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	entry, ok := c.entries[key]
+	if !ok {
+		return "", "", false
+	}
+	if !entry.expires.After(c.now()) {
+		c.removeLocked(key, entry)
+		return "", "", false
+	}
+	c.order.MoveToFront(entry.elem)
+	return entry.ip, entry.geo, true
+}
+
+func (c *geoIPCache) put(key, ip, geo string) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if entry, ok := c.entries[key]; ok {
+		entry.ip, entry.geo = ip, geo
+		entry.expires = c.now().Add(c.ttl)
+		c.order.MoveToFront(entry.elem)
+		return
+	}
+	entry := &geoCacheEntry{ip: ip, geo: geo, expires: c.now().Add(c.ttl)}
+	entry.elem = c.order.PushFront(key)
+	c.entries[key] = entry
+	for len(c.entries) > c.capacity {
+		back := c.order.Back()
+		if back == nil {
+			break
+		}
+		oldKey := back.Value.(string)
+		c.removeLocked(oldKey, c.entries[oldKey])
+	}
+}
+
+func (c *geoIPCache) removeLocked(key string, entry *geoCacheEntry) {
+	if entry == nil {
+		return
+	}
+	if entry.elem != nil {
+		c.order.Remove(entry.elem)
+	}
+	delete(c.entries, key)
+}
+
+// queryIPGeo 主动查询 IP 或域名的地理位置与运营商（带 LRU + TTL 内存缓存）。
+// ctx 取消时立即返回，不再继续访问外部 GeoIP 服务。
+func queryIPGeo(ctx context.Context, host string) (ip, geo string) {
 	cleanHost := extractHost(host)
 	if cleanHost == "" {
 		return "", ""
+	}
+	if ctx == nil {
+		ctx = context.Background()
 	}
 	parsedIP := net.ParseIP(cleanHost)
 	if parsedIP != nil && (parsedIP.IsLoopback() || parsedIP.IsPrivate() || parsedIP.IsUnspecified()) {
 		return cleanHost, "本地直连"
 	}
 
-	geoCacheMu.RLock()
-	if cached, ok := geoCacheMap[cleanHost]; ok {
-		geoCacheMu.RUnlock()
-		return cached.ip, cached.geo
+	if cachedIP, cachedGeo, ok := defaultGeoCache.get(cleanHost); ok {
+		return cachedIP, cachedGeo
 	}
-	geoCacheMu.RUnlock()
 
 	targetIP := cleanHost
 	if parsedIP == nil {
-		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
-		ips, err := net.DefaultResolver.LookupIP(ctx, "ip", cleanHost)
+		lookupCtx, cancel := context.WithTimeout(ctx, 2*time.Second)
+		ips, err := net.DefaultResolver.LookupIP(lookupCtx, "ip", cleanHost)
 		cancel()
 		if err == nil && len(ips) > 0 {
 			targetIP = ips[0].String()
 		}
 	}
 
-	isV6 := strings.Contains(targetIP, ":")
-	apiURL := "https://ipv4.ipleak.net/json/" + targetIP
-	if isV6 {
-		apiURL = "https://ipv6.ipleak.net/json/" + targetIP
-	}
-
-	client := &http.Client{Timeout: 3 * time.Second}
-	req, err := http.NewRequest(http.MethodGet, apiURL, nil)
-	if err == nil {
-		req.Header.Set("User-Agent", "Mozilla/5.0")
-		resp, err := client.Do(req)
-		if err == nil {
-			if resp.StatusCode == http.StatusOK {
-				var info struct {
-					CountryName string `json:"country_name"`
-					ISPName     string `json:"isp_name"`
-					IP          string `json:"ip"`
-				}
-				if err := json.NewDecoder(io.LimitReader(resp.Body, 64*1024)).Decode(&info); err == nil {
-					if info.IP != "" {
-						targetIP = info.IP
-					}
-					parts := make([]string, 0, 2)
-					if info.CountryName != "" {
-						parts = append(parts, info.CountryName)
-					}
-					if info.ISPName != "" && info.ISPName != info.CountryName {
-						parts = append(parts, info.ISPName)
-					}
-					if len(parts) > 0 {
-						geo = strings.Join(parts, " ")
-					}
-				}
+	if fetch := geoLookupFuncs; len(fetch) > 0 {
+		for _, lookup := range fetch {
+			if ctx.Err() != nil {
+				break
 			}
-			_ = resp.Body.Close()
-		}
-	}
-
-	if geo == "" {
-		reqSB, err := http.NewRequest(http.MethodGet, "https://api.ip.sb/geoip/"+targetIP, nil)
-		if err == nil {
-			reqSB.Header.Set("User-Agent", "Mozilla/5.0")
-			respSB, err := client.Do(reqSB)
-			if err == nil {
-				if respSB.StatusCode == http.StatusOK {
-					var infoSB struct {
-						Country string `json:"country"`
-						ISP     string `json:"isp"`
-						IP      string `json:"ip"`
-					}
-					if err := json.NewDecoder(io.LimitReader(respSB.Body, 64*1024)).Decode(&infoSB); err == nil {
-						if infoSB.IP != "" {
-							targetIP = infoSB.IP
-						}
-						parts := make([]string, 0, 2)
-						if infoSB.Country != "" {
-							parts = append(parts, infoSB.Country)
-						}
-						if infoSB.ISP != "" && infoSB.ISP != infoSB.Country {
-							parts = append(parts, infoSB.ISP)
-						}
-						if len(parts) > 0 {
-							geo = strings.Join(parts, " ")
-						}
-					}
+			if resolvedIP, resolvedGeo, ok := lookup(ctx, targetIP); ok {
+				if resolvedIP != "" {
+					targetIP = resolvedIP
 				}
-				_ = respSB.Body.Close()
-			}
-		}
-	}
-
-	if geo == "" {
-		reqAPI, err := http.NewRequest(http.MethodGet, "http://ip-api.com/json/"+targetIP, nil)
-		if err == nil {
-			reqAPI.Header.Set("User-Agent", "Mozilla/5.0")
-			respAPI, err := client.Do(reqAPI)
-			if err == nil {
-				if respAPI.StatusCode == http.StatusOK {
-					var infoAPI struct {
-						Country string `json:"country"`
-						ISP     string `json:"isp"`
-						Org     string `json:"org"`
-						Query   string `json:"query"`
-						Status  string `json:"status"`
-					}
-					if err := json.NewDecoder(io.LimitReader(respAPI.Body, 64*1024)).Decode(&infoAPI); err == nil && infoAPI.Status == "success" {
-						if infoAPI.Query != "" {
-							targetIP = infoAPI.Query
-						}
-						parts := make([]string, 0, 2)
-						if infoAPI.Country != "" {
-							parts = append(parts, infoAPI.Country)
-						}
-						isp := infoAPI.ISP
-						if isp == "" || isp == infoAPI.Country {
-							isp = infoAPI.Org
-						}
-						if isp != "" && isp != infoAPI.Country {
-							parts = append(parts, isp)
-						}
-						if len(parts) > 0 {
-							geo = strings.Join(parts, " ")
-						}
-					}
+				if resolvedGeo != "" {
+					geo = resolvedGeo
+					break
 				}
-				_ = respAPI.Body.Close()
 			}
 		}
 	}
@@ -672,12 +702,86 @@ func queryIPGeo(host string) (ip, geo string) {
 	if geo == "" && ip != "" {
 		geo = ip
 	}
-
-	geoCacheMu.Lock()
-	geoCacheMap[cleanHost] = struct{ ip, geo string }{ip: ip, geo: geo}
-	geoCacheMu.Unlock()
-
+	defaultGeoCache.put(cleanHost, ip, geo)
 	return ip, geo
+}
+
+// geoLookupFuncs 是依次尝试的 GeoIP 数据源，全部使用 HTTPS，避免明文查询泄露节点地址。
+var geoLookupFuncs = []func(context.Context, string) (ip, geo string, ok bool){
+	lookupGeoIPLeak,
+	lookupGeoIPSB,
+	lookupGeoIPAPI,
+}
+
+type geoAPIResponse struct {
+	IP          string `json:"ip"`
+	Query       string `json:"query"`
+	Country     string `json:"country"`
+	CountryName string `json:"country_name"`
+	ISP         string `json:"isp"`
+	Org         string `json:"org"`
+	Error       bool   `json:"error"`
+}
+
+// fetchGeoAPI 请求一个 JSON GeoIP 接口，并拼接“国家 运营商”展示文案。
+func fetchGeoAPI(ctx context.Context, apiURL string) (ip, geo string, ok bool) {
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, apiURL, nil)
+	if err != nil {
+		return "", "", false
+	}
+	req.Header.Set("User-Agent", "Mozilla/5.0")
+	resp, err := geoHTTPClient.Do(req)
+	if err != nil {
+		return "", "", false
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return "", "", false
+	}
+	var info geoAPIResponse
+	if err := json.NewDecoder(io.LimitReader(resp.Body, 64*1024)).Decode(&info); err != nil || info.Error {
+		return "", "", false
+	}
+	if info.IP != "" {
+		ip = info.IP
+	} else if info.Query != "" {
+		ip = info.Query
+	}
+	country := info.CountryName
+	if country == "" {
+		country = info.Country
+	}
+	isp := info.ISP
+	if isp == "" || isp == country {
+		isp = info.Org
+	}
+	parts := make([]string, 0, 2)
+	if country != "" {
+		parts = append(parts, country)
+	}
+	if isp != "" && isp != country {
+		parts = append(parts, isp)
+	}
+	if len(parts) > 0 {
+		geo = strings.Join(parts, " ")
+	}
+	return ip, geo, true
+}
+
+func lookupGeoIPLeak(ctx context.Context, targetIP string) (string, string, bool) {
+	host := "ipv4.ipleak.net"
+	if strings.Contains(targetIP, ":") {
+		host = "ipv6.ipleak.net"
+	}
+	return fetchGeoAPI(ctx, "https://"+host+"/json/"+targetIP)
+}
+
+func lookupGeoIPSB(ctx context.Context, targetIP string) (string, string, bool) {
+	return fetchGeoAPI(ctx, "https://api.ip.sb/geoip/"+targetIP)
+}
+
+func lookupGeoIPAPI(ctx context.Context, targetIP string) (string, string, bool) {
+	return fetchGeoAPI(ctx, "https://ipapi.co/"+targetIP+"/json/")
 }
 
 // parseMatrixHijack 解析防劫持 JSON

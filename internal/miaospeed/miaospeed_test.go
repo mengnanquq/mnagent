@@ -19,6 +19,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync/atomic"
 	"testing"
 
 	"golang.org/x/net/websocket"
@@ -1644,9 +1645,7 @@ func TestInboundGeoFallbackWhenBareCountryCode(t *testing.T) {
 		Protocol: "ss",
 		Server:   "1.14.0.1:8388",
 	}
-	geoCacheMu.Lock()
-	geoCacheMap["1.14.0.1"] = struct{ ip, geo string }{ip: "1.14.0.1", geo: "China Shenzhen Tencent"}
-	geoCacheMu.Unlock()
+	defaultGeoCache.put("1.14.0.1", "1.14.0.1", "China Shenzhen Tencent")
 
 	// 模拟 miaospeed 核心因回退至代理自身出口 trace 而错误返回 "TW"
 	slot := slaveEntrySlot{
@@ -1797,5 +1796,93 @@ func TestParseProxyURI_SetsNodeURL(t *testing.T) {
 	rep := parseSingleSlot(slot, node, miaospeedTestPlan{})
 	if rep.URL != vlessURI {
 		t.Fatalf("rep.URL 期望 %q, 实际: %q", vlessURI, rep.URL)
+	}
+}
+
+// TestGeoIPCacheLRUAndTTL 验证 GeoIP 缓存有界、按 LRU 淘汰并支持 TTL 失效。
+func TestGeoIPCacheLRUAndTTL(t *testing.T) {
+	now := time.Unix(1000, 0)
+	c := newGeoIPCache(2, time.Minute)
+	c.now = func() time.Time { return now }
+
+	c.put("a", "1.1.1.1", "A")
+	c.put("b", "2.2.2.2", "B")
+	if _, _, ok := c.get("a"); !ok {
+		t.Fatal("a 应在缓存中")
+	}
+	c.put("c", "3.3.3.3", "C") // b 最久未使用，应被淘汰
+	if _, _, ok := c.get("b"); ok {
+		t.Fatal("b 应被 LRU 淘汰")
+	}
+	if ip, geo, ok := c.get("a"); !ok || ip != "1.1.1.1" || geo != "A" {
+		t.Fatalf("a 应仍在缓存且内容正确，实际 ip=%q geo=%q ok=%v", ip, geo, ok)
+	}
+	now = now.Add(2 * time.Minute)
+	if _, _, ok := c.get("c"); ok {
+		t.Fatal("TTL 到期后 c 应失效")
+	}
+	if geoCacheMaxEntries != 512 || defaultGeoCache.capacity != 512 {
+		t.Fatalf("GeoIP 缓存容量应为 512，实际常量=%d 实例=%d", geoCacheMaxEntries, defaultGeoCache.capacity)
+	}
+}
+
+// TestQueryIPGeoCanceledContext 验证 ctx 取消后 queryIPGeo 立即返回，不再等待外部接口。
+func TestQueryIPGeoCanceledContext(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	start := time.Now()
+	ip, geo := queryIPGeo(ctx, "203.0.113.77")
+	if elapsed := time.Since(start); elapsed > time.Second {
+		t.Fatalf("ctx 已取消时 queryIPGeo 耗时 %s，应立即返回", elapsed)
+	}
+	if ip != "203.0.113.77" || geo == "" {
+		t.Fatalf("应返回目标 IP 与兜底地域，实际 ip=%q geo=%q", ip, geo)
+	}
+}
+
+// TestParseSlaveTaskResultLimitsGeoConcurrency 验证多节点报告生成时 GeoIP 查询并发不超过 4，
+// 同时输出顺序与节点顺序一致。
+func TestParseSlaveTaskResultLimitsGeoConcurrency(t *testing.T) {
+	oldLookups := geoLookupFuncs
+	defer func() { geoLookupFuncs = oldLookups }()
+
+	var active, maxActive atomic.Int32
+	geoLookupFuncs = []func(context.Context, string) (string, string, bool){
+		func(ctx context.Context, targetIP string) (string, string, bool) {
+			cur := active.Add(1)
+			for {
+				prev := maxActive.Load()
+				if cur <= prev || maxActive.CompareAndSwap(prev, cur) {
+					break
+				}
+			}
+			time.Sleep(20 * time.Millisecond)
+			active.Add(-1)
+			return targetIP, "Test Geo", true
+		},
+	}
+
+	const nodeCount = 12
+	nodes := make([]MiaospeedNode, nodeCount)
+	slots := make([]slaveEntrySlot, nodeCount)
+	for i := 0; i < nodeCount; i++ {
+		nodes[i] = MiaospeedNode{Name: fmt.Sprintf("Node-%d", i), Server: fmt.Sprintf("203.0.113.%d:443", i+1)}
+		slots[i] = slaveEntrySlot{Matrices: []matrixResponse{{Type: matrixRTTPing, Payload: fmt.Sprintf("%d", i+1)}}}
+	}
+	plan := buildMiaospeedTestPlan(model.Job{Query: "latency"}, nodeCount)
+	rep := parseSlaveTaskResultContext(context.Background(), &slaveTask{Results: slots}, nodes, nodeCount, plan, time.Second)
+
+	if got := maxActive.Load(); got > geoLookupWorkers {
+		t.Fatalf("GeoIP 查询最大并发 = %d，超过上限 %d", got, geoLookupWorkers)
+	} else if got < 2 {
+		t.Fatalf("GeoIP 查询应并发执行，实际最大并发仅 %d", got)
+	}
+	if len(rep.SubReports) != nodeCount {
+		t.Fatalf("SubReports = %d，期望 %d", len(rep.SubReports), nodeCount)
+	}
+	for i, sub := range rep.SubReports {
+		if sub.NodeName != nodes[i].Name || sub.PingRTTMs != float64(i+1) {
+			t.Fatalf("第 %d 个节点结果顺序/内容异常: %+v", i, sub)
+		}
 	}
 }
