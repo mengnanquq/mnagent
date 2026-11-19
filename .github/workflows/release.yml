@@ -164,7 +164,10 @@ jobs:
       - name: Add installer scripts to release assets
         run: |
           cp install.sh install.ps1 dist/
-          (cd dist && sha256sum install.sh install.ps1 > installers.sha256)
+          # 每个资产都要有同名 .sha256（安装脚本也不例外），校验步骤才能逐个确认。
+          (cd dist && sha256sum install.sh > install.sh.sha256 \
+            && sha256sum install.ps1 > install.ps1.sha256 \
+            && sha256sum install.sh install.ps1 > installers.sha256)
       - name: Sign checksum files
         env:
           MNAGENT_SIGNING_PRIVATE_KEY: ${{ secrets.MNAGENT_SIGNING_PRIVATE_KEY }}
@@ -183,6 +186,71 @@ jobs:
           cat dist/*.sha256 | LC_ALL=C sort > dist/checksums.txt
           go run ./scripts/gen-signing-key.go -mode sign -key "$key" -in dist/checksums.txt -out dist/checksums.txt.sig
           rm -f "$key"
+      - name: Verify release assets
+        env:
+          MNAGENT_SIGNING_PRIVATE_KEY: ${{ secrets.MNAGENT_SIGNING_PRIVATE_KEY }}
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+
+          # 构建 job 是否内置公钥完全取决于同一个 Secret：已配置则本次发布的所有
+          # .sha256 都必须有对应 .sig，且必须能用公钥验证通过，否则拒绝发布。
+          signer="$RUNNER_TEMP/gen-signing-key"
+          go build -o "$signer" ./scripts/gen-signing-key.go
+
+          failed=0
+
+          # 1) 每个非校验文件资产都必须有同名 .sha256。
+          for f in dist/*; do
+            [ -f "$f" ] || continue
+            base="$(basename "$f")"
+            case "$base" in
+              *.sha256|*.sig|checksums.txt) continue ;;
+            esac
+            if [ ! -s "$f.sha256" ]; then
+              echo "::error::资产 ${base} 缺少对应的 .sha256 校验文件"
+              failed=1
+            fi
+          done
+
+          if [ -n "${MNAGENT_SIGNING_PRIVATE_KEY:-}" ]; then
+            key="$RUNNER_TEMP/signing-private.key"
+            printf '%s' "$MNAGENT_SIGNING_PRIVATE_KEY" > "$key"
+            chmod 600 "$key"
+            pub="$("$signer" -mode public -key "$key")"
+
+            # 2) 每个 .sha256 都必须有 .sig，并逐个用公钥验签。
+            for sum in dist/*.sha256; do
+              if [ ! -s "${sum}.sig" ]; then
+                echo "::error::校验文件 $(basename "$sum") 缺少对应的 .sig 签名"
+                failed=1
+                continue
+              fi
+              if ! "$signer" -mode verify -pub "$pub" -in "$sum" -sig "${sum}.sig"; then
+                echo "::error::$(basename "$sum") 的签名校验失败"
+                failed=1
+              fi
+            done
+
+            # 3) 汇总清单 checksums.txt 也必须带签名并可验证。
+            if [ ! -s dist/checksums.txt.sig ]; then
+              echo "::error::checksums.txt 缺少对应的 .sig 签名"
+              failed=1
+            elif ! "$signer" -mode verify -pub "$pub" -in dist/checksums.txt -sig dist/checksums.txt.sig; then
+              echo "::error::checksums.txt 的签名校验失败"
+              failed=1
+            fi
+            rm -f "$key"
+          else
+            echo "::warning title=未配置更新签名私钥::未生成 .sig 附件，仅校验了每个资产的 .sha256"
+          fi
+
+          if [ "$failed" -ne 0 ]; then
+            echo "::error::发布资产校验未通过，已中止发布"
+            exit 1
+          fi
+          echo "所有发布资产均通过校验和/签名检查"
+
       - name: Publish release
         env:
           GH_TOKEN: ${{ github.token }}

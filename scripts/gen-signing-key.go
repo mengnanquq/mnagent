@@ -5,6 +5,7 @@
 //	go run ./scripts/gen-signing-key.go                       # 生成 signing-private.key / signing-public.key
 //	go run ./scripts/gen-signing-key.go -mode public -key signing-private.key
 //	go run ./scripts/gen-signing-key.go -mode sign -key signing-private.key -in file.sha256 -out file.sha256.sig
+//	go run ./scripts/gen-signing-key.go -mode verify -pub <base64公钥> -in file.sha256 -sig file.sha256.sig
 //
 // 私钥文件内容是 64 字节 Ed25519 私钥的 base64，必须保存在 GitHub Actions Secret
 // （MNAGENT_SIGNING_PRIVATE_KEY）中，绝不能提交到仓库。
@@ -21,12 +22,14 @@ import (
 )
 
 func main() {
-	mode := flag.String("mode", "generate", "操作模式：generate / public / sign")
+	mode := flag.String("mode", "generate", "操作模式：generate / public / sign / verify")
 	privatePath := flag.String("private", "signing-private.key", "生成模式：私钥输出路径")
 	publicPath := flag.String("public", "signing-public.key", "生成模式：公钥输出路径")
-	keyPath := flag.String("key", "signing-private.key", "public/sign 模式：私钥文件路径")
-	inPath := flag.String("in", "", "sign 模式：待签名文件")
+	keyPath := flag.String("key", "signing-private.key", "public/sign/verify 模式：私钥文件路径")
+	inPath := flag.String("in", "", "sign/verify 模式：待签名或待校验文件")
 	outPath := flag.String("out", "", "sign 模式：签名输出路径（默认 <in>.sig）")
+	sigPath := flag.String("sig", "", "verify 模式：签名文件（默认 <in>.sig）")
+	pubKey := flag.String("pub", "", "verify 模式：base64 公钥（缺省时由 -key 私钥推导）")
 	flag.Parse()
 
 	switch strings.ToLower(strings.TrimSpace(*mode)) {
@@ -41,6 +44,13 @@ func main() {
 		}
 		pub := priv.Public().(ed25519.PublicKey)
 		fmt.Println(base64.StdEncoding.EncodeToString(pub))
+	case "verify":
+		if *inPath == "" {
+			fail(fmt.Errorf("verify 模式必须指定 -in"))
+		}
+		if err := verify(*inPath, *sigPath, *pubKey, *keyPath); err != nil {
+			fail(err)
+		}
 	case "sign":
 		if *inPath == "" {
 			fail(fmt.Errorf("sign 模式必须指定 -in"))
@@ -63,8 +73,58 @@ func main() {
 		}
 		fmt.Fprintf(os.Stderr, "已签名 %s -> %s\n", *inPath, out)
 	default:
-		fail(fmt.Errorf("未知 -mode：%q（可选 generate/public/sign）", *mode))
+		fail(fmt.Errorf("未知 -mode：%q（可选 generate/public/sign/verify）", *mode))
 	}
+}
+
+// verify 用公钥校验签名文件（base64 文本或 64 字节原始签名）。
+func verify(inPath, sigPath, pubEncoded, privPath string) error {
+	data, err := os.ReadFile(inPath)
+	if err != nil {
+		return fmt.Errorf("读取待校验文件失败：%w", err)
+	}
+	if sigPath == "" {
+		sigPath = inPath + ".sig"
+	}
+	rawSig, err := os.ReadFile(sigPath)
+	if err != nil {
+		return fmt.Errorf("读取签名文件失败：%w", err)
+	}
+	// 与 updater 的解析保持一致：优先接受 base64 文本，其次接受 64 字节原始签名。
+	sig := []byte(strings.TrimSpace(string(rawSig)))
+	if len(sig) != ed25519.SignatureSize {
+		decoded, err := base64.StdEncoding.DecodeString(string(sig))
+		if err != nil {
+			return fmt.Errorf("签名不是合法 base64：%w", err)
+		}
+		sig = decoded
+	}
+	if len(sig) != ed25519.SignatureSize {
+		return fmt.Errorf("签名长度非法：期望 %d 字节，实际 %d", ed25519.SignatureSize, len(sig))
+	}
+
+	var pub ed25519.PublicKey
+	if strings.TrimSpace(pubEncoded) != "" {
+		raw, err := base64.StdEncoding.DecodeString(strings.TrimSpace(pubEncoded))
+		if err != nil {
+			return fmt.Errorf("公钥不是合法 base64：%w", err)
+		}
+		if len(raw) != ed25519.PublicKeySize {
+			return fmt.Errorf("公钥长度非法：期望 %d 字节，实际 %d", ed25519.PublicKeySize, len(raw))
+		}
+		pub = ed25519.PublicKey(raw)
+	} else {
+		priv, err := loadPrivateKey(privPath)
+		if err != nil {
+			return err
+		}
+		pub = priv.Public().(ed25519.PublicKey)
+	}
+	if !ed25519.Verify(pub, data, sig) {
+		return fmt.Errorf("签名校验失败：%s", inPath)
+	}
+	fmt.Fprintf(os.Stderr, "签名校验通过：%s\n", inPath)
+	return nil
 }
 
 func generate(privatePath, publicPath string) error {
