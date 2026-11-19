@@ -3,6 +3,7 @@ package updater
 import (
 	"bufio"
 	"bytes"
+	"context"
 	"crypto/sha256"
 	"crypto/subtle"
 	"encoding/hex"
@@ -12,6 +13,7 @@ import (
 	"io"
 	"net/http"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"regexp"
 	"runtime"
@@ -136,6 +138,10 @@ type Updater struct {
 	URLForFunc      func(version string) string
 	ChecksumURLFunc func(version string) string
 	APIURLFunc      func() string
+
+	// verifyBinary 在替换前执行下载的临时文件，确认其可运行且版本匹配。
+	// 测试可注入空实现；生产环境使用 verifyDownloadedBinary。
+	verifyBinary func(path, version string) error
 }
 
 // New 创建一个新的 Updater 实例。
@@ -190,6 +196,7 @@ func New(cfg Config) *Updater {
 		SkipFile:       skipFile,
 		GHProxy:        cfg.GHProxy,
 		RestartFunc:    cfg.Restart,
+		verifyBinary:   verifyDownloadedBinary,
 	}
 }
 
@@ -429,12 +436,17 @@ func (u *Updater) DownloadAndReplace(version string) (string, error) {
 	}
 
 	downloadURL := u.urlForOrFallback(version)
-	tmpFile, err := os.CreateTemp(filepath.Dir(u.Executable), "mnagent-upd-*")
+	// 临时文件必须与目标同目录：跨文件系统 rename 会失败（EXDEV），而此前回退到 /tmp
+	// 正是踩了这个坑。目录不可写时直接报清晰错误，不悄悄换到不安全的位置。
+	updDir := filepath.Dir(u.Executable)
+	tmpPattern := "mnagent-upd-*"
+	if runtime.GOOS == "windows" {
+		// Windows 的 exec 需要 .exe 后缀才能运行自检。
+		tmpPattern = "mnagent-upd-*.exe"
+	}
+	tmpFile, err := os.CreateTemp(updDir, tmpPattern)
 	if err != nil {
-		tmpFile, err = os.CreateTemp("", "mnagent-upd-*")
-		if err != nil {
-			return "", fmt.Errorf("创建临时更新文件失败：%w", err)
-		}
+		return "", fmt.Errorf("在 %s 创建临时更新文件失败（目录不可写，无法同目录替换）：%w", updDir, err)
 	}
 	tmpPath := tmpFile.Name()
 	defer func() {
@@ -448,7 +460,13 @@ func (u *Updater) DownloadAndReplace(version string) (string, error) {
 		_ = tmpFile.Close()
 		return "", fmt.Errorf("下载新版本失败：%w", err)
 	}
-	_ = tmpFile.Close()
+	if err := tmpFile.Sync(); err != nil {
+		_ = tmpFile.Close()
+		return "", fmt.Errorf("同步新版本文件失败：%w", err)
+	}
+	if err := tmpFile.Close(); err != nil {
+		return "", fmt.Errorf("关闭新版本文件失败：%w", err)
+	}
 
 	actualHash := hex.EncodeToString(hasher.Sum(nil))
 	if subtle.ConstantTimeCompare([]byte(strings.ToLower(actualHash)), []byte(strings.ToLower(expectedHash))) != 1 {
@@ -457,6 +475,14 @@ func (u *Updater) DownloadAndReplace(version string) (string, error) {
 
 	if err := os.Chmod(tmpPath, 0o755); err != nil {
 		return "", fmt.Errorf("设置执行权限失败：%w", err)
+	}
+
+	// 替换前先跑一次 -version：能挡住架构不匹配、截断、损坏的二进制，
+	// 避免坏版本落盘后让 systemd/procd 进入无限重启。
+	if u.verifyBinary != nil {
+		if err := u.verifyBinary(tmpPath, version); err != nil {
+			return "", fmt.Errorf("新版本二进制自检失败，已中止替换：%w", err)
+		}
 	}
 
 	if err := ReplaceExecutable(tmpPath, u.Executable); err != nil {
@@ -590,14 +616,34 @@ func DetectPlatformArch() (platform, arch string) {
 	return platform, arch
 }
 
-// ReplaceExecutable 将 newFile 原子替换（或 Windows 兼容替换）到 targetPath。
+// ReplaceExecutable 将 newFile 原子替换到 targetPath。
+// 非 Windows 平台先把旧版本保留为 <路径>.prev 便于手工回滚；Windows 由于文件锁
+// 只能先改名再替换（.old 机制），并在启动时由 CleanupOldExecutables 清理。
 func ReplaceExecutable(newFile, targetPath string) error {
 	if runtime.GOOS != "windows" {
-		return os.Rename(newFile, targetPath)
+		if _, err := os.Stat(targetPath); err == nil {
+			prevPath := targetPath + ".prev"
+			_ = os.Remove(prevPath)
+			// 优先硬链接：旧 inode 继续保留为 .prev，主路径在 rename 完成前始终有效。
+			if err := os.Link(targetPath, prevPath); err != nil {
+				if err := copyFile(targetPath, prevPath); err != nil {
+					return fmt.Errorf("保留上一版本失败: %w", err)
+				}
+			}
+		} else if !errors.Is(err, os.ErrNotExist) {
+			return fmt.Errorf("检查当前可执行文件失败: %w", err)
+		}
+		if err := os.Rename(newFile, targetPath); err != nil {
+			return err
+		}
+		return syncDir(filepath.Dir(targetPath))
 	}
 
 	if _, err := os.Stat(targetPath); errors.Is(err, os.ErrNotExist) {
-		return os.Rename(newFile, targetPath)
+		if err := os.Rename(newFile, targetPath); err != nil {
+			return err
+		}
+		return syncDir(filepath.Dir(targetPath))
 	}
 
 	oldPath := targetPath + ".old"
@@ -616,7 +662,79 @@ func ReplaceExecutable(newFile, targetPath string) error {
 	}
 
 	_ = os.Remove(oldPath)
+	return syncDir(filepath.Dir(targetPath))
+}
+
+// copyFile 复制文件内容（用于文件系统不支持硬链接时保留上一版本）。
+func copyFile(src, dst string) error {
+	in, err := os.Open(src)
+	if err != nil {
+		return err
+	}
+	defer in.Close()
+	out, err := os.OpenFile(dst, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0o755)
+	if err != nil {
+		return err
+	}
+	if _, err := io.Copy(out, in); err != nil {
+		_ = out.Close()
+		return err
+	}
+	if err := out.Sync(); err != nil {
+		_ = out.Close()
+		return err
+	}
+	return out.Close()
+}
+
+// syncDir 对目录执行 fsync，确保 rename 结果在掉电后仍可见。
+func syncDir(dir string) error {
+	if runtime.GOOS == "windows" {
+		return nil
+	}
+	d, err := os.Open(dir)
+	if err != nil {
+		return err
+	}
+	defer d.Close()
+	return d.Sync()
+}
+
+var binaryVersionPattern = regexp.MustCompile(`v?(\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?)`)
+
+// verifyDownloadedBinary 执行临时二进制的 -version，确认能运行且版本号为目标版本。
+// 可拦截架构不匹配（exec format error）、下载截断与内容错误。
+func verifyDownloadedBinary(path, version string) error {
+	want, ok := ParseVersion(version)
+	if !ok {
+		return fmt.Errorf("目标版本号非法：%q", version)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	out, err := exec.CommandContext(ctx, path, "-version").CombinedOutput()
+	if ctx.Err() == context.DeadlineExceeded {
+		return fmt.Errorf("执行 %s -version 超时", path)
+	}
+	if err != nil {
+		return fmt.Errorf("执行 %s -version 失败：%w（输出：%s）", path, err, truncateForLog(string(out), 200))
+	}
+	m := binaryVersionPattern.FindStringSubmatch(string(out))
+	if len(m) < 2 {
+		return fmt.Errorf("无法从 -version 输出解析版本号：%s", truncateForLog(string(out), 200))
+	}
+	got, ok := ParseVersion(m[1])
+	if !ok || got.Major != want.Major || got.Minor != want.Minor || got.Patch != want.Patch || got.Pre != want.Pre {
+		return fmt.Errorf("版本不匹配：期望 %s，实际 %s", version, m[1])
+	}
 	return nil
+}
+
+func truncateForLog(s string, n int) string {
+	s = strings.TrimSpace(s)
+	if len(s) <= n {
+		return s
+	}
+	return s[:n] + "..."
 }
 
 // CleanupOldExecutables 清理可执行文件周边的 .old 遗留备份文件（主要针对 Windows）。

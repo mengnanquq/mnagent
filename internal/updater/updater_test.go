@@ -8,6 +8,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -121,8 +122,8 @@ func TestUpdaterCheck(t *testing.T) {
 
 // TestUpdaterApply 验证“下载 → 原子替换 → 重启”。
 func TestUpdaterApply(t *testing.T) {
-	// 填充到 1KB 以上（downloadTo 有最小体积校验）。
-	bin := []byte("#!/bin/sh\n# padding for size check\n")
+	// 填充到 1KB 以上（downloadTo 有最小体积校验）；脚本需能响应 -version 自检。
+	bin := []byte("#!/bin/sh\necho \"mnagent v0.1.8 (linux/amd64, go1.26.0)\"\n")
 	for len(bin) < 2048 {
 		bin = append(bin, '#', '\n')
 	}
@@ -178,6 +179,10 @@ func TestUpdaterApply(t *testing.T) {
 	}
 	if string(got) != string(bin) {
 		t.Fatalf("替换后的内容不一致: %q", string(got))
+	}
+	prev, err := os.ReadFile(exe + ".prev")
+	if err != nil || string(prev) != "old-binary" {
+		t.Fatalf(".prev 应保留上一版本: content=%q err=%v", string(prev), err)
 	}
 }
 
@@ -337,7 +342,7 @@ func TestUpdaterAssetNameWindows(t *testing.T) {
 
 // TestUpdaterSHA256ChecksumVerification 验证发布了 <资产>.sha256 时哈希匹配则成功，被篡改则拦截报错。
 func TestUpdaterSHA256ChecksumVerification(t *testing.T) {
-	bin := []byte("#!/bin/sh\n# padding for size check\n")
+	bin := []byte("#!/bin/sh\necho \"mnagent v0.1.1 (linux/amd64, go1.26.0)\"\n")
 	for len(bin) < 2048 {
 		bin = append(bin, "#"...)
 	}
@@ -476,5 +481,95 @@ func TestUpdaterChecksumMissingOrInvalidAborts(t *testing.T) {
 				t.Fatal("校验失败时不应替换二进制")
 			}
 		})
+	}
+}
+
+// TestVerifyDownloadedBinary 验证替换前自检能识别版本不符与不可执行文件。
+func TestVerifyDownloadedBinary(t *testing.T) {
+	dir := t.TempDir()
+	okPath := filepath.Join(dir, "ok")
+	if err := os.WriteFile(okPath, []byte("#!/bin/sh\necho \"mnagent v1.2.3 (linux/amd64, go1.26.0)\"\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := verifyDownloadedBinary(okPath, "v1.2.3"); err != nil {
+		t.Fatalf("版本一致应通过: %v", err)
+	}
+	if err := verifyDownloadedBinary(okPath, "1.2.3"); err != nil {
+		t.Fatalf("忽略 v 前缀后应通过: %v", err)
+	}
+	if err := verifyDownloadedBinary(okPath, "v1.2.4"); err == nil || !strings.Contains(err.Error(), "版本不匹配") {
+		t.Fatalf("版本不一致应拒绝，实际 err=%v", err)
+	}
+
+	badPath := filepath.Join(dir, "bad")
+	if err := os.WriteFile(badPath, []byte("not-an-executable"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := verifyDownloadedBinary(badPath, "v1.2.3"); err == nil {
+		t.Fatal("不可执行文件应被拒绝")
+	}
+}
+
+// TestDownloadAndReplaceRejectsBadBinary 验证自检失败时中止替换，原二进制保持不变。
+func TestDownloadAndReplaceRejectsBadBinary(t *testing.T) {
+	bin := []byte("#!/bin/sh\necho \"mnagent v0.9.9 (linux/amd64, go1.26.0)\"\n")
+	for len(bin) < 2048 {
+		bin = append(bin, '#', '\n')
+	}
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if strings.HasSuffix(r.URL.Path, ".sha256") {
+			fmt.Fprintf(w, "%x  mnagent_linux_amd64\n", sha256.Sum256(bin))
+			return
+		}
+		_, _ = w.Write(bin)
+	}))
+	defer ts.Close()
+
+	exe := filepath.Join(t.TempDir(), "mnagent")
+	if err := os.WriteFile(exe, []byte("old-bin"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	u := New(Config{CurrentVersion: "v0.1.0", Repo: "owner/repo", Platform: "linux", Arch: "amd64", DownloadClient: ts.Client(), Executable: exe})
+	u.URLForFunc = func(version string) string { return ts.URL + "/d/" + version + "/" + u.AssetName() }
+	u.ChecksumURLFunc = func(version string) string { return ts.URL + "/d/" + version + "/" + u.AssetName() + ".sha256" }
+
+	err := u.Apply("v0.1.1")
+	if err == nil || !strings.Contains(err.Error(), "自检失败") {
+		t.Fatalf("二进制版本不符应中止替换，实际 err=%v", err)
+	}
+	if got, _ := os.ReadFile(exe); string(got) != "old-bin" {
+		t.Fatalf("自检失败时不得替换二进制: %q", string(got))
+	}
+}
+
+// TestReplaceExecutableKeepsPrev 验证非 Windows 平台替换时保留 <路径>.prev 供手工回滚。
+func TestReplaceExecutableKeepsPrev(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("Windows 使用 .old 机制")
+	}
+	dir := t.TempDir()
+	target := filepath.Join(dir, "mnagent")
+	if err := os.WriteFile(target, []byte("v1"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	for _, step := range []struct{ newContent, wantPrev string }{
+		{"v2", "v1"},
+		{"v3", "v2"},
+	} {
+		tmp := filepath.Join(dir, "new.tmp")
+		if err := os.WriteFile(tmp, []byte(step.newContent), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := ReplaceExecutable(tmp, target); err != nil {
+			t.Fatalf("替换失败: %v", err)
+		}
+		got, _ := os.ReadFile(target)
+		if string(got) != step.newContent {
+			t.Fatalf("目标内容 = %q，期望 %q", string(got), step.newContent)
+		}
+		prev, err := os.ReadFile(target + ".prev")
+		if err != nil || string(prev) != step.wantPrev {
+			t.Fatalf(".prev 内容 = %q (err=%v)，期望 %q", string(prev), err, step.wantPrev)
+		}
 	}
 }

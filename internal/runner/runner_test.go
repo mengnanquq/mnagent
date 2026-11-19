@@ -578,7 +578,11 @@ func TestHandleUpgradeJob(t *testing.T) {
 			w.WriteHeader(http.StatusFound)
 			return
 		}
-		payload := make([]byte, 2048)
+		// 下载内容必须是能响应 -version 的可执行脚本（替换前会做自检）。
+		payload := []byte("#!/bin/sh\necho \"mnagent v1.1.0 (linux/amd64, go1.26.0)\"\n")
+		for len(payload) < 2048 {
+			payload = append(payload, '#', '\n')
+		}
 		if strings.HasSuffix(r.URL.Path, ".sha256") {
 			fmt.Fprintf(w, "%x  mnagent_linux_amd64\n", sha256.Sum256(payload))
 			return
