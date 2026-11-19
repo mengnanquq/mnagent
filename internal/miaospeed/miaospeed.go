@@ -20,6 +20,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"sync"
 	"time"
 
 	"golang.org/x/net/websocket"
@@ -27,6 +28,18 @@ import (
 
 // 常量定义：MiaoSpeed 任务类型与官方通用构建凭证。
 const maxOutputBytes = 256 * 1024
+
+// maxSlaveJSONBytes 限制单条 miaospeed WebSocket JSON 响应的缓冲上限。
+// 正常 500 节点结果约 3MB；给到 8MB 已足够，同时避免异常/恶意服务端把
+// 低内存设备的内存吃光。
+const maxSlaveJSONBytes = 8 << 20
+
+// readNextSlaveJSON 的 32KB 读取块与累积缓冲通过 sync.Pool 复用，
+// 避免每个节点/每轮读取都重新分配大块内存。
+var (
+	slaveJSONChunkPool = sync.Pool{New: func() any { return make([]byte, 32*1024) }}
+	slaveJSONBufPool   = sync.Pool{New: func() any { return bytes.NewBuffer(make([]byte, 0, 64*1024)) }}
+)
 
 const (
 	kindMiaospeed = "miaospeed"
@@ -762,8 +775,16 @@ func generateRandomHex(n int) string {
 // readNextSlaveJSON 从 ws 连接中读取下一条完整的 JSON 响应并反序列化。
 // 内部处理 5s ReadDeadline 超时并在 ctx 未结束时继续累积读取，防止跨读取周期拆帧丢失半包数据。
 func readNextSlaveJSON(ctx context.Context, ws *websocket.Conn, dest any) error {
-	var buf bytes.Buffer
-	chunk := make([]byte, 32*1024)
+	buf := slaveJSONBufPool.Get().(*bytes.Buffer)
+	buf.Reset()
+	defer func() {
+		// 异常超大缓冲不复用，避免池中长期驻留大块内存。
+		if buf.Cap() <= maxSlaveJSONBytes {
+			slaveJSONBufPool.Put(buf)
+		}
+	}()
+	chunk := slaveJSONChunkPool.Get().([]byte)
+	defer slaveJSONChunkPool.Put(chunk)
 	for {
 		if ctx.Err() != nil {
 			return ctx.Err()
@@ -771,7 +792,9 @@ func readNextSlaveJSON(ctx context.Context, ws *websocket.Conn, dest any) error 
 		_ = ws.SetReadDeadline(time.Now().Add(5 * time.Second))
 		n, err := ws.Read(chunk)
 		if n > 0 {
-			buf.Write(chunk[:n])
+			if werr := appendSlaveJSONChunk(buf, chunk[:n]); werr != nil {
+				return werr
+			}
 			b := bytes.TrimSpace(buf.Bytes())
 			if len(b) > 0 && b[0] == '{' && b[len(b)-1] == '}' {
 				if json.Valid(b) {
@@ -800,6 +823,15 @@ func readNextSlaveJSON(ctx context.Context, ws *websocket.Conn, dest any) error 
 			return err
 		}
 	}
+}
+
+// appendSlaveJSONChunk 把新读取的数据追加到缓冲，并强制单条响应的大小上限。
+func appendSlaveJSONChunk(buf *bytes.Buffer, chunk []byte) error {
+	if buf.Len()+len(chunk) > maxSlaveJSONBytes {
+		return fmt.Errorf("miaospeed 响应超过 %d 字节上限", maxSlaveJSONBytes)
+	}
+	_, _ = buf.Write(chunk)
+	return nil
 }
 
 // Logger 是本包用到的最小日志接口。

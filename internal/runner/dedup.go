@@ -15,9 +15,12 @@ import (
 var defaultDedupTTL = model.JobMiaospeedMaxTimeout + 10*time.Minute
 
 const (
-	defaultDedupCapacity  = 2048
-	maxCachedResultBytes  = 16 << 20 // 单个结果最多缓存 16MB（与结果体上限一致）
-	maxCachedResultsTotal = 16 << 20 // 所有缓存结果的总内存上限（常驻内存，不宜过大）
+	defaultDedupCapacity = 2048
+	// 常驻内存的缓存上限必须适配低内存设备（16MB/32MB Flash 的 OpenWrt 路由器）：
+	// 单条结果最多 2MB，所有缓存结果合计最多 4MB。超出上限的任务仍会标记完成，
+	// 只是重复下发时不再重发缓存，而是记录 oversized 并跳过重复执行。
+	maxCachedResultBytes  = 2 << 20
+	maxCachedResultsTotal = 4 << 20
 )
 
 type dedupAction int

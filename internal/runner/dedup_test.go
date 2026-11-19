@@ -109,18 +109,18 @@ func TestJobDedupOversizedResultStillSkipsExecution(t *testing.T) {
 	}
 }
 
-// TestJobDedupTotalCacheLimit 验证所有缓存结果的总内存上限（16MB）：
+// TestJobDedupTotalCacheLimit 验证所有缓存结果的总内存上限（4MB）：
 // 新结果挤掉旧结果时，旧任务重复下发应标记为“超出缓存上限”而不是“已取消/无结果”。
 func TestJobDedupTotalCacheLimit(t *testing.T) {
 	d := newJobDedup()
-	payload := strings.Repeat("x", 9<<20)
-	if payload == "" {
-		t.Fatal("payload 构造失败")
+	// 每条 1.5MB（低于单条 2MB 上限），三条合计 4.5MB，应挤掉最旧的 a。
+	payload := strings.Repeat("x", 1500<<10)
+	for _, id := range []string{"a", "b", "c"} {
+		if action, _, _ := d.start(id); action != dedupRun {
+			t.Fatalf("%s 首次应执行", id)
+		}
+		d.complete(id, &model.Result{ID: id, Output: payload + id})
 	}
-	d.start("a")
-	d.complete("a", &model.Result{ID: "a", Output: payload + "a"})
-	d.start("b")
-	d.complete("b", &model.Result{ID: "b", Output: payload + "b"})
 
 	if d.cachedBytes > maxCachedResultsTotal {
 		t.Fatalf("缓存总大小 %d 超过上限 %d", d.cachedBytes, maxCachedResultsTotal)
@@ -129,8 +129,20 @@ func TestJobDedupTotalCacheLimit(t *testing.T) {
 	if action != dedupCompleted || cached != nil || state != dedupCacheOversized {
 		t.Fatalf("被总缓存上限挤出的结果应标记 oversized，实际 action=%v cached=%v state=%v", action, cached, state)
 	}
-	if action, cached, state := d.start("b"); action != dedupCompleted || cached == nil || state != dedupCacheHit {
-		t.Fatalf("最新的 b 应仍在缓存中，实际 action=%v cached=%v state=%v", action, cached, state)
+	for _, id := range []string{"b", "c"} {
+		if action, cached, state := d.start(id); action != dedupCompleted || cached == nil || state != dedupCacheHit {
+			t.Fatalf("最新的 %s 应仍在缓存中，实际 action=%v cached=%v state=%v", id, action, cached, state)
+		}
+	}
+}
+
+// TestJobDedupLowMemoryLimits 固定低内存设备的缓存上限，防止以后被无意调大。
+func TestJobDedupLowMemoryLimits(t *testing.T) {
+	if maxCachedResultBytes != 2<<20 {
+		t.Fatalf("单条结果缓存上限 = %d，期望 2MB", maxCachedResultBytes)
+	}
+	if maxCachedResultsTotal != 4<<20 {
+		t.Fatalf("结果缓存总上限 = %d，期望 4MB", maxCachedResultsTotal)
 	}
 }
 

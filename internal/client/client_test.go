@@ -357,3 +357,12 @@ func TestClientPollLargePayload(t *testing.T) {
 		t.Fatalf("超大任务数据不完整: len=%d", len(job.Target))
 	}
 }
+
+// TestClientWSJobsCapacityLowMemory 固定 WebSocket 任务缓冲容量为 16，
+// 避免低内存设备上积压过多任务对象。
+func TestClientWSJobsCapacityLowMemory(t *testing.T) {
+	cli := New(testConfig("http://127.0.0.1:1", nil))
+	if got := cap(cli.wsJobs); got != 16 {
+		t.Fatalf("wsJobs 容量 = %d，期望 16", got)
+	}
+}

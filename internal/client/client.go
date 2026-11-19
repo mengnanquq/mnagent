@@ -103,7 +103,7 @@ func New(cfg *config.Config) *Client {
 		resultTotalTimeout: resultTotalTimeout,
 		wsDisabled:         wsDisabledByEnv(),
 		wsHTTP:             newWSHTTPClient(),
-		wsJobs:             make(chan *model.Job, 64),
+		wsJobs:             make(chan *model.Job, 16),
 		wsReject:           make(chan model.Result, 64),
 	}
 }

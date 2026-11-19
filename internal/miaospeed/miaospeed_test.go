@@ -1886,3 +1886,18 @@ func TestParseSlaveTaskResultLimitsGeoConcurrency(t *testing.T) {
 		}
 	}
 }
+
+// TestAppendSlaveJSONChunkRejectsOversize 验证读取 miaospeed 响应时缓冲有硬上限，
+// 异常超大响应不会无限占用内存。
+func TestAppendSlaveJSONChunkRejectsOversize(t *testing.T) {
+	buf := new(bytes.Buffer)
+	if err := appendSlaveJSONChunk(buf, bytes.Repeat([]byte("x"), maxSlaveJSONBytes)); err != nil {
+		t.Fatalf("刚好达到上限应允许: %v", err)
+	}
+	if err := appendSlaveJSONChunk(buf, []byte("x")); err == nil || !strings.Contains(err.Error(), "上限") {
+		t.Fatalf("超过上限应返回明确错误，实际: %v", err)
+	}
+	if buf.Len() != maxSlaveJSONBytes {
+		t.Fatalf("超限数据不应写入缓冲，实际长度 %d", buf.Len())
+	}
+}
