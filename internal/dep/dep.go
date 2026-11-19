@@ -36,6 +36,19 @@ var (
 	GenericVerPattern   = regexp.MustCompile(`v?(\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?)`)
 )
 
+// 查不到最新版本时只允许在“尚未安装”的场景安装这些固定版本；
+// 已安装时必须保持现有版本不动，绝不因为 API 临时不可用而悄悄降级。
+const (
+	fallbackNexttraceVersion = "v1.7.3"
+	fallbackMiaospeedVersion = "4.7.8"
+)
+
+// binaryPresent 判断目标路径上是否已有文件（用于区分“升级”与“首次安装”）。
+func binaryPresent(path string) bool {
+	fi, err := os.Stat(path)
+	return err == nil && !fi.IsDir()
+}
+
 func StripANSI(s string) string {
 	return AnsiEscapePattern.ReplaceAllString(s, "")
 }
@@ -578,7 +591,13 @@ func (dm *DependencyManager) UpdateNextTrace(ctx context.Context, targetPath, ve
 	if tag == "" || tag == "latest" {
 		latest, err := dm.fetchLatestTag(ctx, "nxtrace/NTrace-core")
 		if err != nil {
-			tag = "v1.7.3"
+			if binaryPresent(destPath) {
+				return "", fmt.Errorf("获取 nexttrace 最新版本失败，已保留现有版本：%w", err)
+			}
+			tag = fallbackNexttraceVersion
+			if log != nil {
+				log.Warn("获取 nexttrace 最新版本失败，尝试安装兜底版本", "version", tag, "error", err)
+			}
 		} else {
 			tag = latest
 		}
@@ -628,7 +647,13 @@ func (dm *DependencyManager) UpdateMiaospeed(ctx context.Context, targetPath, ve
 	if tag == "" || tag == "latest" {
 		latest, err := dm.fetchLatestTag(ctx, "AirportR/miaospeed")
 		if err != nil {
-			tag = "4.7.8" // 兜底
+			if binaryPresent(destPath) {
+				return "", fmt.Errorf("获取 miaospeed 最新版本失败，已保留现有版本：%w", err)
+			}
+			tag = fallbackMiaospeedVersion
+			if log != nil {
+				log.Warn("获取 miaospeed 最新版本失败，尝试安装兜底版本", "version", tag, "error", err)
+			}
 		} else {
 			tag = strings.TrimPrefix(latest, "v")
 		}

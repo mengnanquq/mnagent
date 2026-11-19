@@ -579,3 +579,102 @@ func TestUpdateNextTraceDigestMissingAborts(t *testing.T) {
 		t.Fatal("API 不可达时不应写入目标文件")
 	}
 }
+
+// TestUpdateNextTraceLatestFailureKeepsInstalled 验证已安装时查询最新版本失败不会回落到写死的旧版本。
+func TestUpdateNextTraceLatestFailureKeepsInstalled(t *testing.T) {
+	content := bytes.Repeat([]byte("F"), 150*1024)
+	sum := sha256.Sum256(content)
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case strings.Contains(r.URL.Path, "/releases/latest"):
+			http.NotFound(w, r)
+		case strings.Contains(r.URL.Path, "/releases/tags/v1.7.3"):
+			fmt.Fprintf(w, `{"assets":[{"name":"nexttrace_linux_amd64","digest":"sha256:%x"}]}`, sum)
+		case strings.Contains(r.URL.Path, "releases/download"):
+			_, _ = w.Write(content)
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer srv.Close()
+
+	dm := newDependencyManager(srv.URL)
+	dm.apiBaseURL = srv.URL
+	dm.githubBaseURL = srv.URL
+	dm.goos = "linux"
+	dm.goarch = "amd64"
+
+	target := filepath.Join(t.TempDir(), "nexttrace")
+	if err := os.WriteFile(target, []byte("installed-binary"), 0755); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := dm.UpdateNextTrace(context.Background(), target, "latest", nil); err == nil || !strings.Contains(err.Error(), "保留现有版本") {
+		t.Fatalf("已安装时查询最新版本失败应保持现状，实际 err=%v", err)
+	}
+	if got, _ := os.ReadFile(target); string(got) != "installed-binary" {
+		t.Fatalf("不得覆盖已安装版本: %q", string(got))
+	}
+}
+
+// TestUpdateNextTraceLatestFailureFallsBackWhenMissing 验证未安装时才允许安装兜底版本。
+func TestUpdateNextTraceLatestFailureFallsBackWhenMissing(t *testing.T) {
+	content := bytes.Repeat([]byte("F"), 150*1024)
+	sum := sha256.Sum256(content)
+	var gotTag atomic.Value
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case strings.Contains(r.URL.Path, "/releases/latest"):
+			http.NotFound(w, r)
+		case strings.Contains(r.URL.Path, "/releases/tags/"):
+			gotTag.Store(strings.TrimPrefix(r.URL.Path, "/repos/nxtrace/NTrace-core/releases/tags/"))
+			fmt.Fprintf(w, `{"assets":[{"name":"nexttrace_linux_amd64","digest":"sha256:%x"}]}`, sum)
+		case strings.Contains(r.URL.Path, "releases/download"):
+			_, _ = w.Write(content)
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer srv.Close()
+
+	dm := newDependencyManager(srv.URL)
+	dm.apiBaseURL = srv.URL
+	dm.githubBaseURL = srv.URL
+	dm.goos = "linux"
+	dm.goarch = "amd64"
+
+	target := filepath.Join(t.TempDir(), "nexttrace")
+	if _, err := dm.UpdateNextTrace(context.Background(), target, "latest", nil); err != nil {
+		t.Fatalf("未安装时应安装兜底版本: %v", err)
+	}
+	if got := gotTag.Load(); got != fallbackNexttraceVersion {
+		t.Fatalf("兜底版本 = %v，期望 %s", got, fallbackNexttraceVersion)
+	}
+	if fi, err := os.Stat(target); err != nil || fi.Size() != int64(len(content)) {
+		t.Fatalf("兜底安装结果异常: fi=%v err=%v", fi, err)
+	}
+}
+
+// TestUpdateMiaospeedLatestFailureKeepsInstalled 验证 miaospeed 同样不会在 API 失败时降级。
+func TestUpdateMiaospeedLatestFailureKeepsInstalled(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		http.NotFound(w, r)
+	}))
+	defer srv.Close()
+
+	dm := newDependencyManager(srv.URL)
+	dm.apiBaseURL = srv.URL
+	dm.githubBaseURL = srv.URL
+	dm.goos = "linux"
+	dm.goarch = "amd64"
+
+	target := filepath.Join(t.TempDir(), "miaospeed")
+	if err := os.WriteFile(target, []byte("installed-miao"), 0755); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := dm.UpdateMiaospeed(context.Background(), target, "latest", nil); err == nil || !strings.Contains(err.Error(), "保留现有版本") {
+		t.Fatalf("已安装时查询最新版本失败应保持现状，实际 err=%v", err)
+	}
+	if got, _ := os.ReadFile(target); string(got) != "installed-miao" {
+		t.Fatalf("不得覆盖已安装版本: %q", string(got))
+	}
+}
