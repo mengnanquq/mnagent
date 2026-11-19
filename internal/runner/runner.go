@@ -367,6 +367,9 @@ func (a *Agent) Loop(ctx context.Context) error {
 		if n := a.client.FailPending(fctx, "agent 正在重启或退出，任务未执行，请重试"); n > 0 {
 			a.logger.Info("已回报未执行的任务", "count", n)
 		}
+		if n := a.failPendingHeavy(fctx, "节点停止，未执行"); n > 0 {
+			a.logger.Info("已回报 heavyQueue 中未执行的任务", "count", n)
+		}
 	}()
 	a.startHeartbeat(ctx)
 
@@ -710,6 +713,41 @@ func (a *Agent) execute(ctx context.Context, job model.Job) {
 		return
 	}
 	a.logger.Info("任务完成", entry...)
+}
+
+// failPendingHeavy 在退出/重启前把 heavyQueue 中尚未执行的任务逐一回报，
+// 避免机器人一直等到任务超时。
+func (a *Agent) failPendingHeavy(ctx context.Context, reason string) int {
+	if a.heavyQueue == nil {
+		return 0
+	}
+	n := 0
+	for {
+		select {
+		case job, ok := <-a.heavyQueue:
+			if !ok {
+				return n
+			}
+			if job.Kind == "cancel" {
+				continue
+			}
+			res := model.Result{
+				ID:       job.ID,
+				Kind:     probe.ProbeKind(job),
+				ExitCode: -1,
+				Error:    reason,
+			}
+			a.dedupStore().complete(job.ID, &res)
+			if a.client != nil {
+				if err := a.client.SendResult(ctx, res); err != nil {
+					a.logger.Warn("回报未执行重任务失败", "job", job.ID, "error", err)
+				}
+			}
+			n++
+		default:
+			return n
+		}
+	}
 }
 
 // sleep 等待指定时长；ctx 结束时返回 false。

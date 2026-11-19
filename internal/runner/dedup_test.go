@@ -159,3 +159,50 @@ func TestAgentLoopDeduplicatesCompletedJob(t *testing.T) {
 		t.Fatalf("缓存重发结果不一致: %+v", results)
 	}
 }
+
+// TestFailPendingHeavyReportsQueuedJobs 验证退出时 heavyQueue 中未执行的任务会逐一回报。
+func TestFailPendingHeavyReportsQueuedJobs(t *testing.T) {
+	var mu sync.Mutex
+	var got []model.Result
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/results" {
+			var res model.Result
+			_ = json.NewDecoder(r.Body).Decode(&res)
+			mu.Lock()
+			got = append(got, res)
+			mu.Unlock()
+			w.WriteHeader(http.StatusNoContent)
+			return
+		}
+		w.WriteHeader(http.StatusNoContent)
+	}))
+	defer srv.Close()
+
+	cfg := &config.Config{BotURL: srv.URL, Tokens: &config.TokenSource{Value: "tok"}, PollTimeout: time.Second}
+	a := &Agent{cfg: cfg, logger: testLogger{t}, client: client.New(cfg)}
+	a.heavyQueue = make(chan model.Job, 4)
+	a.heavyQueue <- model.Job{ID: "h1", Kind: "trace", Target: "1.1.1.1"}
+	a.heavyQueue <- model.Job{ID: "h2", Kind: "miaospeed", Target: "sub"}
+	a.heavyQueue <- model.Job{ID: "h1", Kind: "cancel"} // 取消控制包不应回报
+
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	if n := a.failPendingHeavy(ctx, "节点停止，未执行"); n != 2 {
+		t.Fatalf("应回报 2 个未执行重任务，实际 %d", n)
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	if len(got) != 2 {
+		t.Fatalf("结果数量 = %d，期望 2: %+v", len(got), got)
+	}
+	ids := map[string]bool{}
+	for _, res := range got {
+		ids[res.ID] = true
+		if res.ExitCode != -1 || res.Error != "节点停止，未执行" {
+			t.Fatalf("未执行任务回报异常: %+v", res)
+		}
+	}
+	if !ids["h1"] || !ids["h2"] {
+		t.Fatalf("回报的任务 ID 异常: %+v", ids)
+	}
+}

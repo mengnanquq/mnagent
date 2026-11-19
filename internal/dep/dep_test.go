@@ -23,6 +23,16 @@ import (
 	"testing"
 )
 
+// mockDependencyVersion 让下载后的依赖自检返回指定版本（测试无需真实可执行二进制）。
+func mockDependencyVersion(dm *DependencyManager, nexttraceVer, miaospeedVer string) {
+	dm.cmdRunner = func(_ context.Context, name string, _ ...string) ([]byte, error) {
+		if strings.Contains(strings.ToLower(name), "miaospeed") {
+			return []byte("version: " + miaospeedVer + "\n"), nil
+		}
+		return []byte("NextTrace  " + nexttraceVer + "\n"), nil
+	}
+}
+
 // TestStripANSI 验证 ANSI 控制字符的清理。
 func TestStripANSI(t *testing.T) {
 	raw := "\x1b[37;1mNextTrace\x1b[0;22m  \x1b[90;1mv1.7.3\x1b[0;22m  \x1b[90;1m2026-08-27T04:36:24Z\x1b[0;22m"
@@ -204,6 +214,7 @@ func TestUpdateNextTrace(t *testing.T) {
 	dm.apiBaseURL = srv.URL
 	dm.goos = "linux"
 	dm.goarch = "amd64"
+	mockDependencyVersion(dm, "v1.7.4", "4.7.7")
 
 	dest, err := dm.UpdateNextTrace(context.Background(), targetPath, "v1.7.4", nil)
 	if err != nil {
@@ -265,6 +276,7 @@ func TestUpdateMiaospeed(t *testing.T) {
 	dm.apiBaseURL = srv.URL
 	dm.goos = "linux"
 	dm.goarch = "amd64"
+	mockDependencyVersion(dm, "4.7.7", "4.7.7")
 
 	dest, err := dm.UpdateMiaospeed(context.Background(), targetPath, "4.7.7", nil)
 	if err != nil {
@@ -328,6 +340,7 @@ func TestUpdateMiaospeedWindowsZip(t *testing.T) {
 	dm.apiBaseURL = srv.URL
 	dm.goos = "windows"
 	dm.goarch = "amd64"
+	mockDependencyVersion(dm, "4.7.7", "4.7.7")
 
 	dest, err := dm.UpdateMiaospeed(context.Background(), targetPath, "4.7.7", nil)
 	if err != nil {
@@ -494,6 +507,7 @@ func TestUpdateNextTraceVerifiesDigest(t *testing.T) {
 	dm.apiBaseURL = srv.URL
 	dm.goos = "linux"
 	dm.goarch = "amd64"
+	mockDependencyVersion(dm, "v1.7.4", "4.7.7")
 	target := filepath.Join(t.TempDir(), "nexttrace")
 
 	tampered.Store(true)
@@ -641,6 +655,7 @@ func TestUpdateNextTraceLatestFailureFallsBackWhenMissing(t *testing.T) {
 	dm.githubBaseURL = srv.URL
 	dm.goos = "linux"
 	dm.goarch = "amd64"
+	mockDependencyVersion(dm, "v1.7.3", "4.7.7")
 
 	target := filepath.Join(t.TempDir(), "nexttrace")
 	if _, err := dm.UpdateNextTrace(context.Background(), target, "latest", nil); err != nil {
@@ -701,5 +716,38 @@ func TestExtractTarGzRunnerLayout(t *testing.T) {
 	got, err := os.ReadFile(dest)
 	if err != nil || string(got) != string(content) {
 		t.Fatalf("解压内容不匹配: %q err=%v", string(got), err)
+	}
+}
+
+// TestUpdateNextTraceSelfCheckMismatchAborts 验证下载后的版本自检失败会中止替换，
+// 保留已有二进制，避免架构不匹配或损坏的依赖落盘。
+func TestUpdateNextTraceSelfCheckMismatchAborts(t *testing.T) {
+	content := bytes.Repeat([]byte("F"), 150*1024)
+	sum := sha256.Sum256(content)
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if strings.Contains(r.URL.Path, "/releases/tags/v1.7.4") {
+			fmt.Fprintf(w, `{"assets":[{"name":"nexttrace_linux_amd64","digest":"sha256:%x"}]}`, sum)
+			return
+		}
+		_, _ = w.Write(content)
+	}))
+	defer srv.Close()
+
+	dm := newDependencyManager(srv.URL)
+	dm.apiBaseURL = srv.URL
+	dm.goos = "linux"
+	dm.goarch = "amd64"
+	mockDependencyVersion(dm, "v1.0.0", "4.7.7") // 与实际目标 v1.7.4 不一致
+
+	target := filepath.Join(t.TempDir(), "nexttrace")
+	if err := os.WriteFile(target, []byte("old-binary"), 0755); err != nil {
+		t.Fatal(err)
+	}
+	_, err := dm.UpdateNextTrace(context.Background(), target, "v1.7.4", nil)
+	if err == nil || !strings.Contains(err.Error(), "版本不匹配") {
+		t.Fatalf("版本自检不一致应中止，实际 err=%v", err)
+	}
+	if got, _ := os.ReadFile(target); string(got) != "old-binary" {
+		t.Fatalf("自检失败时不得替换依赖: %q", string(got))
 	}
 }

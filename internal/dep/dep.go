@@ -579,6 +579,43 @@ func (dm *DependencyManager) downloadVerified(ctx context.Context, repo, tag, as
 	return written, nil
 }
 
+// selfCheckDependency 在替换前运行一次下载的依赖二进制，确认可执行且版本与目标一致。
+// 与 updater 的自检一致：宁可中止更新，也不把架构不匹配或损坏的二进制落盘。
+func (dm *DependencyManager) selfCheckDependency(ctx context.Context, name, path, want string) error {
+	var (
+		installed bool
+		got       string
+		err       error
+	)
+	switch name {
+	case "nexttrace":
+		installed, _, got, err = dm.detectLocalNextTrace(ctx, path)
+	case "miaospeed":
+		installed, _, got, err = dm.detectLocalMiaospeed(ctx, path)
+	default:
+		return fmt.Errorf("未知依赖：%s", name)
+	}
+	if !installed {
+		return fmt.Errorf("自检失败：找不到刚下载的 %s（%s）", name, path)
+	}
+	if err != nil {
+		return fmt.Errorf("%s 版本自检失败：%w", name, err)
+	}
+	if got == "" {
+		return fmt.Errorf("%s 版本自检失败：无法解析版本输出", name)
+	}
+	wantV, wantOK := updater.ParseVersion(strings.TrimPrefix(want, "v"))
+	gotV, gotOK := updater.ParseVersion(strings.TrimPrefix(got, "v"))
+	if wantOK && gotOK {
+		if gotV.Major != wantV.Major || gotV.Minor != wantV.Minor || gotV.Patch != wantV.Patch || gotV.Pre != wantV.Pre {
+			return fmt.Errorf("%s 版本不匹配：期望 %s，实际 %s", name, want, got)
+		}
+	} else if strings.TrimPrefix(got, "v") != strings.TrimPrefix(want, "v") {
+		return fmt.Errorf("%s 版本不匹配：期望 %s，实际 %s", name, want, got)
+	}
+	return nil
+}
+
 // UpdateNextTrace 下载并安装/更新 nexttrace 到目标路径。
 func (dm *DependencyManager) UpdateNextTrace(ctx context.Context, targetPath, version string, log Logger) (string, error) {
 	destPath := ResolveInstallTarget(targetPath, "nexttrace")
@@ -629,6 +666,9 @@ func (dm *DependencyManager) UpdateNextTrace(ctx context.Context, targetPath, ve
 	}
 	if written < 100*1024 { // nexttrace 二进制至少几百 KB 以上
 		return "", fmt.Errorf("下载的 nexttrace 二进制体积异常 (%d bytes)", written)
+	}
+	if err := dm.selfCheckDependency(ctx, "nexttrace", tmpFile, tag); err != nil {
+		return "", fmt.Errorf("nexttrace 自检失败，已中止替换：%w", err)
 	}
 
 	if err := updater.ReplaceExecutable(tmpFile, destPath); err != nil {
@@ -708,6 +748,9 @@ func (dm *DependencyManager) UpdateMiaospeed(ctx context.Context, targetPath, ve
 
 	if err := os.Chmod(tmpFile, 0755); err != nil {
 		return "", fmt.Errorf("设置权限失败：%w", err)
+	}
+	if err := dm.selfCheckDependency(ctx, "miaospeed", tmpFile, tag); err != nil {
+		return "", fmt.Errorf("miaospeed 自检失败，已中止替换：%w", err)
 	}
 
 	if err := updater.ReplaceExecutable(tmpFile, destPath); err != nil {

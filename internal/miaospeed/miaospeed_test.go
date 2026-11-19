@@ -496,7 +496,7 @@ func TestAutoInstallMiaospeedWithProxy(t *testing.T) {
 	var buf bytes.Buffer
 	gw := gzip.NewWriter(&buf)
 	tw := tar.NewWriter(gw)
-	content := []byte("#!/bin/sh\necho fake-miaospeed\n")
+	content := []byte("#!/bin/sh\necho \"version: 4.7.7\"\n")
 	hdr := &tar.Header{
 		Name:     "miaospeed-linux-amd64",
 		Mode:     0755,
