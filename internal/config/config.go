@@ -43,6 +43,7 @@ type Config struct {
 	PollTimeout     time.Duration
 	ResultTimeout   time.Duration
 	LogLevel        slog.Level
+	LogFile         string
 
 	AutoUpdate         bool
 	UpdateInterval     time.Duration
@@ -178,6 +179,7 @@ func ParseConfig(args []string, version string) (*Config, error) {
 		skipUpd      = fs.String("skip-update", "", "跳过指定版本一段时间（如 v0.1.7，默认 24 小时）")
 		ghProxy      = fs.String("gh-proxy", "", "GitHub 代理加速前缀，例如 https://gh-proxy.com/")
 		logLevel     = fs.String("log-level", "info", "日志级别：debug / info / warn / error")
+		logFile      = fs.String("log-file", "", "日志输出文件（可选；Windows 服务模式建议设置，按 5MB × 3 轮转）")
 		showVer      = fs.Bool("version", false, "输出版本后退出")
 		diagJob      = fs.String("diag-job", "", "本地直接执行一次测速任务并输出调试信息后退出")
 		runDiag      = fs.Bool("diag", false, "执行本地环境与系统依赖健康自检并输出诊断看板后退出")
@@ -274,6 +276,7 @@ func ParseConfig(args []string, version string) (*Config, error) {
 		PollTimeout:          *pollWait,
 		ResultTimeout:        *resultWait,
 		LogLevel:             ParseLogLevel(*logLevel),
+		LogFile:              strings.TrimSpace(*logFile),
 		AutoUpdate:           *autoUpdate,
 		UpdateInterval:       *updateIntv,
 		CheckUpdateOnce:      *checkUpd,

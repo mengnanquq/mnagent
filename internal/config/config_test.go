@@ -228,3 +228,14 @@ func TestParseConfigValidatesProbeKind(t *testing.T) {
 		t.Fatalf("ProbeKind = %q，期望 dns", cfg.ProbeKind)
 	}
 }
+
+// TestParseConfigLogFile 验证 -log-file 参数会被解析并去除空白。
+func TestParseConfigLogFile(t *testing.T) {
+	cfg, err := ParseConfig([]string{"-bot", "https://x/agent", "-token", "t", "-nexttrace", "/bin/echo", "-log-file", " /tmp/mnagent.log "}, "dev")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.LogFile != "/tmp/mnagent.log" {
+		t.Fatalf("LogFile = %q", cfg.LogFile)
+	}
+}

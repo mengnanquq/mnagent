@@ -23,6 +23,7 @@ param(
 
     [string]$TokenFile,
     [string]$InstallDir = "",
+    [string]$LogFile = "",
     [string]$Version = "latest",
     [string]$GhProxy = "",
     [switch]$AutoUpdate,
@@ -62,6 +63,9 @@ if (-not $programFilesDir) { $programFilesDir = $env:ProgramFiles }
 if ([string]::IsNullOrWhiteSpace($InstallDir)) {
     $InstallDir = Join-Path $programFilesDir "mnagent"
 }
+if ([string]::IsNullOrWhiteSpace($LogFile)) {
+    $LogFile = Join-Path $InstallDir "mnagent.log"
+}
 
 function Show-Usage {
     Write-Host @"
@@ -77,6 +81,7 @@ mnagent Windows 一键安装脚本
 
 常用选项:
   -InstallDir <目录>         安装目录（默认: C:\Program Files\mnagent）
+  -LogFile <路径>            服务日志文件（默认: <安装目录>\mnagent.log，5MB × 3 轮转）
   -Version <版本>            mnagent 版本号（默认: latest）
   -GhProxy <URL>             GitHub 代理加速前缀（如 https://gh-proxy.com/）
   -AutoUpdate                开启自动检查更新（默认开启）
@@ -435,7 +440,8 @@ $serviceArgs = @(
     "-bot `"$Bot`"",
     "-token-file `"$tokenPath`"",
     "-nexttrace `"$nexttraceBin`"",
-    "-miaospeed `"$miaospeedBin`""
+    "-miaospeed `"$miaospeedBin`"",
+    "-log-file `"$LogFile`""
 )
 if ($enableAutoUpdate) {
     $serviceArgs += "-auto-update"
@@ -498,6 +504,7 @@ if ($svcStatus -and $svcStatus.Status -eq "Running") {
   ⚡ mnagent Windows 服务已成功安装并启动！
 ============================================================
   • 安装目录: $InstallDir
+  • 日志文件: $LogFile
   • 主执行程序: $mnagentBin
   • 服务名称: mnagent (自启状态: 自动)
   • 追踪引擎: nexttrace ($nexttraceBin)

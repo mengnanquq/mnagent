@@ -540,6 +540,8 @@ func TestWindowsInstallScript(t *testing.T) {
 		{"参数定义 -Bot", "[string]$Bot"},
 		{"参数定义 -Token", "[string]$Token"},
 		{"参数定义 -TokenFile", "[string]$TokenFile"},
+		{"参数定义 -LogFile", "[string]$LogFile"},
+		{"Windows 服务日志文件参数", "-log-file `\"$LogFile`\""},
 		{"严格校验 -Bot URL", "Assert-UrlSafe $Bot"},
 		{"严格校验 -GhProxy URL", "Assert-UrlSafe $GhProxy"},
 		{"支持环境变量令牌", "$env:MNAGENT_TOKEN"},

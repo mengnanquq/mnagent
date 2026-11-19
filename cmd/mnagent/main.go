@@ -8,6 +8,7 @@ package main
 import (
 	"context"
 	"fmt"
+	"io"
 	"log/slog"
 	"os"
 	"os/signal"
@@ -76,7 +77,17 @@ func runWithContext(ctx context.Context, args []string) error {
 			updater.CleanupOldExecutables(p)
 		}
 	}
-	log := slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: cfg.LogLevel}))
+	var logOutput io.Writer = os.Stderr
+	if cfg.LogFile != "" {
+		logWriter, logErr := newRotatingLogWriter(cfg.LogFile, defaultLogMaxBytes, defaultLogBackups)
+		if logErr != nil {
+			return fmt.Errorf("初始化日志文件 %s 失败：%w", cfg.LogFile, logErr)
+		}
+		defer func() { _ = logWriter.Close() }()
+		logOutput = io.MultiWriter(os.Stderr, logWriter)
+	}
+	log := slog.New(slog.NewTextHandler(logOutput, &slog.HandlerOptions{Level: cfg.LogLevel}))
+	slog.SetDefault(log) // 让 client 等包内的全局 slog 日志也遵循级别与日志文件。
 
 	// CLI 模式：检查/应用/跳过更新（不进入常驻循环）。
 	if handled, err := runner.HandleUpdateCLI(cfg, log); handled {
