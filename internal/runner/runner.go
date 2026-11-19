@@ -446,7 +446,7 @@ func (a *Agent) Loop(ctx context.Context) error {
 
 		// 同一 jobID 可能因长轮询重连/机器人重试被重复下发：正在执行则跳过，
 		// 已完成则重发缓存结果，避免重复跑 trace / miaospeed / 升级。
-		switch action, cached := a.dedupStore().start(job.ID); action {
+		switch action, cached, cacheState := a.dedupStore().start(job.ID); action {
 		case dedupRunning:
 			a.logger.Info("忽略重复下发的任务（正在执行）", "job", job.ID, "kind", probe.ProbeKind(*job))
 			continue
@@ -454,10 +454,10 @@ func (a *Agent) Loop(ctx context.Context) error {
 			// 异步重发：缓存结果可能有数 MB，同步上传会阻塞长轮询，
 			// 导致后续任务与取消指令迟迟得不到处理。
 			a.tasksWG.Add(1)
-			go func(j model.Job, cached *model.Result) {
+			go func(j model.Job, cached *model.Result, state dedupCacheState) {
 				defer a.tasksWG.Done()
-				a.resendCachedResult(ctx, j, cached)
-			}(*job, cached)
+				a.resendCachedResult(ctx, j, cached, state)
+			}(*job, cached, cacheState)
 			continue
 		}
 
@@ -502,7 +502,7 @@ func (a *Agent) heavyWorker(ctx context.Context) {
 
 			// 检查任务在排队期间是否已被 cancel
 			if a.tracker != nil && a.tracker.IsCancelled(j.ID) {
-				a.logger.Info("任务在排队期间已被取消，跳过执行", "job", j.ID, "kind", j.Kind)
+				a.logger.Info("任务在排队期间已被取消，标记为无结果并跳过执行", "job", j.ID, "kind", j.Kind)
 				a.dedupStore().complete(j.ID, nil)
 				continue
 			}
@@ -986,9 +986,14 @@ func (a *Agent) sendResultWithin(ctx context.Context, res model.Result, total ti
 // resendCachedResult 处理重复下发的已完成任务：能拿到缓存就重发，否则只记录跳过，
 // 绝不重新执行（尤其是 upgrade/miaospeed/trace）。
 // 在独立协程中调用，ctx 随主循环结束而取消，避免退出时被大结果上传拖住。
-func (a *Agent) resendCachedResult(ctx context.Context, job model.Job, cached *model.Result) {
+func (a *Agent) resendCachedResult(ctx context.Context, job model.Job, cached *model.Result, state dedupCacheState) {
 	if cached == nil {
-		a.logger.Warn("任务已执行过，但没有可重发的缓存结果（可能已取消或结果过大），跳过重复执行", "job", job.ID, "kind", probe.ProbeKind(job))
+		if state == dedupCacheOversized {
+			a.logger.Warn("任务已执行过，但结果超出缓存上限，跳过重复执行", "job", job.ID, "kind", probe.ProbeKind(job),
+				"cache_limit_bytes", int64(maxCachedResultsTotal))
+			return
+		}
+		a.logger.Info("任务已取消或没有可回传的结果，跳过重复执行", "job", job.ID, "kind", probe.ProbeKind(job))
 		return
 	}
 	if err := a.sendResultWithin(ctx, *cached, config.DefaultResultTotalTimeout); err != nil {

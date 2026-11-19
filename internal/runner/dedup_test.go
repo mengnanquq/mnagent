@@ -20,17 +20,17 @@ import (
 
 func TestJobDedupSkipsRunningAndReplaysCompleted(t *testing.T) {
 	d := newJobDedup()
-	if action, cached := d.start("j1"); action != dedupRun || cached != nil {
+	if action, cached, state := d.start("j1"); action != dedupRun || cached != nil || state != dedupCacheNone {
 		t.Fatalf("首次任务应执行: action=%v cached=%v", action, cached)
 	}
-	if action, _ := d.start("j1"); action != dedupRunning {
+	if action, _, _ := d.start("j1"); action != dedupRunning {
 		t.Fatalf("执行中的重复任务应跳过，实际 action=%v", action)
 	}
 
 	res := &model.Result{ID: "j1", Kind: "trace", Output: "cached-output", ExitCode: 0}
 	d.complete("j1", res)
-	action, cached := d.start("j1")
-	if action != dedupCompleted {
+	action, cached, state := d.start("j1")
+	if action != dedupCompleted || state != dedupCacheHit {
 		t.Fatalf("已完成任务的重复下发应走缓存，实际 action=%v", action)
 	}
 	if cached == nil || cached.ID != "j1" || cached.Output != "cached-output" {
@@ -45,28 +45,28 @@ func TestJobDedupExpiresAndEvictsLRU(t *testing.T) {
 	d.capacity = 2
 	d.now = func() time.Time { return now }
 
-	if action, _ := d.start("a"); action != dedupRun {
+	if action, _, _ := d.start("a"); action != dedupRun {
 		t.Fatalf("a 首次应执行")
 	}
 	d.complete("a", &model.Result{ID: "a", Output: "a"})
-	if action, _ := d.start("b"); action != dedupRun {
+	if action, _, _ := d.start("b"); action != dedupRun {
 		t.Fatalf("b 首次应执行")
 	}
 	d.complete("b", &model.Result{ID: "b", Output: "b"})
 	// b 最近使用过，插入 c 应淘汰最久未使用的 a。
-	if action, _ := d.start("c"); action != dedupRun {
+	if action, _, _ := d.start("c"); action != dedupRun {
 		t.Fatalf("c 首次应执行")
 	}
-	if action, cached := d.start("b"); action != dedupCompleted || cached == nil {
+	if action, cached, state := d.start("b"); action != dedupCompleted || cached == nil || state != dedupCacheHit {
 		t.Fatalf("b 应仍在缓存中，实际 action=%v cached=%v", action, cached)
 	}
-	if action, _ := d.start("a"); action != dedupRun {
+	if action, _, _ := d.start("a"); action != dedupRun {
 		t.Fatalf("a 应已被 LRU 淘汰，实际 action=%v", action)
 	}
 
 	// TTL 到期后同一 jobID 可重新执行。
 	now = now.Add(2 * time.Minute)
-	if action, _ := d.start("b"); action != dedupRun {
+	if action, _, _ := d.start("b"); action != dedupRun {
 		t.Fatalf("TTL 到期后应重新执行，实际 action=%v", action)
 	}
 }
@@ -85,10 +85,15 @@ func TestJobDedupExpiresEntryNotAtLRUTail(t *testing.T) {
 	d.start("old") // 把未过期的 old 移到 LRU 前端，使其不再位于尾部
 	// 推进到 old 过期、new 未过期：过期清理只看尾部会漏掉 old。
 	now = now.Add(40 * time.Second)
-	if action, _ := d.start("new"); action != dedupCompleted {
+	if action, _, _ := d.start("new"); action != dedupCompleted {
 		t.Fatalf("未过期的 new 应命中缓存，实际 action=%v", action)
 	}
-	if action, _ := d.start("old"); action != dedupRun {
+	// expireLocked 必须遍历整个 LRU，而不是只清理尾部：old 已被移到前端，
+	// 但已过期，应在上面的 start("new") 中就被清出内存。
+	if _, ok := d.entries["old"]; ok {
+		t.Fatal("不在 LRU 尾部的过期条目也应被主动清理")
+	}
+	if action, _, _ := d.start("old"); action != dedupRun {
 		t.Fatalf("不在 LRU 尾部的过期条目也必须失效并重新执行，实际 action=%v", action)
 	}
 }
@@ -98,9 +103,34 @@ func TestJobDedupOversizedResultStillSkipsExecution(t *testing.T) {
 	d.start("big")
 	huge := &model.Result{ID: "big", Output: strings.Repeat("x", maxCachedResultBytes+1)}
 	d.complete("big", huge)
-	action, cached := d.start("big")
-	if action != dedupCompleted || cached != nil {
-		t.Fatalf("超大结果应标记完成但不缓存，实际 action=%v cached=%v", action, cached)
+	action, cached, state := d.start("big")
+	if action != dedupCompleted || cached != nil || state != dedupCacheOversized {
+		t.Fatalf("超大结果应标记完成但不缓存且状态为 oversized，实际 action=%v cached=%v state=%v", action, cached, state)
+	}
+}
+
+// TestJobDedupTotalCacheLimit 验证所有缓存结果的总内存上限（16MB）：
+// 新结果挤掉旧结果时，旧任务重复下发应标记为“超出缓存上限”而不是“已取消/无结果”。
+func TestJobDedupTotalCacheLimit(t *testing.T) {
+	d := newJobDedup()
+	payload := strings.Repeat("x", 9<<20)
+	if payload == "" {
+		t.Fatal("payload 构造失败")
+	}
+	d.start("a")
+	d.complete("a", &model.Result{ID: "a", Output: payload + "a"})
+	d.start("b")
+	d.complete("b", &model.Result{ID: "b", Output: payload + "b"})
+
+	if d.cachedBytes > maxCachedResultsTotal {
+		t.Fatalf("缓存总大小 %d 超过上限 %d", d.cachedBytes, maxCachedResultsTotal)
+	}
+	action, cached, state := d.start("a")
+	if action != dedupCompleted || cached != nil || state != dedupCacheOversized {
+		t.Fatalf("被总缓存上限挤出的结果应标记 oversized，实际 action=%v cached=%v state=%v", action, cached, state)
+	}
+	if action, cached, state := d.start("b"); action != dedupCompleted || cached == nil || state != dedupCacheHit {
+		t.Fatalf("最新的 b 应仍在缓存中，实际 action=%v cached=%v state=%v", action, cached, state)
 	}
 }
 

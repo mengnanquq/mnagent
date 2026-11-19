@@ -17,7 +17,7 @@ var defaultDedupTTL = model.JobMiaospeedMaxTimeout + 10*time.Minute
 const (
 	defaultDedupCapacity  = 2048
 	maxCachedResultBytes  = 16 << 20 // 单个结果最多缓存 16MB（与结果体上限一致）
-	maxCachedResultsTotal = 64 << 20 // 所有缓存结果的总内存上限
+	maxCachedResultsTotal = 16 << 20 // 所有缓存结果的总内存上限（常驻内存，不宜过大）
 )
 
 type dedupAction int
@@ -28,9 +28,19 @@ const (
 	dedupCompleted                    // 任务已完成，有缓存则重发缓存结果
 )
 
+// dedupCacheState 说明已完成任务为什么有/没有可重发的缓存结果。
+type dedupCacheState int
+
+const (
+	dedupCacheNone      dedupCacheState = iota // 没有结果（任务被取消或未产生结果）
+	dedupCacheHit                              // 命中缓存，可重发
+	dedupCacheOversized                        // 结果超出单个结果缓存上限，未缓存
+)
+
 type dedupEntry struct {
 	id      string
 	state   dedupAction
+	cache   dedupCacheState
 	result  *model.Result
 	size    int64
 	expires time.Time
@@ -58,8 +68,9 @@ func newJobDedup() *jobDedup {
 	}
 }
 
-// start 登记任务并返回处理动作；已完成时同时返回缓存结果（可能为 nil，例如结果过大）。
-func (d *jobDedup) start(id string) (dedupAction, *model.Result) {
+// start 登记任务并返回处理动作；已完成时同时返回缓存结果与缓存状态
+// （结果可能为 nil：任务已取消，或结果超过缓存上限）。
+func (d *jobDedup) start(id string) (dedupAction, *model.Result, dedupCacheState) {
 	d.mu.Lock()
 	defer d.mu.Unlock()
 	now := d.now()
@@ -74,13 +85,16 @@ func (d *jobDedup) start(id string) (dedupAction, *model.Result) {
 			d.order.MoveToFront(e.elem)
 			switch e.state {
 			case dedupRunning:
-				return dedupRunning, nil
+				return dedupRunning, nil, dedupCacheNone
 			default:
-				if e.result != nil {
+				if e.cache == dedupCacheHit && e.result != nil {
 					cached := *e.result
-					return dedupCompleted, &cached
+					return dedupCompleted, &cached, dedupCacheHit
 				}
-				return dedupCompleted, nil
+				if e.cache == dedupCacheOversized {
+					return dedupCompleted, nil, dedupCacheOversized
+				}
+				return dedupCompleted, nil, dedupCacheNone
 			}
 		}
 	}
@@ -89,7 +103,7 @@ func (d *jobDedup) start(id string) (dedupAction, *model.Result) {
 	e.elem = d.order.PushFront(e)
 	d.entries[id] = e
 	d.evictLocked()
-	return dedupRun, nil
+	return dedupRun, nil, dedupCacheNone
 }
 
 // complete 把任务标记为已完成，并在体积允许时缓存结果供重复下发时重发。
@@ -109,6 +123,7 @@ func (d *jobDedup) complete(id string, res *model.Result) {
 		d.entries[id] = e
 	}
 	e.state = dedupCompleted
+	e.cache = dedupCacheNone
 	e.expires = now.Add(d.ttl)
 	d.order.MoveToFront(e.elem)
 
@@ -119,33 +134,26 @@ func (d *jobDedup) complete(id string, res *model.Result) {
 			cached := *res
 			e.result = &cached
 			e.size = size
+			e.cache = dedupCacheHit
 			d.cachedBytes += size
 			d.trimResultsLocked()
+		} else {
+			e.cache = dedupCacheOversized
 		}
 	}
 	d.evictLocked()
 }
 
-// forget 删除记录（例如任务被取消，不应把取消状态当作“已完成”）。
-func (d *jobDedup) forget(id string) {
-	d.mu.Lock()
-	defer d.mu.Unlock()
-	if e, ok := d.entries[id]; ok {
-		d.removeLocked(e)
-	}
-}
-
+// expireLocked 清理所有过期项。不能只从 LRU 尾部扫：被重复访问过的条目会
+// 提前移到前面，即使已经过期也不会落在尾部，只扫尾部会长期占用内存。
 func (d *jobDedup) expireLocked(now time.Time) {
-	for {
-		back := d.order.Back()
-		if back == nil {
-			return
+	for el := d.order.Front(); el != nil; {
+		next := el.Next()
+		e := el.Value.(*dedupEntry)
+		if !e.expires.After(now) {
+			d.removeLocked(e)
 		}
-		e := back.Value.(*dedupEntry)
-		if e.expires.After(now) {
-			return
-		}
-		d.removeLocked(e)
+		el = next
 	}
 }
 
@@ -164,7 +172,10 @@ func (d *jobDedup) trimResultsLocked() {
 		return
 	}
 	for el := d.order.Back(); el != nil && d.cachedBytes > maxCachedResultsTotal; el = el.Prev() {
-		d.dropResultLocked(el.Value.(*dedupEntry))
+		e := el.Value.(*dedupEntry)
+		d.dropResultLocked(e)
+		// 因总缓存上限被挤出：重复下发时应说明“超出缓存上限”，而不是“已取消/无结果”。
+		e.cache = dedupCacheOversized
 	}
 }
 
