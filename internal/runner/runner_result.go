@@ -39,8 +39,7 @@ func (a *Agent) finishResend(id string) {
 	a.resendMu.Unlock()
 }
 
-// enqueueHeavy 把重任务投入串行队列；队列已满时立即清理去重记录并回传失败，
-// 绝不阻塞主循环或让任务静默消失。返回值表示是否成功入队。
+// setStopContext 记录退出阶段的共享停止预算，供在途任务回传使用。
 func (a *Agent) setStopContext(ctx context.Context) {
 	a.stopMu.Lock()
 	a.stopCtx = ctx
@@ -111,11 +110,10 @@ func (a *Agent) resendCachedResult(ctx context.Context, job model.Job, cached *m
 		a.logger.Info("任务已取消或没有可回传的结果，跳过重复执行", "job", job.ID, "kind", probe.ProbeKind(job))
 		return
 	}
-	if err := a.sendResultWithin(ctx, *cached, config.DefaultResultTotalTimeout); err != nil {
+	// 重发同样尊重 -result-timeout：缓存结果可能有数 MB，不能用无限制预算。
+	if err := a.sendResultWithin(ctx, *cached, a.resultTimeout()); err != nil {
 		a.logger.Warn("重发缓存结果失败", "job", job.ID, "error", err)
 		return
 	}
 	a.logger.Info("已重发缓存结果（跳过重复执行）", "job", job.ID, "kind", probe.ProbeKind(job))
 }
-
-// NewAgent 创建一个新的调度代理实例。

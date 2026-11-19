@@ -1169,6 +1169,100 @@ func TestAgentEnqueueHeavyQueueFullRejectsImmediately(t *testing.T) {
 	}
 }
 
+// newResultTestServer 返回一个接收 /results 的测试服务端与结果通道。
+func newResultTestServer(t *testing.T, capacity int) (*httptest.Server, chan model.Result) {
+	t.Helper()
+	results := make(chan model.Result, capacity)
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/results" {
+			w.WriteHeader(http.StatusNoContent)
+			return
+		}
+		var res model.Result
+		_ = json.NewDecoder(r.Body).Decode(&res)
+		results <- res
+		w.WriteHeader(http.StatusNoContent)
+	}))
+	t.Cleanup(srv.Close)
+	return srv, results
+}
+
+// TestAgentEnqueueHeavyReportsExit 验证退出阶段收到的重任务会立即回报“节点正在退出”，
+// 而不是静默丢弃让机器人等到超时。
+func TestAgentEnqueueHeavyReportsExit(t *testing.T) {
+	srv, results := newResultTestServer(t, 1)
+	cfg := &config.Config{
+		BotURL:        srv.URL,
+		Tokens:        &config.TokenSource{Value: "tok"},
+		PollTimeout:   time.Second,
+		ResultTimeout: time.Second,
+	}
+	a := &Agent{cfg: cfg, logger: testLogger{t}, client: client.New(cfg)}
+	a.heavyQueue = make(chan model.Job, 1)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	job := model.Job{ID: "exiting", Kind: "trace", Target: "1.1.1.1"}
+	if a.enqueueHeavy(ctx, job) {
+		t.Fatal("退出阶段不应再入队")
+	}
+	select {
+	case res := <-results:
+		if res.ID != "exiting" || res.ExitCode != -1 || !strings.Contains(res.Error, "正在退出") {
+			t.Fatalf("退出阶段失败结果异常: %+v", res)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("退出阶段应回传未执行原因")
+	}
+	action, cached, _ := a.dedupStore().start("exiting")
+	if action != dedupCompleted || cached == nil || cached.ID != "exiting" {
+		t.Fatalf("退出任务应标记为已完成并缓存失败结果，实际 action=%v cached=%+v", action, cached)
+	}
+}
+
+// TestAgentRejectBusyJobLimitsConcurrency 验证失败结果回传并发达到上限后会直接丢弃
+// （结果已在去重缓存中），而不会阻塞主循环或无界地堆集协程。
+func TestAgentRejectBusyJobLimitsConcurrency(t *testing.T) {
+	srv, results := newResultTestServer(t, 1)
+	cfg := &config.Config{
+		BotURL:        srv.URL,
+		Tokens:        &config.TokenSource{Value: "tok"},
+		PollTimeout:   time.Second,
+		ResultTimeout: time.Second,
+	}
+	a := &Agent{cfg: cfg, logger: testLogger{t}, client: client.New(cfg)}
+
+	sem := a.rejectSendLimiter()
+	for i := 0; i < maxConcurrentRejectSends; i++ {
+		sem <- struct{}{}
+	}
+	defer func() {
+		for i := 0; i < maxConcurrentRejectSends; i++ {
+			<-sem
+		}
+	}()
+
+	done := make(chan struct{})
+	go func() {
+		a.rejectBusyJob(model.Job{ID: "dropped", Kind: "miaospeed"}, "节点任务队列已满")
+		close(done)
+	}()
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("并发上限已满时 rejectBusyJob 不应阻塞")
+	}
+	select {
+	case res := <-results:
+		t.Fatalf("并发上限已满时不应再发起回传，实际收到 %+v", res)
+	case <-time.After(200 * time.Millisecond):
+	}
+	// 结果必须已写入缓存，服务端重发时仍能拿到，不是无声丢失。
+	if action, cached, _ := a.dedupStore().start("dropped"); action != dedupCompleted || cached == nil {
+		t.Fatalf("被丢弃的回传仍应保留在去重缓存中，实际 action=%v cached=%+v", action, cached)
+	}
+}
+
 // TestRunnerArgvSupportsBracketedIPv6WithPort 验证带端口的 IPv6 trace 目标
 // （例如 [2606:4700:4700::1111]:443）不会被参数校验拒绝。
 func TestRunnerArgvSupportsBracketedIPv6WithPort(t *testing.T) {

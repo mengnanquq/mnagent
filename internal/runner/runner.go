@@ -77,11 +77,11 @@ func NewRunnerFull(binary, miaospeed, ghProxy string, allowPrivate bool, log Log
 	return r
 }
 
-// run 执行一次任务，返回输出、错误文案与退出码。
-// 退出码 -1 表示任务本身非法（未执行）。
-// runResult 是一次任务的执行结果。
+// runResult 是 RunResult 的包内简写。
 type runResult = RunResult
 
+// RunResult 是一次任务的执行结果。
+// ExitCode 为 -1 表示任务本身非法（未执行）。
 type RunResult struct {
 	Output   string          // 原始输出（trace）或摘要文本
 	Data     json.RawMessage // 结构化探针结果（ping/tcping/http/dns/miaospeed）
@@ -334,10 +334,13 @@ type Agent struct {
 	update  *updater.Updater
 	tracker *tracker.Tracker
 
-	heavyMu    sync.Mutex
 	heavyQueue chan model.Job
 	lightSem   chan struct{}
 	tasksWG    sync.WaitGroup
+
+	// rejectOnce/rejectSem 限制 rejectBusyJob 并发回传的协程数。
+	rejectOnce sync.Once
+	rejectSem  chan struct{}
 
 	// stopCtx 是主循环退出后的共享停止预算：在途任务回传与未执行任务回报
 	// 都受同一个 deadline 约束，总时长不超过 config.DefaultExitResultTimeout。
@@ -506,6 +509,7 @@ func (a *Agent) Loop(ctx context.Context) error {
 	}
 }
 
+// startHeartbeat 启动独立于任务执行的周期心跳协程，确保长任务执行期间服务端 lastSeen 始终保活。
 func (a *Agent) startHeartbeat(ctx context.Context) {
 	a.tasksWG.Add(1)
 	go func() {
