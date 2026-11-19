@@ -111,3 +111,27 @@ func TestLockReleasedWhenProcessExits(t *testing.T) {
 		t.Fatalf("锁文件应保留（内容仅供诊断），实际: %v", err)
 	}
 }
+
+// TestAcquireWarnsAndContinuesOnNonLockError 验证非“锁被占用”的错误（如目录不可用）
+// 只告警并继续运行，不会阻止 agent 启动。
+func TestAcquireWarnsAndContinuesOnNonLockError(t *testing.T) {
+	// 把父路径做成普通文件，打开 <file>/instance.lock 会得到 ENOTDIR。
+	blockedParent := filepath.Join(t.TempDir(), "not-a-dir")
+	if err := os.WriteFile(blockedParent, []byte("x"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	var warned error
+	lock, err := AcquireWithWarn(blockedParent, "instance", 0, func(cause error) { warned = cause })
+	if err != nil {
+		t.Fatalf("非锁占用错误不应阻止启动，实际错误: %v", err)
+	}
+	if lock != nil {
+		t.Fatal("无法加锁时应返回 nil lock")
+	}
+	if warned == nil {
+		t.Fatal("非锁占用错误应通过 warn 回调告警")
+	}
+	if lock, err := Acquire(blockedParent, "instance", 0); err != nil || lock != nil {
+		t.Fatalf("Acquire 在非锁占用错误时应继续运行，实际 lock=%v err=%v", lock, err)
+	}
+}

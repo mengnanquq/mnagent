@@ -52,6 +52,14 @@ func (l *Lock) Close() error {
 // wait > 0 时会在锁被占用时重试一段时间（自更新/服务重启时旧进程退出与新进程
 // 启动可能短暂重叠），超时后返回明确错误；wait == 0 表示只尝试一次。
 func Acquire(dir, name string, wait time.Duration) (*Lock, error) {
+	return AcquireWithWarn(dir, name, wait, nil)
+}
+
+// AcquireWithWarn 与 Acquire 相同，但只在锁确实被另一个实例占用时返回错误。
+// 文件系统不支持 flock（ENOTSUP）、目录不可写（EACCES）等平台/权限问题只通过
+// warn 回调告警并返回 (nil, nil) 继续运行：单实例是防重复启停的优化，不应成为
+// 设备上唯一阻止 agent 工作的原因。
+func AcquireWithWarn(dir, name string, wait time.Duration, warn func(error)) (*Lock, error) {
 	if dir == "" {
 		return nil, errors.New("单实例锁目录为空")
 	}
@@ -61,7 +69,10 @@ func Acquire(dir, name string, wait time.Duration) (*Lock, error) {
 	path := filepath.Join(dir, name+".lock")
 	f, err := os.OpenFile(path, os.O_CREATE|os.O_RDWR, 0o600)
 	if err != nil {
-		return nil, fmt.Errorf("打开锁文件失败：%w", err)
+		if warn != nil {
+			warn(fmt.Errorf("打开锁文件失败：%w", err))
+		}
+		return nil, nil
 	}
 	deadline := time.Now().Add(wait)
 	for {
@@ -74,7 +85,10 @@ func Acquire(dir, name string, wait time.Duration) (*Lock, error) {
 		}
 		if !errors.Is(err, errLocked) {
 			_ = f.Close()
-			return nil, fmt.Errorf("获取单实例锁失败（%s）：%w", path, err)
+			if warn != nil {
+				warn(fmt.Errorf("获取单实例锁失败（%s）：%w", path, err))
+			}
+			return nil, nil
 		}
 		if !time.Now().Before(deadline) {
 			_ = f.Close()

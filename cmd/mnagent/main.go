@@ -185,9 +185,14 @@ func acquireInstanceLock(cfg *config.Config, log *slog.Logger) (*instancelock.Lo
 	if cfg != nil {
 		botURL = cfg.BotURL
 	}
-	lock, err := instancelock.Acquire(dir, instancelock.Name(botURL, token), 5*time.Second)
+	lock, err := instancelock.AcquireWithWarn(dir, instancelock.Name(botURL, token), 5*time.Second, func(cause error) {
+		log.Warn("单实例锁不可用，继续启动（无法阻止同令牌重复实例）", "error", cause)
+	})
 	if err != nil {
 		return nil, fmt.Errorf("单实例检查失败：%w；如确认没有其他 mnagent 在运行，可删除锁文件后重试", err)
+	}
+	if lock == nil {
+		return nil, nil
 	}
 	log.Debug("已获取单实例锁", "path", lock.Path())
 	return lock, nil
