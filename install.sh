@@ -580,13 +580,19 @@ map_nexttrace_arch() {
 	esac
 }
 
-# fetch_github_asset_digest <owner/repo> <资产名>
-# 从 GitHub Releases API 的最新发布中取指定资产的 sha256 摘要（形如 sha256:<hex>）。
-# 不执行任何远端脚本；取不到摘要时返回非零，由调用方跳过自动安装。
+# fetch_github_asset_digest <owner/repo> <资产名> [tag]
+# 从 GitHub Releases API 取指定资产的 sha256 摘要（形如 sha256:<hex>）。
+# tag 缺省或为 latest 时读取最新发布；否则读取 /releases/tags/<tag>。
+# 不执行任何远端脚本；取不到摘要时返回非零，由调用方中止（绝不跳过后安装）。
 fetch_github_asset_digest() {
 	digest_repo="$1"
 	digest_asset="$2"
-	digest_api="https://api.github.com/repos/${digest_repo}/releases/latest"
+	digest_tag="${3:-latest}"
+	if [ -n "$digest_tag" ] && [ "$digest_tag" != "latest" ]; then
+		digest_api="https://api.github.com/repos/${digest_repo}/releases/tags/${digest_tag}"
+	else
+		digest_api="https://api.github.com/repos/${digest_repo}/releases/latest"
+	fi
 	digest_json="$(download_stdout "$digest_api" 2>/dev/null || true)"
 	[ -n "$digest_json" ] || return 1
 	digest_value="$(printf '%s' "$digest_json" \
@@ -731,19 +737,56 @@ download_miaospeed() {
 	url="https://github.com/AirportR/miaospeed/releases/download/${miao_tag}/${tar_name}"
 	url="$(apply_gh_proxy "$url")"
 
+	# 先取上游摘要；拿不到就跳过安装，绝不以 root 执行未经校验的压缩包。
+	miao_digest="$(fetch_github_asset_digest "AirportR/miaospeed" "$tar_name" "$miao_tag" || true)"
+	if [ -z "$miao_digest" ]; then
+		warn "无法获取 miaospeed（${tar_name}）的 SHA-256 摘要，已跳过自动安装（请检查网络或 GitHub API 限额）"
+		return 1
+	fi
+	miao_expected="${miao_digest#sha256:}"
+
 	tmp="$(mktemp -d)"
 	if [ -n "$GH_PROXY" ]; then
-		log "通过 GitHub 代理下载 miaospeed（最新版本：${miao_tag}，${OS}/${miao_arch}，代理：${GH_PROXY}）"
+		log "通过 GitHub 代理下载 miaospeed（版本：${miao_tag}，${OS}/${miao_arch}，代理：${GH_PROXY}）"
 	else
-		log "下载 miaospeed（最新版本：${miao_tag}，${OS}/${miao_arch}）"
+		log "下载 miaospeed（版本：${miao_tag}，${OS}/${miao_arch}）"
 	fi
-	if download "$url" "$tmp/miaospeed.tar.gz"; then
-		tar -xzf "$tmp/miaospeed.tar.gz" -C "$tmp" 2>/dev/null || tar -xz -f "$tmp/miaospeed.tar.gz" -C "$tmp" 2>/dev/null || true
-		miao_file="$(find "$tmp" -maxdepth 2 -type f -name "miaospeed*" ! -name "*.tar.gz" | head -n1)"
-		if [ -n "$miao_file" ] && [ -f "$miao_file" ]; then
-			install_file "$miao_file" "$PREFIX/miaospeed" 0755
-			chmod 0755 "$PREFIX/miaospeed" 2>/dev/null || true
+	if ! download "$url" "$tmp/miaospeed.tar.gz"; then
+		warn "下载 miaospeed 失败：${url}"
+		rm -rf "$tmp"
+		return 1
+	fi
+	miao_actual="$(sha256_of "$tmp/miaospeed.tar.gz" || true)"
+	if [ -z "$miao_actual" ]; then
+		warn "未找到可用的 SHA-256 工具，已跳过 miaospeed 自动安装"
+		rm -rf "$tmp"
+		return 1
+	fi
+	if [ "$miao_actual" != "$miao_expected" ]; then
+		warn "miaospeed SHA-256 校验失败：期望 ${miao_expected}，实际 ${miao_actual}（已丢弃下载文件）"
+		rm -rf "$tmp"
+		return 1
+	fi
+	log "miaospeed SHA-256 校验通过"
+
+	tar -xzf "$tmp/miaospeed.tar.gz" -C "$tmp" 2>/dev/null || tar -xz -f "$tmp/miaospeed.tar.gz" -C "$tmp" 2>/dev/null || true
+	# 按确切文件名取二进制：常规 release 为 miaospeed-<os>-<arch>，
+	# 4.7.11 起部分 amd64 归档改用 runner/runner，同样按固定路径匹配，不使用“第一个类似文件”。
+	miao_bin_name="miaospeed-${OS}-${miao_arch}"
+	miao_file=""
+	for miao_candidate in "$tmp/${miao_bin_name}" "$tmp/runner/runner"; do
+		if [ -f "$miao_candidate" ] && [ ! -L "$miao_candidate" ]; then
+			miao_file="$miao_candidate"
+			break
 		fi
+	done
+	if [ -n "$miao_file" ]; then
+		install_file "$miao_file" "$PREFIX/miaospeed" 0755
+		chmod 0755 "$PREFIX/miaospeed" 2>/dev/null || true
+	else
+		warn "miaospeed 压缩包内未找到预期二进制（${miao_bin_name}），已跳过安装"
+		rm -rf "$tmp"
+		return 1
 	fi
 	rm -rf "$tmp"
 }
@@ -753,7 +796,7 @@ MIAOSPEED_PATH="$(find_binary "$MIAOSPEED_BIN" || true)"
 # 缺少 miaospeed 时，尝试从 GitHub Releases 自动下载安装
 if [ -z "$MIAOSPEED_PATH" ] && [ "$INSTALL_MIAOSPEED" = "yes" ]; then
 	log "环境缺少 miaospeed，正在从 AirportR/miaospeed 获取并安装..."
-	download_miaospeed
+	download_miaospeed || true
 	MIAOSPEED_PATH="$(find_binary "$MIAOSPEED_BIN" || true)"
 	if [ -n "$MIAOSPEED_PATH" ]; then
 		log "miaospeed 安装成功：${MIAOSPEED_PATH}"

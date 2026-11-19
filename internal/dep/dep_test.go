@@ -678,3 +678,28 @@ func TestUpdateMiaospeedLatestFailureKeepsInstalled(t *testing.T) {
 		t.Fatalf("不得覆盖已安装版本: %q", string(got))
 	}
 }
+
+// TestExtractTarGzRunnerLayout 验证兼容 4.7.11 起把二进制放在 runner/runner 的 miaospeed 归档。
+func TestExtractTarGzRunnerLayout(t *testing.T) {
+	var buf bytes.Buffer
+	gw := gzip.NewWriter(&buf)
+	tw := tar.NewWriter(gw)
+	content := []byte("runner-binary-content")
+	if err := tw.WriteHeader(&tar.Header{Name: "runner/runner", Mode: 0755, Size: int64(len(content)), Typeflag: tar.TypeReg}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := tw.Write(content); err != nil {
+		t.Fatal(err)
+	}
+	_ = tw.Close()
+	_ = gw.Close()
+
+	dest := filepath.Join(t.TempDir(), "miaospeed")
+	if err := ExtractTarGzFile(&buf, dest); err != nil {
+		t.Fatalf("解压 runner/runner 归档失败: %v", err)
+	}
+	got, err := os.ReadFile(dest)
+	if err != nil || string(got) != string(content) {
+		t.Fatalf("解压内容不匹配: %q err=%v", string(got), err)
+	}
+}

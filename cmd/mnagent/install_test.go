@@ -222,6 +222,27 @@ func TestInstallScriptDoesNotRunRemoteNexttraceScript(t *testing.T) {
 	}
 }
 
+// TestInstallScriptVerifiesMiaospeed 守护 miaospeed 自动安装：必须先取 GitHub API 摘要并强制校验，
+// 解压后按确切文件名取二进制，禁止再以“第一个类似文件”安装未校验的压缩包。
+func TestInstallScriptVerifiesMiaospeed(t *testing.T) {
+	script := string(readInstallScript(t))
+
+	for _, want := range []struct{ name, needle string }{
+		{"按指定 tag 取上游摘要", `fetch_github_asset_digest "AirportR/miaospeed" "$tar_name" "$miao_tag"`},
+		{"摘要缺失即跳过安装", "无法获取 miaospeed"},
+		{"下载后比对 SHA-256", `[ "$miao_actual" != "$miao_expected" ]`},
+		{"按确切文件名取二进制", `miao_bin_name="miaospeed-${OS}-${miao_arch}"`},
+		{"兼容 runner/runner 归档", `"$tmp/runner/runner"`},
+	} {
+		if !containsActiveLine(script, want.needle) {
+			t.Errorf("install.sh 缺少“%s”（非注释行应包含 %q）", want.name, want.needle)
+		}
+	}
+	if containsActiveLine(script, `-name "miaospeed*"`) {
+		t.Error("install.sh 不应再用通配符取 miaospeed 压缩包内“第一个匹配”文件")
+	}
+}
+
 // TestWindowsInstallScript 校验 Windows 一键安装脚本 install.ps1 的完整性与关键安全逻辑。
 func TestWindowsInstallScript(t *testing.T) {
 	content, err := os.ReadFile(filepath.Join(findRepoRoot(), "install.ps1"))

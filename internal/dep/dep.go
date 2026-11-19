@@ -780,7 +780,8 @@ func ExtractTarGzFile(r io.Reader, destFile string) error {
 		if strings.HasSuffix(lower, ".tar.gz") || strings.HasSuffix(lower, ".tgz") || strings.EqualFold(name, "license") || strings.HasPrefix(lower, "readme") {
 			continue
 		}
-		if strings.HasSuffix(lower, ".exe") || strings.Contains(lower, "miaospeed") {
+		if strings.HasSuffix(lower, ".exe") || strings.Contains(lower, "miaospeed") ||
+			hdr.Name == "runner/runner" { // 4.7.11 起部分 miaospeed 归档把二进制放在 runner/runner
 			f, err := os.OpenFile(destFile, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0755)
 			if err != nil {
 				return err
