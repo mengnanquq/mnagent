@@ -78,7 +78,7 @@ usage() {
 参数：
   --bot <url>          机器人 agent 端点基地址（必填，如 https://mnbot.example.org/agent）
   --token <token>      接入令牌（不推荐：会出现在 argv/命令历史；优先用 --token-file、MNAGENT_TOKEN 或 --token-stdin）
-  --token-file <path>  令牌文件路径（默认 /etc/mnagent/token；推荐，升级时会保留）
+  --token-file <path>  令牌文件路径（默认 /etc/mnagent/token；推荐，升级时会保留；传 - 等价于 --token-stdin）
   --token-stdin        从标准输入读取令牌（仅脚本文件执行时可用，例如 sh install.sh --token-stdin < token.txt）
   --nexttrace <path>   nexttrace 可执行文件路径或名称（默认 nexttrace）
   --miaospeed <path>   miaospeed 可执行文件路径或名称（默认 miaospeed）
@@ -468,6 +468,10 @@ if [ -n "$GH_PROXY" ]; then
 fi
 
 # 令牌可由 --token-stdin 或 MNAGENT_TOKEN 提供，避免明文出现在 argv/ps/命令历史中。
+if [ "$TOKEN_FILE" = "-" ]; then
+	TOKEN_FILE="/etc/mnagent/token"
+	TOKEN_STDIN="yes"
+fi
 if [ "$TOKEN_STDIN" = "yes" ] && [ -z "$TOKEN" ]; then
 	IFS= read -r TOKEN || die "从标准输入读取令牌失败（管道安装时 stdin 已被脚本占用，请改用 --token-file 或 MNAGENT_TOKEN）"
 	TOKEN="$(printf '%s' "$TOKEN" | tr -d '\r\n')"
