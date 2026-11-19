@@ -20,10 +20,16 @@ import (
 
 // 默认参数。
 const (
-	DefaultMinBackoff    = time.Second
-	DefaultMaxBackoff    = time.Minute
-	DefaultPollWait      = 40 * time.Second // 机器人侧长轮询最多保持 20 秒。
-	DefaultResultTimeout = 5 * time.Minute  // /results 上传可能很大（16MB），慢速网络下需要更长时限。
+	DefaultMinBackoff = time.Second
+	DefaultMaxBackoff = time.Minute
+	DefaultPollWait   = 40 * time.Second // 机器人侧长轮询最多保持 20 秒。
+	// 单次 /results 上传超时：必须小于服务端 5 分钟的结果等待，避免服务端先超时。
+	DefaultResultTimeout = 4 * time.Minute
+	// 一次结果回传（含重试）的整体预算：3 次 × 单次超时不再无限累加。
+	DefaultResultTotalTimeout = 6 * time.Minute
+	// 退出/重启时的回报预算：必须明显小于 systemd 的 TimeoutStopSec=90s，
+	// 否则服务会在等待旧进程回报时被 SIGKILL，反而丢结果。
+	DefaultExitResultTimeout = 60 * time.Second
 )
 
 // Config 是进程启动参数解析后的运行配置。

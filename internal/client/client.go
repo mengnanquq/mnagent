@@ -45,8 +45,9 @@ type Client struct {
 	tokens  *config.TokenSource
 	http    *http.Client
 	// results 使用独立客户端：/results 可能上传 16MB，慢速网络下不能沿用长轮询的短超时。
-	resultsHTTP   *http.Client
-	resultTimeout time.Duration
+	resultsHTTP        *http.Client
+	resultTimeout      time.Duration // 单次上传超时
+	resultTotalTimeout time.Duration // 一次 SendResult（含重试）的整体预算
 
 	paused atomic.Bool // 更新期间暂停轮询，避免新旧版本交替领取任务。
 
@@ -81,6 +82,12 @@ func New(cfg *config.Config) *Client {
 	if resultTimeout <= 0 {
 		resultTimeout = config.DefaultResultTimeout
 	}
+	// 整体预算默认 6 分钟；用户显式把单次超时调得更大时，整体预算跟随放大，
+	// 避免自定义配置被静默截断。
+	resultTotalTimeout := config.DefaultResultTotalTimeout
+	if resultTimeout > resultTotalTimeout {
+		resultTotalTimeout = resultTimeout
+	}
 	return &Client{
 		baseURL: cfg.BotURL,
 		tokens:  cfg.Tokens,
@@ -92,11 +99,12 @@ func New(cfg *config.Config) *Client {
 			Transport: transport,
 			Timeout:   resultTimeout,
 		},
-		resultTimeout: resultTimeout,
-		wsDisabled:    wsDisabledByEnv(),
-		wsHTTP:        newWSHTTPClient(),
-		wsJobs:        make(chan *model.Job, 64),
-		wsReject:      make(chan model.Result, 64),
+		resultTimeout:      resultTimeout,
+		resultTotalTimeout: resultTotalTimeout,
+		wsDisabled:         wsDisabledByEnv(),
+		wsHTTP:             newWSHTTPClient(),
+		wsJobs:             make(chan *model.Job, 64),
+		wsReject:           make(chan model.Result, 64),
 	}
 }
 
@@ -194,17 +202,22 @@ func (c *Client) SendResult(ctx context.Context, res model.Result) error {
 	if err != nil {
 		return err
 	}
+	// 整体 deadline：最多 maxResultAttempts 次，但总耗时不超过 resultTotalTimeout，
+	// 避免“3 次 × 单次 4 分钟”在慢速网络下把任务回传拖到十几分钟。
+	totalCtx, cancelTotal := context.WithTimeout(ctx, c.resultTotalTimeout)
+	defer cancelTotal()
 	var lastErr error
 	for attempt := 1; attempt <= maxResultAttempts; attempt++ {
 		if attempt > 1 {
 			select {
-			case <-ctx.Done():
-				return ctx.Err()
+			case <-totalCtx.Done():
+				return totalCtx.Err()
 			case <-time.After(time.Duration(attempt-1) * time.Second):
 			}
 		}
 		// 每次上传单独限时：结果体可达 16MB，慢速网络需要远长于长轮询的时限。
-		attemptCtx, cancel := context.WithTimeout(ctx, c.resultTimeout)
+		// 单次超时同时受整体 deadline 约束。
+		attemptCtx, cancel := context.WithTimeout(totalCtx, c.resultTimeout)
 		resp, err := c.doWith(c.resultsHTTP, attemptCtx, http.MethodPost, "/results", payload)
 		if err != nil {
 			cancel()

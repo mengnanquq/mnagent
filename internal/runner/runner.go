@@ -362,7 +362,9 @@ func (a *Agent) Loop(ctx context.Context) error {
 		if a.client == nil {
 			return
 		}
-		fctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		// 退出回报使用短预算：总时长必须小于 systemd 的停止超时（90s），
+		// 否则服务会在回报途中被 SIGKILL，反而丢结果。
+		fctx, cancel := context.WithTimeout(context.Background(), config.DefaultExitResultTimeout)
 		defer cancel()
 		if n := a.client.FailPending(fctx, "agent 正在重启或退出，任务未执行，请重试"); n > 0 {
 			a.logger.Info("已回报未执行的任务", "count", n)
@@ -449,7 +451,13 @@ func (a *Agent) Loop(ctx context.Context) error {
 			a.logger.Info("忽略重复下发的任务（正在执行）", "job", job.ID, "kind", probe.ProbeKind(*job))
 			continue
 		case dedupCompleted:
-			a.resendCachedResult(*job, cached)
+			// 异步重发：缓存结果可能有数 MB，同步上传会阻塞长轮询，
+			// 导致后续任务与取消指令迟迟得不到处理。
+			a.tasksWG.Add(1)
+			go func(j model.Job, cached *model.Result) {
+				defer a.tasksWG.Done()
+				a.resendCachedResult(ctx, j, cached)
+			}(*job, cached)
 			continue
 		}
 
@@ -721,16 +729,39 @@ func (a *Agent) failPendingHeavy(ctx context.Context, reason string) int {
 	if a.heavyQueue == nil {
 		return 0
 	}
-	n := 0
+	var jobs []model.Job
 	for {
 		select {
 		case job, ok := <-a.heavyQueue:
 			if !ok {
-				return n
+				goto send
 			}
 			if job.Kind == "cancel" {
 				continue
 			}
+			jobs = append(jobs, job)
+		default:
+			goto send
+		}
+	}
+
+send:
+	if len(jobs) == 0 {
+		return 0
+	}
+	// 退出时可能积压多个任务：小并发回报，共享同一个退出预算（见 Loop），
+	// 既比原来 5s 串行更宽裕，也不会超过 systemd 的停止超时。
+	var (
+		wg sync.WaitGroup
+		n  atomic.Int64
+	)
+	sem := make(chan struct{}, 4)
+	for _, job := range jobs {
+		wg.Add(1)
+		go func(job model.Job) {
+			defer wg.Done()
+			sem <- struct{}{}
+			defer func() { <-sem }()
 			res := model.Result{
 				ID:       job.ID,
 				Kind:     probe.ProbeKind(job),
@@ -743,11 +774,11 @@ func (a *Agent) failPendingHeavy(ctx context.Context, reason string) int {
 					a.logger.Warn("回报未执行重任务失败", "job", job.ID, "error", err)
 				}
 			}
-			n++
-		default:
-			return n
-		}
+			n.Add(1)
+		}(job)
 	}
+	wg.Wait()
+	return int(n.Load())
 }
 
 // sleep 等待指定时长；ctx 结束时返回 false。
@@ -937,21 +968,30 @@ func (a *Agent) resultTimeout() time.Duration {
 	return config.DefaultResultTimeout
 }
 
-// sendResult 在独立于任务上下文的时限内回传结果。
+// sendResult 在独立于任务上下文的整体预算内回传结果。
 func (a *Agent) sendResult(res model.Result) error {
-	ctx, cancel := context.WithTimeout(context.Background(), a.resultTimeout())
+	return a.sendResultWithin(context.Background(), res, config.DefaultResultTotalTimeout)
+}
+
+// sendResultWithin 在给定整体预算内回传结果；ctx 取消时立即返回。
+func (a *Agent) sendResultWithin(ctx context.Context, res model.Result, total time.Duration) error {
+	if total <= 0 {
+		total = config.DefaultResultTotalTimeout
+	}
+	ctx, cancel := context.WithTimeout(ctx, total)
 	defer cancel()
 	return a.client.SendResult(ctx, res)
 }
 
 // resendCachedResult 处理重复下发的已完成任务：能拿到缓存就重发，否则只记录跳过，
 // 绝不重新执行（尤其是 upgrade/miaospeed/trace）。
-func (a *Agent) resendCachedResult(job model.Job, cached *model.Result) {
+// 在独立协程中调用，ctx 随主循环结束而取消，避免退出时被大结果上传拖住。
+func (a *Agent) resendCachedResult(ctx context.Context, job model.Job, cached *model.Result) {
 	if cached == nil {
-		a.logger.Warn("任务已执行过，但结果超出缓存上限，跳过重复执行", "job", job.ID, "kind", probe.ProbeKind(job))
+		a.logger.Warn("任务已执行过，但没有可重发的缓存结果（可能已取消或结果过大），跳过重复执行", "job", job.ID, "kind", probe.ProbeKind(job))
 		return
 	}
-	if err := a.sendResult(*cached); err != nil {
+	if err := a.sendResultWithin(ctx, *cached, config.DefaultResultTotalTimeout); err != nil {
 		a.logger.Warn("重发缓存结果失败", "job", job.ID, "error", err)
 		return
 	}

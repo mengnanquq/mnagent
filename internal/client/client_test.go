@@ -163,6 +163,38 @@ func TestClientSendResultUsesLongTimeout(t *testing.T) {
 	}
 }
 
+// TestClientSendResultRespectsTotalBudget 验证重试受整体 deadline 约束：
+// 单次超时 100ms、整体 250ms 时，第二次尝试前的 1s 退避就应被整体预算截断，
+// 而不是“3 次 × 单次超时 + 退避”地拖上好几秒。
+func TestClientSendResultRespectsTotalBudget(t *testing.T) {
+	var calls atomic.Int64
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		calls.Add(1)
+		time.Sleep(300 * time.Millisecond)
+		w.WriteHeader(http.StatusInternalServerError)
+	}))
+	defer srv.Close()
+
+	cfg := testConfig(srv.URL, nil)
+	cfg.ResultTimeout = 100 * time.Millisecond
+	c := New(cfg)
+	c.resultTimeout = 100 * time.Millisecond
+	c.resultTotalTimeout = 250 * time.Millisecond
+
+	start := time.Now()
+	err := c.SendResult(context.Background(), model.Result{ID: "slow", Output: "x"})
+	elapsed := time.Since(start)
+	if err == nil {
+		t.Fatal("服务端持续 500 时应返回错误")
+	}
+	if elapsed > 1500*time.Millisecond {
+		t.Fatalf("整体预算未生效，耗时 %s（期望 << 3s）", elapsed)
+	}
+	if got := calls.Load(); got != 1 {
+		t.Fatalf("整体预算内不应再发起第二次上传，实际请求 %d 次", got)
+	}
+}
+
 // TestClientSendResultRetries 验证回传失败会退避重试。
 func TestClientSendResultRetries(t *testing.T) {
 	var calls atomic.Int64
