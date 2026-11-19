@@ -4,6 +4,7 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"strings"
 	"testing"
 )
 
@@ -33,5 +34,30 @@ func TestEnsurePrivateRejectsUnsafeDirs(t *testing.T) {
 	_ = os.Symlink(ok, link)
 	if err := ensurePrivate(link); err == nil {
 		t.Fatal("符号链接应被拒绝")
+	}
+}
+
+// TestEnsurePrivateChecksOwner 验证 Unix 上拒绝属于其他普通用户的目录。
+// 非 root 测试环境无法 chown，跳过该分支。
+func TestEnsurePrivateChecksOwner(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		// Windows 的属主检查由 owner_windows.go 实现，普通测试目录属主为当前用户，应通过。
+		if err := ensurePrivate(filepath.Join(t.TempDir(), "win-ok")); err != nil {
+			t.Fatalf("当前用户拥有的目录应被接受：%v", err)
+		}
+		return
+	}
+	if os.Geteuid() != 0 {
+		t.Skip("非 root 环境无法把目录 chown 给其他用户")
+	}
+	dir := filepath.Join(t.TempDir(), "other-owner")
+	if err := os.Mkdir(dir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chown(dir, 65534, 65534); err != nil {
+		t.Skipf("chown 失败，跳过：%v", err)
+	}
+	if err := ensurePrivate(dir); err == nil || !strings.Contains(err.Error(), "属主") {
+		t.Fatalf("其他用户拥有的目录应被拒绝，实际 err=%v", err)
 	}
 }

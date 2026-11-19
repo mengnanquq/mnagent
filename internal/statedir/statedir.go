@@ -66,6 +66,9 @@ func ensurePrivate(dir string) error {
 	if runtime.GOOS != "windows" && fi.Mode().Perm()&0o022 != 0 {
 		return fmt.Errorf("%s 允许其他用户写入，拒绝使用", dir)
 	}
+	if err := checkDirOwner(dir, fi); err != nil {
+		return err
+	}
 	// 确认当前进程确实能在其中写文件
 	f, err := os.CreateTemp(dir, ".probe-*")
 	if err != nil {
