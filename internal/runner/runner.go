@@ -324,6 +324,10 @@ func looksLikeUnknownFlag(out string) bool {
 // 调度器并发参数。
 const defaultMaxConcurrentLight = 8
 
+// exitInflightWait 是退出时等待在途任务结束的上限，剩余约 20s 留给
+// FailPending 与 heavyQueue 回报（总预算 config.DefaultExitResultTimeout=60s）。
+const exitInflightWait = 40 * time.Second
+
 // agent 把客户端与执行器串成“领取 → 执行 → 回传”的主循环。
 type Agent struct {
 	cfg     *config.Config
@@ -338,8 +342,16 @@ type Agent struct {
 	lightSem   chan struct{}
 	tasksWG    sync.WaitGroup
 
+	// stopCtx 是主循环退出后的共享停止预算：在途任务回传与未执行任务回报
+	// 都受同一个 deadline 约束，总时长不超过 config.DefaultExitResultTimeout。
+	stopMu  sync.RWMutex
+	stopCtx context.Context
+
 	dedupOnce sync.Once
 	dedup     *jobDedup
+
+	resendMu       sync.Mutex
+	resendInFlight map[string]struct{}
 }
 
 // logger 是本包用到的最小日志接口，便于测试注入。
@@ -356,20 +368,27 @@ func isHeavy(job model.Job) bool {
 
 // loop 不断领取任务并执行，直到 ctx 结束；启用自动更新时按周期检查新版本。
 func (a *Agent) Loop(ctx context.Context) error {
-	defer a.tasksWG.Wait()
 	defer func() {
-		// 退出/重启前回报已推送但未执行的任务，免得机器人等到超时
+		// 退出/重启时的所有网络写操作共享同一个 60s 停止预算，必须明显小于
+		// systemd 的 TimeoutStopSec=90s，否则服务会在回传途中被 SIGKILL。
+		stopCtx, cancel := context.WithTimeout(context.Background(), config.DefaultExitResultTimeout)
+		defer cancel()
+		a.setStopContext(stopCtx)
+
+		// 等待在途任务结束，但绝不能无限等待：超时后直接进入未执行任务回报，
+		// 剩余预算留给 FailPending / heavyQueue 清理。
+		waitCtx, waitCancel := context.WithTimeout(stopCtx, exitInflightWait)
+		a.waitTasks(waitCtx)
+		waitCancel()
+
 		if a.client == nil {
 			return
 		}
-		// 退出回报使用短预算：总时长必须小于 systemd 的停止超时（90s），
-		// 否则服务会在回报途中被 SIGKILL，反而丢结果。
-		fctx, cancel := context.WithTimeout(context.Background(), config.DefaultExitResultTimeout)
-		defer cancel()
-		if n := a.client.FailPending(fctx, "agent 正在重启或退出，任务未执行，请重试"); n > 0 {
+		// 退出回报使用共享停止预算：总时长不得超过 systemd 的停止超时。
+		if n := a.client.FailPending(stopCtx, "agent 正在重启或退出，任务未执行，请重试"); n > 0 {
 			a.logger.Info("已回报未执行的任务", "count", n)
 		}
-		if n := a.failPendingHeavy(fctx, "节点停止，未执行"); n > 0 {
+		if n := a.failPendingHeavy(stopCtx, "节点停止，未执行"); n > 0 {
 			a.logger.Info("已回报 heavyQueue 中未执行的任务", "count", n)
 		}
 	}()
@@ -960,6 +979,40 @@ func (a *Agent) dedupStore() *jobDedup {
 	return a.dedup
 }
 
+// setStopContext 记录退出阶段的共享停止预算，供在途任务回传使用。
+func (a *Agent) setStopContext(ctx context.Context) {
+	a.stopMu.Lock()
+	a.stopCtx = ctx
+	a.stopMu.Unlock()
+}
+
+// stopContext 返回退出阶段的共享预算；未进入退出流程时返回 Background。
+func (a *Agent) stopContext() context.Context {
+	a.stopMu.RLock()
+	ctx := a.stopCtx
+	a.stopMu.RUnlock()
+	if ctx == nil {
+		return context.Background()
+	}
+	return ctx
+}
+
+// waitTasks 等待在途任务结束；ctx 到期后放弃等待，避免退出被卡死。
+func (a *Agent) waitTasks(ctx context.Context) {
+	done := make(chan struct{})
+	go func() {
+		a.tasksWG.Wait()
+		close(done)
+	}()
+	select {
+	case <-done:
+	case <-ctx.Done():
+		if a.logger != nil {
+			a.logger.Warn("等待在途任务结束超时，剩余结果可能无法回传", "error", ctx.Err())
+		}
+	}
+}
+
 // resultTimeout 返回结果回传超时，与 client 的 /results 独立超时保持一致。
 func (a *Agent) resultTimeout() time.Duration {
 	if a.cfg != nil && a.cfg.ResultTimeout > 0 {
@@ -969,8 +1022,9 @@ func (a *Agent) resultTimeout() time.Duration {
 }
 
 // sendResult 在独立于任务上下文的整体预算内回传结果。
+// 正常运行时使用 -result-timeout 作为单次回传上限；退出阶段再叠加共享停止预算。
 func (a *Agent) sendResult(res model.Result) error {
-	return a.sendResultWithin(context.Background(), res, config.DefaultResultTotalTimeout)
+	return a.sendResultWithin(a.stopContext(), res, a.resultTimeout())
 }
 
 // sendResultWithin 在给定整体预算内回传结果；ctx 取消时立即返回。

@@ -1032,3 +1032,77 @@ func TestHandleUpdateCLICheckOnly(t *testing.T) {
 		t.Fatal("期望 handled 为 true")
 	}
 }
+
+// TestAgentSendResultHonorsResultTimeout 验证 -result-timeout 不再是无用配置：
+// 单次结果回传会按该超时截止，而不是固定等满 6 分钟总预算。
+func TestAgentSendResultHonorsResultTimeout(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		time.Sleep(400 * time.Millisecond)
+		w.WriteHeader(http.StatusNoContent)
+	}))
+	defer srv.Close()
+
+	cfg := &config.Config{
+		BotURL:        srv.URL,
+		Tokens:        &config.TokenSource{Value: "tok"},
+		PollTimeout:   time.Second,
+		ResultTimeout: 50 * time.Millisecond,
+	}
+	a := &Agent{cfg: cfg, logger: testLogger{t}, client: client.New(cfg)}
+
+	start := time.Now()
+	err := a.sendResult(model.Result{ID: "slow-result", Kind: "ping"})
+	elapsed := time.Since(start)
+	if err == nil {
+		t.Fatal("服务端响应超过 -result-timeout 时应返回超时错误")
+	}
+	if elapsed > time.Second {
+		t.Fatalf("结果回传耗时 %s，未按 -result-timeout 截止", elapsed)
+	}
+}
+
+// TestAgentSendResultUsesSharedStopBudget 验证退出阶段在途结果回传使用共享停止预算
+// （而不是重新申请 6 分钟），确保不会超过 systemd 的 90s 停止超时。
+func TestAgentSendResultUsesSharedStopBudget(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		time.Sleep(500 * time.Millisecond)
+		w.WriteHeader(http.StatusNoContent)
+	}))
+	defer srv.Close()
+
+	cfg := &config.Config{
+		BotURL:        srv.URL,
+		Tokens:        &config.TokenSource{Value: "tok"},
+		PollTimeout:   time.Second,
+		ResultTimeout: 5 * time.Second,
+	}
+	a := &Agent{cfg: cfg, logger: testLogger{t}, client: client.New(cfg)}
+	stopCtx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
+	defer cancel()
+	a.setStopContext(stopCtx)
+
+	start := time.Now()
+	err := a.sendResult(model.Result{ID: "inflight-result", Kind: "trace"})
+	elapsed := time.Since(start)
+	if err == nil {
+		t.Fatal("共享停止预算到期后应返回错误")
+	}
+	if elapsed > time.Second {
+		t.Fatalf("退出阶段结果回传耗时 %s，未受共享停止预算约束", elapsed)
+	}
+}
+
+// TestAgentWaitTasksTimesOut 验证退出时 tasksWG.Wait 带超时，不会被卡死的在途任务无限阻塞。
+func TestAgentWaitTasksTimesOut(t *testing.T) {
+	a := &Agent{logger: testLogger{t}}
+	a.tasksWG.Add(1)
+	ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
+	defer cancel()
+
+	start := time.Now()
+	a.waitTasks(ctx)
+	if elapsed := time.Since(start); elapsed > time.Second {
+		t.Fatalf("waitTasks 耗时 %s，未在 ctx 到期后返回", elapsed)
+	}
+	a.tasksWG.Done()
+}
