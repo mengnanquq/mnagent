@@ -34,6 +34,11 @@ const maxOutputBytes = 256 * 1024
 // 低内存设备的内存吃光。
 const maxSlaveJSONBytes = 8 << 20
 
+// slaveJSONBufRetainBytes 是累积缓冲放回 sync.Pool 的体积上限。
+// 只有较小的缓冲才值得复用；接近 8MB 的大缓冲长期滞留在池中反而会抬高低内存
+// 设备的常驻内存，因此超过该阈值的缓冲交给 GC 回收。
+const slaveJSONBufRetainBytes = 256 << 10
+
 // readNextSlaveJSON 的 32KB 读取块与累积缓冲通过 sync.Pool 复用，
 // 避免每个节点/每轮读取都重新分配大块内存。
 var (
@@ -772,7 +777,7 @@ func readNextSlaveJSON(ctx context.Context, ws *websocket.Conn, dest any) error 
 	buf.Reset()
 	defer func() {
 		// 异常超大缓冲不复用，避免池中长期驻留大块内存。
-		if buf.Cap() <= maxSlaveJSONBytes {
+		if buf.Cap() <= slaveJSONBufRetainBytes {
 			slaveJSONBufPool.Put(buf)
 		}
 	}()
@@ -788,13 +793,8 @@ func readNextSlaveJSON(ctx context.Context, ws *websocket.Conn, dest any) error 
 			if werr := appendSlaveJSONChunk(buf, chunk[:n]); werr != nil {
 				return werr
 			}
-			b := bytes.TrimSpace(buf.Bytes())
-			if len(b) > 0 && b[0] == '{' && b[len(b)-1] == '}' {
-				if json.Valid(b) {
-					if jsonErr := json.Unmarshal(b, dest); jsonErr == nil {
-						return nil
-					}
-				}
+			if decodeSlaveJSON(buf, dest) {
+				return nil
 			}
 		}
 		if err != nil {
@@ -805,13 +805,8 @@ func readNextSlaveJSON(ctx context.Context, ws *websocket.Conn, dest any) error 
 				}
 				continue
 			}
-			if buf.Len() > 0 {
-				b := bytes.TrimSpace(buf.Bytes())
-				if len(b) > 0 && json.Valid(b) {
-					if jsonErr := json.Unmarshal(b, dest); jsonErr == nil {
-						return nil
-					}
-				}
+			if buf.Len() > 0 && decodeSlaveJSON(buf, dest) {
+				return nil
 			}
 			return err
 		}
@@ -825,6 +820,20 @@ func appendSlaveJSONChunk(buf *bytes.Buffer, chunk []byte) error {
 	}
 	_, _ = buf.Write(chunk)
 	return nil
+}
+
+// decodeSlaveJSON 尝试把缓冲解析为完整 JSON 对象。
+// 只当缓冲首尾字符看起来是完整对象（'{' ... '}'）时才做 json.Valid 全量校验，
+// 避免每读到一个分片都对整个缓冲做一次 O(n) 扫描（500 节点结果可达数 MB）。
+func decodeSlaveJSON(buf *bytes.Buffer, dest any) bool {
+	b := bytes.TrimSpace(buf.Bytes())
+	if len(b) < 2 || b[0] != '{' || b[len(b)-1] != '}' {
+		return false
+	}
+	if !json.Valid(b) {
+		return false
+	}
+	return json.Unmarshal(b, dest) == nil
 }
 
 // Logger 是本包用到的最小日志接口。

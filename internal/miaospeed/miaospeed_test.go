@@ -1901,3 +1901,33 @@ func TestAppendSlaveJSONChunkRejectsOversize(t *testing.T) {
 		t.Fatalf("超限数据不应写入缓冲，实际长度 %d", buf.Len())
 	}
 }
+
+// TestDecodeSlaveJSONOnlyOnCompleteBlocks 验证只有看起来完整（'{' ... '}'）的缓冲才会触发
+// 全量 JSON 校验：读取分片中途不做 O(n) 扫描，解析失败的缓冲也不会被误判为完成。
+func TestDecodeSlaveJSONOnlyOnCompleteBlocks(t *testing.T) {
+	cases := []struct {
+		name string
+		body string
+		want bool
+	}{
+		{"完整对象", `{"a":1}`, true},
+		{"带空白", "  {\"a\":1}\n", true},
+		{"分片中段", `{"a":`, false},
+		{"以闭括号结尾但非法", `{"a":1,}`, false},
+		{"非对象", `[1,2]`, false},
+		{"空缓冲", ``, false},
+	}
+	for _, c := range cases {
+		buf := bytes.NewBufferString(c.body)
+		var v map[string]any
+		if got := decodeSlaveJSON(buf, &v); got != c.want {
+			t.Errorf("%s: decodeSlaveJSON = %v，期望 %v", c.name, got, c.want)
+		}
+	}
+	if slaveJSONBufRetainBytes != 256<<10 {
+		t.Fatalf("缓冲复用阈值 = %d，期望 256KB", slaveJSONBufRetainBytes)
+	}
+	if slaveJSONBufRetainBytes >= maxSlaveJSONBytes {
+		t.Fatal("缓冲复用阈值必须明显小于单条响应上限，否则大缓冲会长期留在池中")
+	}
+}
