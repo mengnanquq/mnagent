@@ -66,16 +66,22 @@ func (d *jobDedup) start(id string) (dedupAction, *model.Result) {
 	d.expireLocked(now)
 
 	if e, ok := d.entries[id]; ok {
-		d.order.MoveToFront(e.elem)
-		switch e.state {
-		case dedupRunning:
-			return dedupRunning, nil
-		default:
-			if e.result != nil {
-				cached := *e.result
-				return dedupCompleted, &cached
+		// 该条目可能不在 LRU 尾部但仍已过期（例如被重复访问提前移到前面），
+		// 必须按自己的 expires 判断，不能只看尾部。
+		if !e.expires.After(now) {
+			d.removeLocked(e)
+		} else {
+			d.order.MoveToFront(e.elem)
+			switch e.state {
+			case dedupRunning:
+				return dedupRunning, nil
+			default:
+				if e.result != nil {
+					cached := *e.result
+					return dedupCompleted, &cached
+				}
+				return dedupCompleted, nil
 			}
-			return dedupCompleted, nil
 		}
 	}
 

@@ -71,6 +71,28 @@ func TestJobDedupExpiresAndEvictsLRU(t *testing.T) {
 	}
 }
 
+func TestJobDedupExpiresEntryNotAtLRUTail(t *testing.T) {
+	now := time.Unix(2000, 0)
+	d := newJobDedup()
+	d.ttl = time.Minute
+	d.now = func() time.Time { return now }
+
+	d.start("old")
+	d.complete("old", &model.Result{ID: "old"})
+	now = now.Add(30 * time.Second)
+	d.start("new")
+	d.complete("new", &model.Result{ID: "new"})
+	d.start("old") // 把未过期的 old 移到 LRU 前端，使其不再位于尾部
+	// 推进到 old 过期、new 未过期：过期清理只看尾部会漏掉 old。
+	now = now.Add(40 * time.Second)
+	if action, _ := d.start("new"); action != dedupCompleted {
+		t.Fatalf("未过期的 new 应命中缓存，实际 action=%v", action)
+	}
+	if action, _ := d.start("old"); action != dedupRun {
+		t.Fatalf("不在 LRU 尾部的过期条目也必须失效并重新执行，实际 action=%v", action)
+	}
+}
+
 func TestJobDedupOversizedResultStillSkipsExecution(t *testing.T) {
 	d := newJobDedup()
 	d.start("big")
