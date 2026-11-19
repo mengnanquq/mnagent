@@ -34,6 +34,7 @@ PREFIX=""
 VERSION="latest"
 MODE="auto"        # auto | release | source | binary
 BINARY_SRC=""
+BINARY_SHA256=""
 UNINSTALL="no"
 SERVICE_NAME="mnagent"
 AUTO_UPDATE="yes"   # 默认开启自动更新（可 --auto-update no 关闭）
@@ -60,7 +61,8 @@ usage() {
   --miaospeed-version <tag> 安装的 miaospeed 版本，默认 latest（取最新 Release）
   --version <tag>      安装的版本标签，默认 latest（取最新 Release）
   --binary <path|url>  直接使用已编译好的 mnagent（本地路径或下载地址）
-  --from-source        从源码编译（不下载 Release）
+  --sha256 <hex>       校验 --binary 指定文件的 SHA-256（URL 未提供时尝试同目录 <url>.sha256）
+  --from-source        从源码编译（Release 下载失败时不再自动回退，需显式指定本选项）
   --user <name>        运行服务的用户（默认 root）
   --prefix <dir>       二进制安装目录（systemd 默认 /usr/local/bin，OpenWrt 默认 /usr/bin）
   --auto-update [yes|no] 是否启用自动更新（默认 yes）
@@ -111,6 +113,7 @@ while [ $# -gt 0 ]; do
 			--miaospeed-version) MIAOSPEED_VERSION="${2:-}"; shift 2;;
 			--version)     VERSION="${2:-}"; shift 2;;
 			--binary)      BINARY_SRC="${2:-}"; MODE="binary"; shift 2;;
+			--sha256)      BINARY_SHA256="${2:-}"; shift 2;;
 			--from-source) MODE="source"; shift;;
 			--user)        RUN_USER="${2:-}"; shift 2;;
 			--prefix)      PREFIX="${2:-}"; shift 2;;
@@ -319,6 +322,26 @@ verify_sha256() {
 	log "SHA-256 校验通过（${verify_asset}）"
 }
 
+# verify_sha256_value <文件> <期望哈希> <资产名>
+# 用于 --binary/--sha256 这类不依赖校验文件 URL 的场景；格式非法或不一致一律中止。
+verify_sha256_value() {
+	value_file="$1"
+	value_expected="$(printf '%s' "$2" | tr 'A-Z' 'a-z')"
+	value_asset="$3"
+	value_actual="$(sha256_of "$value_file")" \
+		|| die "未找到可用的 SHA-256 工具（sha256sum / shasum / openssl），已中止安装"
+	if [ "${#value_expected}" -ne 64 ]; then
+		die "SHA-256 值格式非法：${value_expected}（已中止安装）"
+	fi
+	if printf '%s' "$value_expected" | grep -q '[^0-9a-f]'; then
+		die "SHA-256 值格式非法：${value_expected}（已中止安装）"
+	fi
+	if [ "$value_actual" != "$value_expected" ]; then
+		die "SHA-256 校验失败：期望 ${value_expected}，实际 ${value_actual}（已中止安装，未覆盖旧二进制）"
+	fi
+	log "SHA-256 校验通过（${value_asset}）"
+}
+
 # install_file <源> <目标> <权限>
 install_file() {
 	if command -v install >/dev/null 2>&1; then
@@ -455,25 +478,46 @@ mkdir -p "$PREFIX"
 case "$MODE" in
 	binary)
 		if [ -f "$BINARY_SRC" ]; then
+			if [ -n "$BINARY_SHA256" ]; then
+				verify_sha256_value "$BINARY_SRC" "$BINARY_SHA256" "mnagent"
+			fi
 			install_file "$BINARY_SRC" "$PREFIX/mnagent" 0755
 		else
 			log "下载 mnagent：$BINARY_SRC"
-			download "$BINARY_SRC" "$PREFIX/mnagent" || die "下载失败：$BINARY_SRC"
-			chmod 0755 "$PREFIX/mnagent"
+			tmp_bin="$PREFIX/.mnagent.new"
+			download "$BINARY_SRC" "$tmp_bin" || die "下载失败：$BINARY_SRC"
+			if [ -n "$BINARY_SHA256" ]; then
+				# 用户显式给出哈希：强制校验，失败即中止（不覆盖已有二进制）。
+				verify_sha256_value "$tmp_bin" "$BINARY_SHA256" "mnagent"
+			elif download "${BINARY_SRC}.sha256" "${tmp_bin}.sha256"; then
+				# 未给 --sha256 时尝试同目录校验文件；只要拿到了就按它校验。
+				sum_expected="$(awk 'NF >= 1 { print $1; exit }' "${tmp_bin}.sha256")"
+				sum_name="$(awk 'NF >= 2 { print $2; exit }' "${tmp_bin}.sha256")"
+				rm -f "${tmp_bin}.sha256"
+				case "$sum_name" in
+					\**) sum_name="${sum_name#?}";;
+				esac
+				if [ -n "$sum_name" ] && [ "$(basename "$sum_name")" != "mnagent" ]; then
+					die "SHA-256 校验文件与资产不匹配：期望 mnagent，实际 ${sum_name}（已中止安装）"
+				fi
+				verify_sha256_value "$tmp_bin" "$sum_expected" "mnagent"
+			else
+				warn "================================================================"
+				warn "未提供 --sha256，且无法获取 ${BINARY_SRC}.sha256，将跳过完整性校验继续安装！"
+				warn "你显式指定了二进制来源，请自行确认该地址可信（内网镜像/自建分发需自行负责）。"
+				warn "================================================================"
+			fi
+			install_file "$tmp_bin" "$PREFIX/mnagent" 0755
+			rm -f "$tmp_bin"
 		fi
 		;;
 	source)
 		build_from_source
 		;;
 	auto)
-		if ! download_release; then
-			if command -v go >/dev/null 2>&1; then
-				warn "下载 Release 失败（可能还没有 ${OS}/${ARCH} 产物，或网络受限），改为从源码编译"
-				build_from_source
-			else
-				die "下载 ${OS}/${ARCH} 的 Release 产物失败：该架构可能暂无产物，或网络受限；本机没有 go 无法源码编译。可用 --binary <本地或镜像地址> 指定二进制，例如 --binary https://github.com/$REPO/releases/latest/download/mnagent_${OS}_${ARCH}"
-			fi
-		fi
+		# Release 下载失败不再自动改为“编译 main 分支”——那会把用户从固定版本悄悄带到
+		# 未发布的移动代码。需要源码编译必须显式 --from-source。
+		download_release || die "下载 ${OS}/${ARCH} 的 Release 产物失败：该架构可能暂无产物，或网络受限。本脚本不会自动从源码编译；如确需源码编译请加 --from-source，或用 --binary <本地或镜像地址> 指定二进制，例如 --binary https://github.com/$REPO/releases/latest/download/mnagent_${OS}_${ARCH}"
 		;;
 esac
 [ -x "$PREFIX/mnagent" ] || die "mnagent 安装失败"

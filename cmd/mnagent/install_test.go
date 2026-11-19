@@ -115,7 +115,7 @@ func TestInstallScriptSyntax(t *testing.T) {
 	if err != nil {
 		t.Fatalf("--help 执行失败: %v\n%s", err, out)
 	}
-	for _, want := range []string{"--bot", "--token", "--uninstall", "OpenWrt", "--miaospeed", "--miaospeed-version"} {
+	for _, want := range []string{"--bot", "--token", "--uninstall", "OpenWrt", "--miaospeed", "--miaospeed-version", "--sha256", "--from-source"} {
 		if !strings.Contains(string(out), want) {
 			t.Fatalf("--help 未提及 %s: %s", want, out)
 		}
@@ -183,6 +183,9 @@ func TestInstallScriptKeepsKeySafeguards(t *testing.T) {
 		{"自动更新可写目录", "ReadWritePaths=$PREFIX"},
 		{"下载后强制校验 SHA-256", `verify_sha256 "$PREFIX/.mnagent.new"`},
 		{"校验文件为同名 .sha256", `sum_url="${url}.sha256"`},
+		{"--binary 支持显式哈希", `verify_sha256_value "$tmp_bin" "$BINARY_SHA256"`},
+		{"--binary 尝试同名 .sha256", `download "${BINARY_SRC}.sha256"`},
+		{"Release 失败不自动源码编译", "download_release || die"},
 		{"SHA-256 工具首选 sha256sum", `sha256sum "$sha_file"`},
 		{"SHA-256 回退 shasum -a 256", "shasum -a 256"},
 		{"SHA-256 回退 openssl dgst -sha256", "openssl dgst -sha256"},
@@ -240,6 +243,23 @@ func TestInstallScriptVerifiesMiaospeed(t *testing.T) {
 	}
 	if containsActiveLine(script, `-name "miaospeed*"`) {
 		t.Error("install.sh 不应再用通配符取 miaospeed 压缩包内“第一个匹配”文件")
+	}
+}
+
+// TestInstallScriptNeverAutoBuildsFromSource 守护：Release 下载失败时不得自动改为编译 main 分支，
+// 否则用户会在不知情的情况下从固定版本切到未发布的移动代码。源码编译只能显式 --from-source。
+func TestInstallScriptNeverAutoBuildsFromSource(t *testing.T) {
+	script := string(readInstallScript(t))
+	for _, bad := range []string{"改为从源码编译"} {
+		if containsActiveLine(script, bad) {
+			t.Errorf("install.sh 非注释行仍包含自动源码编译回退：%q", bad)
+		}
+	}
+	if !containsActiveLine(script, "download_release || die") {
+		t.Error("Release 下载失败应直接报错并提示 --from-source/--binary")
+	}
+	if !containsActiveLine(script, "如确需源码编译请加 --from-source") {
+		t.Error("Release 失败提示中应说明 --from-source")
 	}
 }
 
