@@ -1168,3 +1168,33 @@ func TestAgentEnqueueHeavyQueueFullRejectsImmediately(t *testing.T) {
 		t.Fatalf("队列满任务应标记为已完成并缓存失败结果，实际 action=%v cached=%+v", action, cached)
 	}
 }
+
+// TestRunnerArgvSupportsBracketedIPv6WithPort 验证带端口的 IPv6 trace 目标
+// （例如 [2606:4700:4700::1111]:443）不会被参数校验拒绝。
+func TestRunnerArgvSupportsBracketedIPv6WithPort(t *testing.T) {
+	r := newRunner("nexttrace", nil)
+	args, err := r.argv(model.Job{
+		Target:   "[2606:4700:4700::1111]:443",
+		Protocol: "tcp",
+		Port:     443,
+		Hops:     16,
+	})
+	if err != nil {
+		t.Fatalf("带端口的 IPv6 目标应被接受: %v", err)
+	}
+	want := "-j -P tcp -p 443 -m 16 [2606:4700:4700::1111]:443"
+	if got := strings.Join(args, " "); got != want {
+		t.Fatalf("argv = %q，期望 %q", got, want)
+	}
+}
+
+// TestRunTraceBlocksPrivateIPv6WithPort 验证 [::1]:port 这类带端口的私网 IPv6
+// 仍会被 SSRF 守卫拦截。
+func TestRunTraceBlocksPrivateIPv6WithPort(t *testing.T) {
+	r := newRunner("nexttrace", nil)
+	r.allowPrivateProbes = false
+	res := r.run(context.Background(), model.Job{Kind: "trace", Target: "[::1]:443"})
+	if res.ExitCode != -1 || !strings.Contains(res.ErrText, "安全策略拦截") {
+		t.Fatalf("私网 IPv6 目标应被拦截，实际: %+v", res)
+	}
+}

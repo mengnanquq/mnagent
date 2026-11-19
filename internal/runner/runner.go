@@ -30,9 +30,9 @@ import (
 
 var Version = "dev"
 
-// targetPattern 与机器人侧一致：目标只能是 IP/域名（可带 :port），
-// 且不允许以 "-" 开头，避免任何参数注入。
-var targetPattern = regexp.MustCompile(`^[A-Za-z0-9_.:\-]+$`)
+// targetPattern 与机器人侧一致：目标只能是 IP/域名（可带 :port，IPv6 可用
+// [addr]:port 形式），且不允许以 "-" 开头，避免任何参数注入。
+var targetPattern = regexp.MustCompile(`^[A-Za-z0-9_.:\[\]-]+$`)
 
 // maxOutputBytes 限制单次追踪读入内存的输出（机器人侧同样有上限）。
 const maxOutputBytes = 1 << 20
