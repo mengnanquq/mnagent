@@ -17,10 +17,12 @@ import (
 	"github.com/mengnanquq/mnagent/internal/client"
 	"github.com/mengnanquq/mnagent/internal/config"
 	"github.com/mengnanquq/mnagent/internal/dep"
+	"github.com/mengnanquq/mnagent/internal/instancelock"
 	"github.com/mengnanquq/mnagent/internal/model"
 	"github.com/mengnanquq/mnagent/internal/probe"
 	"github.com/mengnanquq/mnagent/internal/runner"
 	"github.com/mengnanquq/mnagent/internal/service"
+	"github.com/mengnanquq/mnagent/internal/statedir"
 	"github.com/mengnanquq/mnagent/internal/tracker"
 	"github.com/mengnanquq/mnagent/internal/updater"
 )
@@ -118,6 +120,21 @@ func runWithContext(ctx context.Context, args []string) error {
 		return nil
 	}
 
+	// 单实例锁：同一令牌只允许一个常驻进程，避免服务端多条 WS 连接互相踢线。
+	// 自更新走 systemd/procd 重启（不是 exec 替换进程），旧进程退出时内核会自动
+	// 释放 flock，新进程随后即可获取；这里的短暂等待覆盖重启交叠的瞬间。
+	lock, err := acquireInstanceLock(cfg, log)
+	if err != nil {
+		return err
+	}
+	if lock != nil {
+		defer func() {
+			if cerr := lock.Close(); cerr != nil {
+				log.Warn("释放单实例锁失败", "error", cerr)
+			}
+		}()
+	}
+
 	cli := client.New(cfg)
 	trk := tracker.New()
 	rnr := runner.NewRunnerFull(cfg.Binary, cfg.MiaospeedBinary, cfg.GHProxy, cfg.AllowPrivateProbes, log)
@@ -148,4 +165,30 @@ func runWithContext(ctx context.Context, args []string) error {
 		"token_from", tokenFrom,
 		"poll_timeout", cfg.PollTimeout, "result_timeout", cfg.ResultTimeout, "auto_update", cfg.AutoUpdate)
 	return agent.Loop(ctx)
+}
+
+// acquireInstanceLock 在私有状态目录下按“机器人地址 + 令牌”获取单实例锁。
+// 状态目录不可用时只告警并继续（agent 仍可工作），锁冲突则直接报错退出。
+func acquireInstanceLock(cfg *config.Config, log *slog.Logger) (*instancelock.Lock, error) {
+	dir, err := statedir.Dir()
+	if err != nil {
+		log.Warn("状态目录不可用，跳过单实例锁（无法阻止同令牌重复实例）", "error", err)
+		return nil, nil
+	}
+	token := ""
+	if cfg != nil && cfg.Tokens != nil {
+		if v, err := cfg.Tokens.Get(); err == nil {
+			token = v
+		}
+	}
+	botURL := ""
+	if cfg != nil {
+		botURL = cfg.BotURL
+	}
+	lock, err := instancelock.Acquire(dir, instancelock.Name(botURL, token), 5*time.Second)
+	if err != nil {
+		return nil, fmt.Errorf("单实例检查失败：%w；如确认没有其他 mnagent 在运行，可删除锁文件后重试", err)
+	}
+	log.Debug("已获取单实例锁", "path", lock.Path())
+	return lock, nil
 }
