@@ -638,8 +638,11 @@ var geoIPAPICooldown = &geoCooldown{now: time.Now}
 // geoCall 是一次进行中的 GeoIP 查询；done 关闭后其字段对等待者可见。
 type geoCall struct {
 	done chan struct{}
-	ip   string
-	geo  string
+	// waiters 是正在等待共享结果的调用方数量（受 geoInflight.mu 保护）。
+	// 它不参与业务逻辑，仅用于观测合并效果，也让测试可以用条件同步代替 sleep。
+	waiters int
+	ip      string
+	geo     string
 }
 
 // geoInflight 合并同一 IP 的并发 GeoIP 查询（手写 singleflight，避免引入新依赖）。
@@ -654,7 +657,13 @@ type geoInflight struct {
 func (g *geoInflight) do(ctx context.Context, key string, fn func(context.Context) (string, string)) (string, string) {
 	g.mu.Lock()
 	if call, ok := g.calls[key]; ok {
+		call.waiters++
 		g.mu.Unlock()
+		defer func() {
+			g.mu.Lock()
+			call.waiters--
+			g.mu.Unlock()
+		}()
 		select {
 		case <-call.done:
 			return call.ip, call.geo

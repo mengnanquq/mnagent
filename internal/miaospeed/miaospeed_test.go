@@ -591,6 +591,7 @@ func TestParseMatrixGeoWithoutGeoIP(t *testing.T) {
 
 // TestParseSingleSlotFiltersDummyGeo 验证当出口与节点名称相同时自动清理。
 func TestParseSingleSlotFiltersDummyGeo(t *testing.T) {
+	stubGeoLookups(t)
 	node := &MiaospeedNode{
 		Name:     "🚫 账号已被删除或不存在",
 		Protocol: "vless",
@@ -609,6 +610,7 @@ func TestParseSingleSlotFiltersDummyGeo(t *testing.T) {
 
 // TestInferOutboundGeoFromMedia 验证当 OutboundGeo 为空时自动从流媒体测试结果中推导出落地地域。
 func TestInferOutboundGeoFromMedia(t *testing.T) {
+	stubGeoLookups(t)
 	node := &MiaospeedNode{
 		Name:     "专享-橘子-域名优选01",
 		Protocol: "vless",
@@ -1625,6 +1627,7 @@ func TestIPv6NodeSupportAndDualStackScript(t *testing.T) {
 }
 
 func TestIPv6InboundGeoFallback(t *testing.T) {
+	stubGeoLookups(t)
 	node := &MiaospeedNode{
 		Name:     "SS2022-v6",
 		Protocol: "ss",
@@ -1807,8 +1810,31 @@ func TestParseProxyURI_SetsNodeURL(t *testing.T) {
 	}
 }
 
+// resetDefaultGeoCacheForTest 把全局 GeoIP 缓存换成空实例，并在用例结束时还原，
+// 避免上一个用例（或上一次 -count 循环）写入的缓存让后续查询直接命中、跳过外部查询。
+func resetDefaultGeoCacheForTest(t *testing.T) {
+	t.Helper()
+	old := defaultGeoCache
+	defaultGeoCache = newGeoIPCache(geoCacheMaxEntries, geoCacheTTL)
+	t.Cleanup(func() { defaultGeoCache = old })
+}
+
+// stubGeoLookups 把 GeoIP 数据源换成不发外部请求的本地桩。
+// 格式化/合并类用例并不校验真实地域，访问外部接口只会让耗时与结果受网络和限流左右。
+func stubGeoLookups(t *testing.T) {
+	t.Helper()
+	old := geoLookupFuncs
+	geoLookupFuncs = []func(context.Context, string) (string, string, bool){
+		func(_ context.Context, targetIP string) (string, string, bool) {
+			return targetIP, "Test Geo", true
+		},
+	}
+	t.Cleanup(func() { geoLookupFuncs = old })
+}
+
 // TestGeoIPCacheLRUAndTTL 验证 GeoIP 缓存有界、按 LRU 淘汰并支持 TTL 失效。
 func TestGeoIPCacheLRUAndTTL(t *testing.T) {
+	resetDefaultGeoCacheForTest(t)
 	now := time.Unix(1000, 0)
 	c := newGeoIPCache(2, time.Minute)
 	c.now = func() time.Time { return now }
@@ -1851,6 +1877,7 @@ func TestQueryIPGeoCanceledContext(t *testing.T) {
 // TestParseSlaveTaskResultLimitsGeoConcurrency 验证多节点报告生成时 GeoIP 查询并发不超过 4，
 // 同时输出顺序与节点顺序一致。
 func TestParseSlaveTaskResultLimitsGeoConcurrency(t *testing.T) {
+	resetDefaultGeoCacheForTest(t)
 	oldLookups := geoLookupFuncs
 	defer func() { geoLookupFuncs = oldLookups }()
 
@@ -1942,41 +1969,92 @@ func TestDecodeSlaveJSONOnlyOnCompleteBlocks(t *testing.T) {
 
 // TestGeoInflightMergesConcurrentLookups 验证同一 IP 的并发 GeoIP 查询只执行一次，
 // 所有等待者共享同一结果（手写 singleflight）。
+// 用“等待者已注册”的条件同步代替 sleep：领跑者被 fn 阻塞期间，所有调用必然合并。
 func TestGeoInflightMergesConcurrentLookups(t *testing.T) {
 	g := &geoInflight{calls: make(map[string]*geoCall)}
 	var calls atomic.Int32
 	const waiters = 8
-	start := make(chan struct{})
-	results := make(chan string, waiters)
-	done := make(chan struct{})
+	const key = "203.0.113.9"
+
+	entered := make(chan struct{}) // 领跑者的查询函数已开始执行
+	release := make(chan struct{}) // 允许领跑者返回
+	type outcome struct{ ip, geo string }
+	leaderDone := make(chan outcome, 1)
+	go func() {
+		ip, geo := g.do(context.Background(), key, func(context.Context) (string, string) {
+			calls.Add(1)
+			close(entered)
+			<-release
+			return "203.0.113.9", "Test Geo"
+		})
+		leaderDone <- outcome{ip, geo}
+	}()
+
+	// 领跑者已阻塞在 fn 中，in-flight 表项在 release 前不会消失，后续调用一定合并。
+	select {
+	case <-entered:
+	case <-time.After(3 * time.Second):
+		t.Fatal("首次 GeoIP 查询未开始")
+	}
+
+	results := make(chan outcome, waiters)
 	for i := 0; i < waiters; i++ {
 		go func() {
-			<-start
-			ip, geo := g.do(context.Background(), "203.0.113.9", func(context.Context) (string, string) {
-				calls.Add(1)
-				time.Sleep(20 * time.Millisecond)
-				return "203.0.113.9", "Test Geo"
+			ip, geo := g.do(context.Background(), key, func(context.Context) (string, string) {
+				t.Error("相同 IP 的并发查询不应再次执行查询函数")
+				return "", ""
 			})
-			results <- ip + "|" + geo
+			results <- outcome{ip, geo}
 		}()
 	}
-	close(start)
-	go func() {
-		for i := 0; i < waiters; i++ {
-			<-results
+
+	// 等全部等待者都完成注册后再放行领跑者，不依赖机器快慢。
+	waitForGeoWaiters(t, g, key, waiters)
+	close(release)
+
+	for i := 0; i < waiters; i++ {
+		select {
+		case got := <-results:
+			if got.ip != "203.0.113.9" || got.geo != "Test Geo" {
+				t.Fatalf("等待者应共享领跑者的结果，实际 ip=%q geo=%q", got.ip, got.geo)
+			}
+		case <-time.After(3 * time.Second):
+			t.Fatal("并发查询未在预期时间内完成")
 		}
-		close(done)
-	}()
-	select {
-	case <-done:
-	case <-time.After(3 * time.Second):
-		t.Fatal("并发查询未在预期时间内完成")
+	}
+	if got := <-leaderDone; got.ip != "203.0.113.9" || got.geo != "Test Geo" {
+		t.Fatalf("领跑者结果异常: ip=%q geo=%q", got.ip, got.geo)
 	}
 	if got := calls.Load(); got != 1 {
 		t.Fatalf("相同 IP 的并发查询应合并为 1 次，实际 %d 次", got)
 	}
-	if len(g.calls) != 0 {
-		t.Fatalf("查询结束后 inflight 表应清空，实际剩余 %d 项", len(g.calls))
+	g.mu.Lock()
+	left := len(g.calls)
+	g.mu.Unlock()
+	if left != 0 {
+		t.Fatalf("查询结束后 inflight 表应清空，实际剩余 %d 项", left)
+	}
+}
+
+// waitForGeoWaiters 轮询等待 key 上的 in-flight 查询累计到 want 个等待者。
+func waitForGeoWaiters(t *testing.T, g *geoInflight, key string, want int) {
+	t.Helper()
+	deadline := time.Now().Add(3 * time.Second)
+	for {
+		g.mu.Lock()
+		call := g.calls[key]
+		got := 0
+		if call != nil {
+			got = call.waiters
+		}
+		g.mu.Unlock()
+		if got == want {
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("等待 %d 个并发等待者超时，实际 %d 个", want, got)
+		}
+		time.Sleep(time.Millisecond)
 	}
 }
 
@@ -2007,6 +2085,7 @@ func TestGeoCooldownWindow(t *testing.T) {
 // TestQueryIPGeoCanceledWaiterDoesNotCacheEmpty 验证等待共享结果的调用方被取消时
 // 不会把空结果写入 GeoIP 缓存，否则后续 30 分钟都会命中空数据。
 func TestQueryIPGeoCanceledWaiterDoesNotCacheEmpty(t *testing.T) {
+	resetDefaultGeoCacheForTest(t)
 	old := geoLookupFuncs
 	defer func() { geoLookupFuncs = old }()
 
