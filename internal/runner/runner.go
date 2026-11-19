@@ -337,6 +337,9 @@ type Agent struct {
 	heavyQueue chan model.Job
 	lightSem   chan struct{}
 	tasksWG    sync.WaitGroup
+
+	dedupOnce sync.Once
+	dedup     *jobDedup
 }
 
 // logger 是本包用到的最小日志接口，便于测试注入。
@@ -436,6 +439,17 @@ func (a *Agent) Loop(ctx context.Context) error {
 			continue
 		}
 
+		// 同一 jobID 可能因长轮询重连/机器人重试被重复下发：正在执行则跳过，
+		// 已完成则重发缓存结果，避免重复跑 trace / miaospeed / 升级。
+		switch action, cached := a.dedupStore().start(job.ID); action {
+		case dedupRunning:
+			a.logger.Info("忽略重复下发的任务（正在执行）", "job", job.ID, "kind", probe.ProbeKind(*job))
+			continue
+		case dedupCompleted:
+			a.resendCachedResult(*job, cached)
+			continue
+		}
+
 		// 收到远程更新控制包或重任务（trace / miaospeed）：投入串行调度队列，不阻塞主循环长轮询
 		if isHeavy(*job) || job.Kind == "upgrade" || job.Kind == "update" {
 			select {
@@ -478,6 +492,7 @@ func (a *Agent) heavyWorker(ctx context.Context) {
 			// 检查任务在排队期间是否已被 cancel
 			if a.tracker != nil && a.tracker.IsCancelled(j.ID) {
 				a.logger.Info("任务在排队期间已被取消，跳过执行", "job", j.ID, "kind", j.Kind)
+				a.dedupStore().complete(j.ID, nil)
 				continue
 			}
 
@@ -680,16 +695,11 @@ func (a *Agent) execute(ctx context.Context, job model.Job) {
 	run := a.runner.run(taskCtx, job)
 	output, errText, exitCode := run.Output, run.ErrText, run.ExitCode
 
+	res := model.Result{ID: job.ID, Kind: probe.ProbeKind(job), Output: output, ExitCode: exitCode, Error: errText, Data: run.Data}
+	a.dedupStore().complete(job.ID, &res)
 	// 回传不依赖任务上下文：即使任务超时或进程正在退出，也尽量让机器人拿到结果，
 	// 否则用户要一直等到超时。
-	resultTimeout := config.DefaultResultTimeout
-	if a.cfg != nil && a.cfg.ResultTimeout > 0 {
-		resultTimeout = a.cfg.ResultTimeout
-	}
-	sendCtx, cancel := context.WithTimeout(context.Background(), resultTimeout)
-	defer cancel()
-	res := model.Result{ID: job.ID, Kind: probe.ProbeKind(job), Output: output, ExitCode: exitCode, Error: errText, Data: run.Data}
-	if err := a.client.SendResult(sendCtx, res); err != nil {
+	if err := a.sendResult(res); err != nil {
 		a.logger.Warn("回传结果失败", "job", job.ID, "error", err)
 		return
 	}
@@ -858,12 +868,6 @@ func (a *Agent) handleUpgradeJob(ctx context.Context, job model.Job) {
 }
 
 func (a *Agent) sendUpgradeResult(job model.Job, exitCode int, output, errText string) {
-	resultTimeout := config.DefaultResultTimeout
-	if a.cfg != nil && a.cfg.ResultTimeout > 0 {
-		resultTimeout = a.cfg.ResultTimeout
-	}
-	sendCtx, cancel := context.WithTimeout(context.Background(), resultTimeout)
-	defer cancel()
 	res := model.Result{
 		ID:       job.ID,
 		Kind:     job.Kind,
@@ -871,9 +875,49 @@ func (a *Agent) sendUpgradeResult(job model.Job, exitCode int, output, errText s
 		ExitCode: exitCode,
 		Error:    errText,
 	}
-	if err := a.client.SendResult(sendCtx, res); err != nil {
+	a.dedupStore().complete(job.ID, &res)
+	if err := a.sendResult(res); err != nil {
 		a.logger.Warn("回传更新结果失败", "job", job.ID, "error", err)
 	}
+}
+
+// dedupStore 返回任务去重记录，供主循环与 worker 共用（首次使用时初始化）。
+func (a *Agent) dedupStore() *jobDedup {
+	a.dedupOnce.Do(func() {
+		if a.dedup == nil {
+			a.dedup = newJobDedup()
+		}
+	})
+	return a.dedup
+}
+
+// resultTimeout 返回结果回传超时，与 client 的 /results 独立超时保持一致。
+func (a *Agent) resultTimeout() time.Duration {
+	if a.cfg != nil && a.cfg.ResultTimeout > 0 {
+		return a.cfg.ResultTimeout
+	}
+	return config.DefaultResultTimeout
+}
+
+// sendResult 在独立于任务上下文的时限内回传结果。
+func (a *Agent) sendResult(res model.Result) error {
+	ctx, cancel := context.WithTimeout(context.Background(), a.resultTimeout())
+	defer cancel()
+	return a.client.SendResult(ctx, res)
+}
+
+// resendCachedResult 处理重复下发的已完成任务：能拿到缓存就重发，否则只记录跳过，
+// 绝不重新执行（尤其是 upgrade/miaospeed/trace）。
+func (a *Agent) resendCachedResult(job model.Job, cached *model.Result) {
+	if cached == nil {
+		a.logger.Warn("任务已执行过，但结果超出缓存上限，跳过重复执行", "job", job.ID, "kind", probe.ProbeKind(job))
+		return
+	}
+	if err := a.sendResult(*cached); err != nil {
+		a.logger.Warn("重发缓存结果失败", "job", job.ID, "error", err)
+		return
+	}
+	a.logger.Info("已重发缓存结果（跳过重复执行）", "job", job.ID, "kind", probe.ProbeKind(job))
 }
 
 // NewAgent 创建一个新的调度代理实例。
