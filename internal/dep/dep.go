@@ -43,6 +43,10 @@ const (
 	fallbackMiaospeedVersion = "4.7.8"
 )
 
+// selfCheckTimeout 是替换前执行依赖 -version/-V 自检的独立超时。
+// 依赖卡死或挂起时不能把整个更新流程一起拖住；测试会缩短该值。
+var selfCheckTimeout = 10 * time.Second
+
 // binaryPresent 判断目标路径上是否已有文件（用于区分“升级”与“首次安装”）。
 func binaryPresent(path string) bool {
 	fi, err := os.Stat(path)
@@ -582,6 +586,9 @@ func (dm *DependencyManager) downloadVerified(ctx context.Context, repo, tag, as
 // selfCheckDependency 在替换前运行一次下载的依赖二进制，确认可执行且版本与目标一致。
 // 与 updater 的自检一致：宁可中止更新，也不把架构不匹配或损坏的二进制落盘。
 func (dm *DependencyManager) selfCheckDependency(ctx context.Context, name, path, want string) error {
+	// 自检独立限时：即使调用方没有 deadline，也不会因为依赖的 -version 卡住而挂死。
+	ctx, cancel := context.WithTimeout(ctx, selfCheckTimeout)
+	defer cancel()
 	var (
 		installed bool
 		got       string
@@ -607,7 +614,9 @@ func (dm *DependencyManager) selfCheckDependency(ctx context.Context, name, path
 	wantV, wantOK := updater.ParseVersion(strings.TrimPrefix(want, "v"))
 	gotV, gotOK := updater.ParseVersion(strings.TrimPrefix(got, "v"))
 	if wantOK && gotOK {
-		if gotV.Major != wantV.Major || gotV.Minor != wantV.Minor || gotV.Patch != wantV.Patch || gotV.Pre != wantV.Pre {
+		// 只要求主/次/补丁号一致：上游 tag 与二进制 -version 输出的预发布后缀
+		// （-rc.1、+build 等）经常不一致，严格比较会把正常二进制误判为损坏。
+		if gotV.Major != wantV.Major || gotV.Minor != wantV.Minor || gotV.Patch != wantV.Patch {
 			return fmt.Errorf("%s 版本不匹配：期望 %s，实际 %s", name, want, got)
 		}
 	} else if strings.TrimPrefix(got, "v") != strings.TrimPrefix(want, "v") {

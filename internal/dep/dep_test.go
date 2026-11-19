@@ -21,6 +21,7 @@ import (
 	"strings"
 	"sync/atomic"
 	"testing"
+	"time"
 )
 
 // mockDependencyVersion 让下载后的依赖自检返回指定版本（测试无需真实可执行二进制）。
@@ -716,6 +717,51 @@ func TestExtractTarGzRunnerLayout(t *testing.T) {
 	got, err := os.ReadFile(dest)
 	if err != nil || string(got) != string(content) {
 		t.Fatalf("解压内容不匹配: %q err=%v", string(got), err)
+	}
+}
+
+// TestSelfCheckDependencyIgnoresPrereleaseSuffix 验证依赖自检只比较主/次/补丁号：
+// 上游 tag 带 -rc 后缀而二进制输出没有（或相反）时应通过。
+func TestSelfCheckDependencyIgnoresPrereleaseSuffix(t *testing.T) {
+	dm := newDependencyManager("")
+	dm.cmdRunner = func(_ context.Context, name string, _ ...string) ([]byte, error) {
+		if strings.Contains(strings.ToLower(name), "miaospeed") {
+			return []byte("version: 4.7.8\n"), nil
+		}
+		return []byte("NextTrace v1.7.4\n"), nil
+	}
+	path := filepath.Join(t.TempDir(), "nexttrace")
+	if err := os.WriteFile(path, []byte("#!/bin/sh\n"), 0755); err != nil {
+		t.Fatal(err)
+	}
+	if err := dm.selfCheckDependency(context.Background(), "nexttrace", path, "v1.7.4-rc.1"); err != nil {
+		t.Fatalf("仅预发布后缀不同不应判定版本不匹配: %v", err)
+	}
+}
+
+// TestSelfCheckDependencyTimeout 验证 -version 自检有独立超时，依赖卡住不会挂死更新流程。
+func TestSelfCheckDependencyTimeout(t *testing.T) {
+	old := selfCheckTimeout
+	selfCheckTimeout = 50 * time.Millisecond
+	defer func() { selfCheckTimeout = old }()
+
+	dm := newDependencyManager("")
+	dm.cmdRunner = func(ctx context.Context, _ string, _ ...string) ([]byte, error) {
+		<-ctx.Done()
+		return nil, ctx.Err()
+	}
+	path := filepath.Join(t.TempDir(), "nexttrace")
+	if err := os.WriteFile(path, []byte("#!/bin/sh\n"), 0755); err != nil {
+		t.Fatal(err)
+	}
+	start := time.Now()
+	err := dm.selfCheckDependency(context.Background(), "nexttrace", path, "v1.7.4")
+	elapsed := time.Since(start)
+	if err == nil || !strings.Contains(err.Error(), "版本自检失败") {
+		t.Fatalf("卡死的自检应超时并报错，实际 err=%v", err)
+	}
+	if elapsed > 2*time.Second {
+		t.Fatalf("自检超时未生效，耗时 %s", elapsed)
 	}
 }
 
