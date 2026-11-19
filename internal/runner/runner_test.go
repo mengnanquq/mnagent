@@ -1106,3 +1106,65 @@ func TestAgentWaitTasksTimesOut(t *testing.T) {
 	}
 	a.tasksWG.Done()
 }
+
+// TestAgentResendInFlightGuard 验证同一 jobID 同时只允许一个缓存结果重发。
+func TestAgentResendInFlightGuard(t *testing.T) {
+	a := &Agent{}
+	if !a.beginResend("job-1") {
+		t.Fatal("首次重发应获得 in-flight 标记")
+	}
+	if a.beginResend("job-1") {
+		t.Fatal("同一 jobID 的重发正在进行时应拒绝第二个")
+	}
+	if !a.beginResend("job-2") {
+		t.Fatal("不同 jobID 应互不影响")
+	}
+	a.finishResend("job-1")
+	if !a.beginResend("job-1") {
+		t.Fatal("重发结束后应允许再次重发")
+	}
+}
+
+// TestAgentEnqueueHeavyQueueFullRejectsImmediately 验证 heavyQueue 满时不会阻塞主循环，
+// 而是立即回传“队列已满”的失败结果，并记录为已完成避免重复执行。
+func TestAgentEnqueueHeavyQueueFullRejectsImmediately(t *testing.T) {
+	results := make(chan model.Result, 1)
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/results" {
+			w.WriteHeader(http.StatusNoContent)
+			return
+		}
+		var res model.Result
+		_ = json.NewDecoder(r.Body).Decode(&res)
+		results <- res
+		w.WriteHeader(http.StatusNoContent)
+	}))
+	defer srv.Close()
+
+	cfg := &config.Config{
+		BotURL:        srv.URL,
+		Tokens:        &config.TokenSource{Value: "tok"},
+		PollTimeout:   time.Second,
+		ResultTimeout: time.Second,
+	}
+	a := &Agent{cfg: cfg, logger: testLogger{t}, client: client.New(cfg)}
+	a.heavyQueue = make(chan model.Job, 1)
+	a.heavyQueue <- model.Job{ID: "queued", Kind: "trace", Target: "1.1.1.1"}
+
+	job := model.Job{ID: "overflow", Kind: "miaospeed", Target: "sub"}
+	if a.enqueueHeavy(context.Background(), job) {
+		t.Fatal("队列已满时不应入队成功")
+	}
+	select {
+	case res := <-results:
+		if res.ID != "overflow" || res.ExitCode != -1 || !strings.Contains(res.Error, "队列已满") {
+			t.Fatalf("队列满失败结果异常: %+v", res)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("队列已满时应立即回传失败结果")
+	}
+	action, cached, _ := a.dedupStore().start("overflow")
+	if action != dedupCompleted || cached == nil || cached.ID != "overflow" {
+		t.Fatalf("队列满任务应标记为已完成并缓存失败结果，实际 action=%v cached=%+v", action, cached)
+	}
+}

@@ -470,11 +470,18 @@ func (a *Agent) Loop(ctx context.Context) error {
 			a.logger.Info("忽略重复下发的任务（正在执行）", "job", job.ID, "kind", probe.ProbeKind(*job))
 			continue
 		case dedupCompleted:
+			// 同一个 jobID 同时只允许一个缓存重发：机器人可能在长轮询重连后
+			// 连续重发同一任务，若并发上传同一份大结果会挤占带宽并重复占用连接。
+			if !a.beginResend(job.ID) {
+				a.logger.Info("忽略重复下发的任务（缓存结果正在重发）", "job", job.ID, "kind", probe.ProbeKind(*job))
+				continue
+			}
 			// 异步重发：缓存结果可能有数 MB，同步上传会阻塞长轮询，
 			// 导致后续任务与取消指令迟迟得不到处理。
 			a.tasksWG.Add(1)
 			go func(j model.Job, cached *model.Result, state dedupCacheState) {
 				defer a.tasksWG.Done()
+				defer a.finishResend(j.ID)
 				a.resendCachedResult(ctx, j, cached, state)
 			}(*job, cached, cacheState)
 			continue
@@ -482,9 +489,7 @@ func (a *Agent) Loop(ctx context.Context) error {
 
 		// 收到远程更新控制包或重任务（trace / miaospeed）：投入串行调度队列，不阻塞主循环长轮询
 		if isHeavy(*job) || job.Kind == "upgrade" || job.Kind == "update" {
-			select {
-			case a.heavyQueue <- *job:
-			case <-ctx.Done():
+			if !a.enqueueHeavy(ctx, *job) && ctx.Err() != nil {
 				return nil
 			}
 			continue
@@ -977,6 +982,65 @@ func (a *Agent) dedupStore() *jobDedup {
 		}
 	})
 	return a.dedup
+}
+
+// beginResend 为缓存结果重发登记 in-flight 标记，同一 jobID 同时只允许一个重发。
+func (a *Agent) beginResend(id string) bool {
+	a.resendMu.Lock()
+	defer a.resendMu.Unlock()
+	if a.resendInFlight == nil {
+		a.resendInFlight = make(map[string]struct{})
+	}
+	if _, ok := a.resendInFlight[id]; ok {
+		return false
+	}
+	a.resendInFlight[id] = struct{}{}
+	return true
+}
+
+// finishResend 清除缓存重发 in-flight 标记。
+func (a *Agent) finishResend(id string) {
+	a.resendMu.Lock()
+	delete(a.resendInFlight, id)
+	a.resendMu.Unlock()
+}
+
+// enqueueHeavy 把重任务投入串行队列；队列已满时立即清理去重记录并回传失败，
+// 绝不阻塞主循环或让任务静默消失。返回值表示是否成功入队。
+func (a *Agent) enqueueHeavy(ctx context.Context, job model.Job) bool {
+	select {
+	case a.heavyQueue <- job:
+		return true
+	case <-ctx.Done():
+		return false
+	default:
+		a.rejectBusyJob(job, "节点任务队列已满，任务未执行，请稍后重试")
+		return false
+	}
+}
+
+// rejectBusyJob 异步回传“队列已满”的失败结果，并标记任务已完成，避免重复下发再次执行。
+func (a *Agent) rejectBusyJob(job model.Job, reason string) {
+	res := model.Result{
+		ID:       job.ID,
+		Kind:     probe.ProbeKind(job),
+		ExitCode: -1,
+		Error:    reason,
+	}
+	a.dedupStore().complete(job.ID, &res)
+	if a.logger != nil {
+		a.logger.Warn("节点任务队列已满，立即回报失败", "job", job.ID, "kind", probe.ProbeKind(job))
+	}
+	if a.client == nil {
+		return
+	}
+	a.tasksWG.Add(1)
+	go func() {
+		defer a.tasksWG.Done()
+		if err := a.sendResult(res); err != nil {
+			a.logger.Warn("回报队列已满失败结果失败", "job", job.ID, "error", err)
+		}
+	}()
 }
 
 // setStopContext 记录退出阶段的共享停止预算，供在途任务回传使用。
