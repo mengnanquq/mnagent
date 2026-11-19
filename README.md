@@ -128,6 +128,20 @@ mnagent -apply-update latest         # 立即升级到最新版本并平滑重�
 
 ---
 
+## 📝 行为变更（v0.3.103）
+
+与升级相关、会影响已有部署的实际行为调整：
+
+- **超过 2MB 的任务结果不再缓存重发**：为避免低内存设备（16MB/32MB Flash 的 OpenWrt）被常驻缓存吃满，单条结果缓存上限为 **2MB**、所有缓存合计 **4MB**。超出上限的任务仍会标记为已完成，但服务端重复下发同一 `jobID` 时只会跳过重复执行并记录 `oversized` 告警，不会再重发缓存结果。
+- **miaospeed 单次响应上限 8MB**：单条 WebSocket JSON 响应超过 8MB 会直接报错并放弃，避免异常/恶意服务端把节点内存耗尽（正常 500 节点结果约 3MB）。同时累积缓冲的复用阈值降到 256KB，大缓冲交给 GC 回收。
+- **WebSocket 任务缓冲由 64 改为 16**：WS 降级模式下待执行任务队列变短，队列满时立即回报明确的失败结果，而不是阻塞长连接读循环（否则连 ping/ack 都会被拖住），常驻内存更可控。
+- **状态目录属主校验**：`/var/lib/mnagent`（Windows 为 `%ProgramData%\mnagent`）必须属于 root/SYSTEM/Administrators 或当前用户，且不允许组/其他用户写入；否则会拒绝使用并输出 `WARN` 告警，Linux 上可执行 `sudo chown root:root /var/lib/mnagent` 修复，详见下文「常见问题排查」。
+- **发布新增 `mnagent_linux_armv7` 别名**：内容与 `mnagent_linux_arm` 完全相同（并带 `.sha256` 与签名），用于线上 v0.3.102 等旧版 ARM 节点（它们按旧资产名请求），使这些节点能自动升级。等所有 ARM 节点升级完成后，该别名会在 v0.3.104 或之后移除。
+- **服务停止超时放宽**：systemd 单元新增 `TimeoutStopSec=80`、OpenWrt procd 新增 `term_timeout 70`，确保退出时能在 60s 预算内回传在途结果，不被守护进程提前强杀（重新执行安装脚本即可更新已有单元）。
+- **缓存结果重发同样受 `-result-timeout` 约束**：重复下发任务的缓存结果上传不再使用固定的 6 分钟预算，而是跟随配置的单次回传超时。
+
+---
+
 ## ❓ 常见问题排查
 
 - **服务端显示 ⚪️ 离线**：先运行 `mnagent -diag` 检查主机到服务端的 HTTPS 连通性，再确认系统服务运行状态（如 `systemctl status mnagent`）。
