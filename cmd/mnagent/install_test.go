@@ -122,6 +122,151 @@ func TestInstallScriptSyntax(t *testing.T) {
 	}
 }
 
+// installEnv 把 PATH 前置 fakeBin，并去重覆盖同名变量，避免继承宿主环境里的
+// MNAGENT_PLATFORM / MNAGENT_TOKEN 等把测试导向真实安装或真实 /etc。
+func installEnv(fakeBin, initDir, defaultToken string, extra ...string) []string {
+	overrides := map[string]string{
+		"PATH":               fakeBin + string(os.PathListSeparator) + os.Getenv("PATH"),
+		"MNAGENT_PLATFORM":   "systemd",
+		"MNAGENT_INIT_DIR":   initDir,
+		"MNAGENT_TOKEN_FILE": defaultToken,
+		"MNAGENT_TOKEN":      "",
+		"MNAGENT_GH_PROXY":   "",
+		"GH_PROXY":           "",
+		"MNAGENT_REPO":       "",
+	}
+	for _, kv := range extra {
+		if k, v, ok := strings.Cut(kv, "="); ok {
+			overrides[k] = v
+		}
+	}
+	var env []string
+	for _, kv := range os.Environ() {
+		k, _, _ := strings.Cut(kv, "=")
+		if _, replaced := overrides[k]; replaced {
+			continue
+		}
+		env = append(env, kv)
+	}
+	for k, v := range overrides {
+		env = append(env, k+"="+v)
+	}
+	return env
+}
+
+// runInstallScript 以 root 身份执行安装脚本。CI 通常以 root 运行；本地非 root 时
+// 借 user namespace（unshare -r）模拟 root，脚本只会写临时目录，不会碰真实 /etc。
+func runInstallScript(t *testing.T, scriptPath string, args, env []string, stdin string) (string, error) {
+	t.Helper()
+	sh, err := exec.LookPath("sh")
+	if err != nil {
+		t.Skip("未找到 sh")
+	}
+	var cmd *exec.Cmd
+	if os.Geteuid() == 0 {
+		cmd = exec.Command(sh, append([]string{scriptPath}, args...)...)
+	} else {
+		unshare, err := exec.LookPath("unshare")
+		if err != nil {
+			t.Skip("非 root 且未安装 unshare，跳过可执行安装脚本测试")
+		}
+		if err := exec.Command(unshare, "-r", "--", "true").Run(); err != nil {
+			t.Skipf("非 root 且 unshare -r 不可用（%v），跳过可执行安装脚本测试", err)
+		}
+		cmd = exec.Command(unshare, append([]string{"-r", "--", sh, scriptPath}, args...)...)
+	}
+	cmd.Env = env
+	cmd.Stdin = strings.NewReader(stdin)
+	out, err := cmd.CombinedOutput()
+	return string(out), err
+}
+
+// TestInstallScriptTokenStdinOnUpgrade 覆盖升级场景：旧 unit 里已有 -token-file 时，
+// `--token-file -` 仍必须从 stdin 读取令牌并覆盖写入，不能被继承逻辑静默吞掉。
+func TestInstallScriptTokenStdinOnUpgrade(t *testing.T) {
+	root := findRepoRoot()
+	scriptPath := filepath.Join(root, "install.sh")
+	tmp := t.TempDir()
+	initDir := filepath.Join(tmp, "systemd")
+	fakeBin := filepath.Join(tmp, "bin")
+	if err := os.MkdirAll(initDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(fakeBin, 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	// 假 systemctl：脚本会调用 daemon-reload / enable / restart / is-active。
+	fakeSystemctl := filepath.Join(fakeBin, "systemctl")
+	if err := os.WriteFile(fakeSystemctl, []byte("#!/bin/sh\ncase \"$1\" in is-active) echo active;; esac\nexit 0\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	fakeAgent := filepath.Join(tmp, "mnagent-fake")
+	if err := os.WriteFile(fakeAgent, []byte("#!/bin/sh\nexit 0\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	tokenFile := filepath.Join(tmp, "token")
+	if err := os.WriteFile(tokenFile, []byte("old-token\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	unitPath := filepath.Join(initDir, "mnagent.service")
+	unit := "[Service]\nExecStart=\"" + fakeAgent + "\" -bot \"https://bot.example/agent\" -token-file \"" + tokenFile + "\"\n"
+	if err := os.WriteFile(unitPath, []byte(unit), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	baseArgs := []string{
+		"--bot", "https://bot.example/agent",
+		"--binary", fakeAgent,
+		"--prefix", filepath.Join(tmp, "install"),
+		"--no-install-nexttrace", "--no-install-miaospeed",
+	}
+
+	// 1) --token-file -：升级时也必须读取 stdin 并写入继承到的令牌文件。
+	env := installEnv(fakeBin, initDir, filepath.Join(tmp, "default-token"))
+	out, err := runInstallScript(t, scriptPath, append(baseArgs, "--token-file", "-"), env, "stdin-token\n")
+	if err != nil {
+		t.Fatalf("以 --token-file - 安装失败: %v\n%s", err, out)
+	}
+	got, err := os.ReadFile(tokenFile)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.TrimSpace(string(got)) != "stdin-token" {
+		t.Fatalf("升级时 stdin 令牌被忽略，令牌文件内容 = %q（期望 stdin-token）\n输出：\n%s", strings.TrimSpace(string(got)), out)
+	}
+
+	// 2) MNAGENT_TOKEN：升级路径下也必须覆盖旧令牌文件。
+	//    显式给一个不存在的 --token-file，让继承逻辑照常从旧 unit 取路径。
+	env = installEnv(fakeBin, initDir, filepath.Join(tmp, "default-token"), "MNAGENT_TOKEN=env-token")
+	out, err = runInstallScript(t, scriptPath, append(baseArgs, "--token-file", filepath.Join(tmp, "absent-token")), env, "")
+	if err != nil {
+		t.Fatalf("以 MNAGENT_TOKEN 升级失败: %v\n%s", err, out)
+	}
+	got, err = os.ReadFile(tokenFile)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.TrimSpace(string(got)) != "env-token" {
+		t.Fatalf("升级时 MNAGENT_TOKEN 被忽略，令牌文件内容 = %q（期望 env-token）", strings.TrimSpace(string(got)))
+	}
+}
+
+// TestInstallScriptNormalizesTokenStdinBeforeInherit 静态守护：'-' 归一化必须出现在
+// 继承旧 unit 之前，否则升级路径会再次吞掉 stdin 令牌。
+func TestInstallScriptNormalizesTokenStdinBeforeInherit(t *testing.T) {
+	script := string(readInstallScript(t))
+	normalize := strings.Index(script, `if [ "$TOKEN_FILE" = "-" ]`)
+	inherit := strings.Index(script, `if [ -n "$existing_cmd" ]`)
+	if normalize < 0 || inherit < 0 {
+		t.Fatalf("未找到归一化（%d）或继承逻辑（%d）", normalize, inherit)
+	}
+	if normalize > inherit {
+		t.Fatal("--token-file - 的归一化必须放在继承旧 unit 之前，否则升级时会用旧路径覆盖 '-'")
+	}
+}
+
 // TestInstallScriptSupportsOpenWrt 覆盖 OpenWrt 相关的关键实现：
 // procd 服务、BusyBox 回退、平台/init 目录开关、MIPS 字节序识别、sysupgrade 处理。
 func TestInstallScriptSupportsOpenWrt(t *testing.T) {

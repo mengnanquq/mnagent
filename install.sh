@@ -26,7 +26,9 @@ BOT_URL=""
 TOKEN=""
 TOKEN_FROM_ARG="no"
 TOKEN_STDIN="no"
-TOKEN_FILE="/etc/mnagent/token"
+# 默认令牌文件路径可覆盖（测试与非标准部署使用；正常安装用 --token-file 指定即可）。
+DEFAULT_TOKEN_FILE="${MNAGENT_TOKEN_FILE:-/etc/mnagent/token}"
+TOKEN_FILE="$DEFAULT_TOKEN_FILE"
 NEXTTRACE_BIN="nexttrace"
 MIAOSPEED_BIN="miaospeed"
 MIAOSPEED_VERSION="latest"
@@ -106,6 +108,7 @@ usage() {
   MNAGENT_REPO=<owner/repo>               覆盖 Release 来源仓库
   GH_PROXY=<url>                          GitHub 代理前缀（如 https://gh-proxy.com/）
   MNAGENT_TOKEN=<token>                   接入令牌（避免出现在 argv；与 --token-file 二选一）
+  MNAGENT_TOKEN_FILE=<path>              默认令牌文件路径（默认 /etc/mnagent/token；一般无需设置）
 EOF
 }
 
@@ -165,6 +168,14 @@ while [ $# -gt 0 ]; do
 				*) die "未知参数：$1（用 --help 查看用法）";;
 	esac
 done
+
+# --token-file - 等价于 --token-stdin：必须在继承旧 unit 之前归一化。
+# 否则升级时继承逻辑会把 '-' 覆盖成旧 unit 里的令牌路径，导致 stdin 传入的
+# 令牌被静默忽略（沿用旧令牌，甚至以为已经轮换成功）。
+if [ "$TOKEN_FILE" = "-" ]; then
+	TOKEN_FILE="$DEFAULT_TOKEN_FILE"
+	TOKEN_STDIN="yes"
+fi
 
 # ---------- 平台与架构 ----------
 
@@ -468,10 +479,7 @@ if [ -n "$GH_PROXY" ]; then
 fi
 
 # 令牌可由 --token-stdin 或 MNAGENT_TOKEN 提供，避免明文出现在 argv/ps/命令历史中。
-if [ "$TOKEN_FILE" = "-" ]; then
-	TOKEN_FILE="/etc/mnagent/token"
-	TOKEN_STDIN="yes"
-fi
+# 注：'-' 的归一化已在解析参数后、继承旧 unit 之前完成（见上方）。
 if [ "$TOKEN_STDIN" = "yes" ] && [ -z "$TOKEN" ]; then
 	IFS= read -r TOKEN || die "从标准输入读取令牌失败（管道安装时 stdin 已被脚本占用，请改用 --token-file 或 MNAGENT_TOKEN）"
 	TOKEN="$(printf '%s' "$TOKEN" | tr -d '\r\n')"
