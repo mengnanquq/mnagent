@@ -1008,7 +1008,10 @@ ExecStart="$PREFIX/mnagent" -bot "$BOT_URL" -token-file "$TOKEN_FILE" -nexttrace
 	Environment=HOME=/var/lib/mnagent
 	ReadWritePaths=$PREFIX
 	Restart=always
-RestartSec=5
+	RestartSec=5
+	# agent 退出时最多用 60s 回传在途结果（见 config.DefaultExitResultTimeout），
+	# 停止超时必须大于它，否则 systemd 会在结果上传完成前 SIGKILL。
+	TimeoutStopSec=80
 AmbientCapabilities=CAP_NET_RAW CAP_NET_ADMIN
 CapabilityBoundingSet=CAP_NET_RAW CAP_NET_ADMIN
 NoNewPrivileges=true
@@ -1056,6 +1059,9 @@ USE_PROCD=1
 			-miaospeed "$MIAOSPEED_EXEC"$AUTO_UPDATE_ARGS
 		procd_set_param env PATH="/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
 		procd_set_param respawn
+		# 退出时 agent 最多用 60s 回传在途结果，停止超时必须大于它，
+		# 否则 procd 会在结果上传完成前强杀进程。
+		procd_set_param term_timeout 70
 		procd_set_param stdout 1
 		procd_set_param stderr 1
 EOF

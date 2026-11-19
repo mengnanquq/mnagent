@@ -364,6 +364,7 @@ func TestInstallScriptSupportsOpenWrt(t *testing.T) {
 		{"procd 传递 miaospeed 参数", `-miaospeed "$MIAOSPEED_EXEC"`},
 		{"procd 环境注入 PATH 补齐 /usr/local/bin", `procd_set_param env PATH="/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"`},
 		{"procd 崩溃自动重启", "procd_set_param respawn"},
+		{"procd 停止超时大于退出预算", "procd_set_param term_timeout 70"},
 		{"procd 日志进 syslog", "procd_set_param stdout 1"},
 		{"rc.common shebang", "#!/bin/sh /etc/rc.common"},
 		{"OpenWrt 平台探测", "/etc/openwrt_release"},
@@ -382,6 +383,22 @@ func TestInstallScriptSupportsOpenWrt(t *testing.T) {
 		if !strings.Contains(script, want.needle) {
 			t.Errorf("install.sh 缺少“%s”（应包含 %q）", want.name, want.needle)
 		}
+	}
+}
+
+// TestServiceUnitStopTimeout 验证 systemd 单元与 procd 的停止超时都大于 agent 的 60s
+// 退出预算（config.DefaultExitResultTimeout），避免在途结果回传途中被强杀。
+func TestServiceUnitStopTimeout(t *testing.T) {
+	script := string(readInstallScript(t))
+	if !strings.Contains(script, "TimeoutStopSec=80") {
+		t.Error("install.sh 生成的 systemd 单元缺少 TimeoutStopSec=80")
+	}
+	tpl, err := os.ReadFile(filepath.Join(findRepoRoot(), "deploy", "mnagent.service"))
+	if err != nil {
+		t.Fatalf("读取 deploy/mnagent.service 失败：%v", err)
+	}
+	if !strings.Contains(string(tpl), "TimeoutStopSec=80") {
+		t.Error("deploy/mnagent.service 缺少 TimeoutStopSec=80")
 	}
 }
 

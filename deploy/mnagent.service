@@ -25,6 +25,9 @@ ReadWritePaths=/usr/local/bin
 
 Restart=always
 RestartSec=5
+# agent 退出时最多用 60s 回传在途结果（见 config.DefaultExitResultTimeout），
+# 停止超时必须大于它，否则 systemd 会在结果上传完成前 SIGKILL。
+TimeoutStopSec=80
 
 # nexttrace 需要 CAP_NET_RAW 才能做原始套接字追踪：由服务携带 ambient 能力并传给
 # 子进程（与 NoNewPrivileges 兼容；比给 nexttrace 二进制 setcap 更稳，二进制被替换后
