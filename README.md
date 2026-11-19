@@ -42,6 +42,10 @@ Agent 通过 HTTPS **主动长轮询**接收服务端下发的网络探测与节
 
 > **网络受限 / 国内加速**：
 > 在安装参数中附加 `--gh-proxy https://gh-proxy.com/`（Windows 添加 `-GhProxy "https://gh-proxy.com/"`），脚本自身、Agent 更新以及依赖下载均会自动经由加速代理。
+>
+> **⚠️ gh-proxy 信任说明**：自更新与依赖安装会强制校验 SHA-256，但配置代理时二进制与对应的 `.sha256` 校验文件都经同一代理下载，代理运营方理论上可以同时替换两者。也就是说，**启用 gh-proxy 等同于信任该代理运营方**；在可信网络环境下建议不要配置代理，必须使用时请选择你信任的服务。
+>
+> 安装脚本还支持 `--sha256 <hex>`（配合 `--binary <url>` 强制校验自定义二进制）与 `--from-source`（显式从源码编译）。Release 下载失败时脚本会直接报错，**不会**自动改为编译 main 分支。
 
 ---
 
@@ -89,6 +93,7 @@ mnagent -apply-update latest         # 立即升级到最新版本并平滑重�
 | **`-auto-update`** | `false` | 是否开启后台定时自动检查并升级（一键脚本安装默认开启） |
 | **`-gh-proxy <url>`** | — | GitHub 代理加速前缀（支持环境变量 `GH_PROXY`） |
 | **`-allow-private-probes`** | `false` | 放行对内网私有网段与云元数据地址的探测（默认严格拦截） |
+| **`-allow-remote-downgrade`** | `false` | 允许服务端远程指令把 Agent 降级到旧版本（默认只接受高于当前版本的目标；本地 `-apply-update` 不受限） |
 | **`-log-level`** | `info` | 日志级别：`debug` / `info` / `warn` / `error` |
 
 ---
@@ -100,3 +105,4 @@ mnagent -apply-update latest         # 立即升级到最新版本并平滑重�
 - **报错 `无法启动 nexttrace/miaospeed`**：运行 `mnagent -apply-update latest` 触发依赖自动补全下载；网络受限环境请配置 `-gh-proxy`。
 - **Ping 探针报套接字权限不足**：systemd 需配置 `AmbientCapabilities=CAP_NET_RAW CAP_NET_ADMIN`（重新执行安装脚本会自动修复）；OpenWrt 需以 root 运行。
 - **提示 `目标地址属于受限私有/元数据地址`**：默认防御 SSRF 拦截了局域网或云元数据地址；自建内网探测需添加 `-allow-private-probes`。
+- **更新后无法启动**：Linux / OpenWrt 上每次替换都会把上一版本保留为 `<二进制路径>.prev`（Windows 为 `.old`，启动时自动清理），可手工 `mv` 回去并重启服务；服务端远程升级只接受更高版本，如需回滚请使用本地 `-apply-update <tag>`。
