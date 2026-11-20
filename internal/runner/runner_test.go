@@ -326,6 +326,69 @@ func (l testLogger) Info(msg string, args ...any)  { l.t.Log(append([]any{msg}, 
 func (l testLogger) Warn(msg string, args ...any)  { l.t.Log(append([]any{"WARN " + msg}, args...)...) }
 func (l testLogger) Debug(msg string, args ...any) {}
 
+func TestIsUpgradeJobNormalizesKind(t *testing.T) {
+	cases := []struct {
+		kind string
+		want bool
+	}{
+		{"upgrade", true},
+		{"  Upgrade  ", true},
+		{"UPDATE", true},
+		{" update ", true},
+		{"trace", false},
+		{"", false},
+		{"   ", false},
+	}
+	for _, tc := range cases {
+		if got := isUpgradeJob(model.Job{Kind: tc.kind}); got != tc.want {
+			t.Fatalf("isUpgradeJob(%q) = %v，期望 %v", tc.kind, got, tc.want)
+		}
+	}
+}
+
+// TestHeavyWorkerHandlesNormalizedUpgradeKind 验证 " Upgrade " 会被当作更新任务
+// 交给 handleUpgradeJob，而不是误走探针执行路径；结果 Kind 也应归一化。
+func TestHeavyWorkerHandlesNormalizedUpgradeKind(t *testing.T) {
+	results := make(chan model.Result, 1)
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/results" {
+			var res model.Result
+			_ = json.NewDecoder(r.Body).Decode(&res)
+			results <- res
+			w.WriteHeader(http.StatusNoContent)
+			return
+		}
+		w.WriteHeader(http.StatusNoContent)
+	}))
+	defer srv.Close()
+
+	cfg := &config.Config{BotURL: srv.URL, Tokens: &config.TokenSource{Value: "tok"}, PollTimeout: time.Second}
+	a := &Agent{
+		logger:     testLogger{t},
+		client:     client.New(cfg),
+		heavyQueue: make(chan model.Job, 1),
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	a.tasksWG.Add(1)
+	go a.heavyWorker(ctx)
+	a.heavyQueue <- model.Job{ID: "up-1", Kind: "  Upgrade  ", Target: "v1.2.3"}
+
+	select {
+	case res := <-results:
+		if res.ID != "up-1" || res.Kind != "upgrade" {
+			t.Fatalf("更新任务结果异常: %+v", res)
+		}
+		if res.ExitCode != -1 || !strings.Contains(res.Error, "updater not ready") {
+			t.Fatalf("应走不支持自更新的更新器路径，实际: %+v", res)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("更新任务未被 heavyWorker 处理")
+	}
+	cancel()
+	a.tasksWG.Wait()
+}
+
 // TestSleepRespectsContext 验证退出时不会卡在退避等待上。
 func TestSleepRespectsContext(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
@@ -743,7 +806,7 @@ func TestAgentLoopNonBlockingLightAndCancelQueue(t *testing.T) {
 				_, _ = w.Write([]byte(`{"id":"light-quick","kind":"tcping","target":"127.0.0.1","port":9,"count":1,"timeout_ms":2000}`))
 			case 3:
 				// 主循环继续轮询，第 3 次收到对 heavy-long 的取消指令
-				_, _ = w.Write([]byte(`{"id":"heavy-long","kind":"cancel"}`))
+				_, _ = w.Write([]byte(`{"id":"heavy-long","kind":"  Cancel  "}`))
 			default:
 				w.WriteHeader(http.StatusNoContent)
 			}

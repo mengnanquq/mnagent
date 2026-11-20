@@ -247,7 +247,7 @@ func TestFailPendingHeavyReportsQueuedJobs(t *testing.T) {
 	a.heavyQueue = make(chan model.Job, 4)
 	a.heavyQueue <- model.Job{ID: "h1", Kind: "trace", Target: "1.1.1.1"}
 	a.heavyQueue <- model.Job{ID: "h2", Kind: "miaospeed", Target: "sub"}
-	a.heavyQueue <- model.Job{ID: "h1", Kind: "cancel"} // 取消控制包不应回报
+	a.heavyQueue <- model.Job{ID: "h1", Kind: "  CANCEL  "} // 取消控制包不应回报
 
 	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
 	defer cancel()

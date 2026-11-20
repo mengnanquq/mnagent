@@ -3,6 +3,7 @@ package model
 import (
 	"encoding/json"
 	"errors"
+	"strings"
 	"time"
 )
 
@@ -37,6 +38,15 @@ var (
 	JobMiaospeedMaxTimeout = 3 * time.Hour
 )
 
+// NormalizedKind 返回归一化后的任务类型：去除首尾空白并转小写，空值按 trace 处理。
+func (j Job) NormalizedKind() string {
+	kind := strings.ToLower(strings.TrimSpace(j.Kind))
+	if kind == "" {
+		return "trace"
+	}
+	return kind
+}
+
 // Timeout 返回任务执行超时，并夹在合理区间内，避免异常值让进程挂死或秒退。
 func (j Job) Timeout() time.Duration {
 	timeout := time.Duration(j.TimeoutMS) * time.Millisecond
@@ -44,7 +54,7 @@ func (j Job) Timeout() time.Duration {
 		timeout = JobMinTimeout
 	}
 	maxTimeout := JobMaxTimeout
-	if j.Kind == "miaospeed" {
+	if j.NormalizedKind() == "miaospeed" {
 		maxTimeout = JobMiaospeedMaxTimeout
 	}
 	if timeout > maxTimeout {

@@ -110,11 +110,7 @@ type Outcome struct {
 
 // probeKind 归一化任务类型；空值按 trace 处理（兼容旧版机器人）。
 func ProbeKind(job model.Job) string {
-	kind := strings.ToLower(strings.TrimSpace(job.Kind))
-	if kind == "" {
-		return KindTrace
-	}
-	return kind
+	return job.NormalizedKind()
 }
 
 // isProbeKind 判断是否为进程内探针（非 nexttrace）。

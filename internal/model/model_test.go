@@ -17,6 +17,7 @@ func TestJobTimeout(t *testing.T) {
 		{"exceed normal max", "trace", 1000000, JobMaxTimeout},
 		{"miaospeed within range", "miaospeed", 3600000, 1 * time.Hour},
 		{"miaospeed exceed max", "miaospeed", 20000000, JobMiaospeedMaxTimeout},
+		{"miaospeed kind with whitespace and case", "  MiaoSpeed  ", 20000000, JobMiaospeedMaxTimeout},
 	}
 
 	for _, tc := range cases {
@@ -26,5 +27,25 @@ func TestJobTimeout(t *testing.T) {
 				t.Errorf("Job.Timeout() = %v, want %v", got, tc.want)
 			}
 		})
+	}
+}
+
+// TestJobNormalizedKind 验证任务类型归一化规则与服务端下发的空值兼容。
+func TestJobNormalizedKind(t *testing.T) {
+	cases := []struct {
+		kind string
+		want string
+	}{
+		{"", "trace"},
+		{"   ", "trace"},
+		{" trace ", "trace"},
+		{"MiaoSpeed", "miaospeed"},
+		{"  PING  ", "ping"},
+		{"cancel", "cancel"},
+	}
+	for _, tc := range cases {
+		if got := (Job{Kind: tc.kind}).NormalizedKind(); got != tc.want {
+			t.Errorf("Job{Kind:%q}.NormalizedKind() = %q, want %q", tc.kind, got, tc.want)
+		}
 	}
 }

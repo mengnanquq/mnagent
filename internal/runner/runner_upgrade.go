@@ -308,7 +308,7 @@ func (a *Agent) handleUpgradeJob(ctx context.Context, job model.Job) {
 func (a *Agent) sendUpgradeResult(job model.Job, exitCode int, output, errText string) {
 	res := model.Result{
 		ID:       job.ID,
-		Kind:     job.Kind,
+		Kind:     job.NormalizedKind(),
 		Output:   output,
 		ExitCode: exitCode,
 		Error:    errText,

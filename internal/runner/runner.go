@@ -450,7 +450,7 @@ func (a *Agent) Loop(ctx context.Context) error {
 		}
 
 		// 收到任务取消控制包：立即在 tracker 中取消，无论其在排队还是正在运行
-		if job.Kind == "cancel" {
+		if job.NormalizedKind() == "cancel" {
 			if a.tracker != nil {
 				if a.tracker.Cancel(job.ID) {
 					a.logger.Info("已按指令中止正在执行的任务", "job", job.ID)
@@ -486,7 +486,7 @@ func (a *Agent) Loop(ctx context.Context) error {
 		}
 
 		// 收到远程更新控制包或重任务（trace / miaospeed）：投入串行调度队列，不阻塞主循环长轮询
-		if isHeavy(*job) || job.Kind == "upgrade" || job.Kind == "update" {
+		if isHeavy(*job) || isUpgradeJob(*job) {
 			if !a.enqueueHeavy(ctx, *job) && ctx.Err() != nil {
 				return nil
 			}

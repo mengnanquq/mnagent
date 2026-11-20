@@ -16,6 +16,19 @@ func isHeavy(job model.Job) bool {
 	return kind == probe.KindTrace || kind == "miaospeed"
 }
 
+// isUpgradeJob 判断是否为远程更新控制任务（Kind 归一化后比较）。
+func isUpgradeJob(job model.Job) bool {
+	switch job.NormalizedKind() {
+	case "upgrade", "update":
+		return true
+	default:
+		return false
+	}
+}
+
+// loggableTarget 返回可安全写入日志的任务目标。
+// miaospeed 的 Target 可能是含 token 的订阅 URL、节点 URI 或整段配置，
+// 直接打印会泄露凭据；其他探针目标受 targetPattern 限制，本身不含敏感信息。
 // heavyWorker 串行处理重任务与远程更新，避免多重任务争抢带宽与端口，
 // 并与主长轮询完全解耦，使长轮询与轻任务始终保持秒级响应。
 func (a *Agent) heavyWorker(ctx context.Context) {
@@ -36,7 +49,7 @@ func (a *Agent) heavyWorker(ctx context.Context) {
 				continue
 			}
 
-			if j.Kind == "upgrade" || j.Kind == "update" {
+			if isUpgradeJob(j) {
 				a.handleUpgradeJob(ctx, j)
 			} else {
 				a.execute(ctx, j)
@@ -91,7 +104,7 @@ func (a *Agent) failPendingHeavy(ctx context.Context, reason string) int {
 			if !ok {
 				goto send
 			}
-			if job.Kind == "cancel" {
+			if job.NormalizedKind() == "cancel" {
 				continue
 			}
 			jobs = append(jobs, job)

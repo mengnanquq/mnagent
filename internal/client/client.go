@@ -183,7 +183,7 @@ func validateJob(job *model.Job) error {
 	if strings.TrimSpace(job.ID) == "" {
 		return errors.New("任务缺少必需字段 ID")
 	}
-	if job.Kind != "cancel" && strings.TrimSpace(job.Target) == "" {
+	if job.NormalizedKind() != "cancel" && strings.TrimSpace(job.Target) == "" {
 		return errors.New("任务缺少必需字段 Target")
 	}
 	return nil
