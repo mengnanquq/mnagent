@@ -11,6 +11,7 @@ import (
 	"path/filepath"
 	"runtime"
 	"strings"
+	"sync"
 	"time"
 	"unicode"
 
@@ -77,6 +78,20 @@ func DefaultTokenFile() string {
 	return "/etc/mnagent/token"
 }
 
+// tokenPermWarned 按令牌文件路径去重权限告警：Get 会被轮询循环频繁调用，
+// 不能每次都打印同一条警告。
+type tokenPermWarned struct {
+	mu   sync.Mutex
+	seen map[string]struct{}
+}
+
+var tokenPermWarnings tokenPermWarned
+
+// tokenPermWarnHook 便于测试捕获告警；生产环境输出到 slog 默认 logger。
+var tokenPermWarnHook = func(path string, perm os.FileMode) {
+	slog.Warn("令牌文件权限过宽，其他本地用户可能读取令牌", "path", path, "mode", fmt.Sprintf("%04o", perm.Perm()))
+}
+
 // TokenSource 提供接入令牌：来自文件时每次读取，因此轮换令牌无需重启 agent。
 type TokenSource struct {
 	Value string // 直接给出的令牌（-token 或环境变量）。
@@ -129,6 +144,15 @@ func (t *TokenSource) Get() (string, error) {
 	if err != nil {
 		return "", err
 	}
+	// 令牌文件应仅属主可读写（0600）。非 Windows 下权限放宽时告警一次，
+	// 避免轮询循环每轮刷屏；Windows 的权限模型不同，交给 install.ps1 的 ACL 收紧。
+	if runtime.GOOS != "windows" {
+		if fi, statErr := os.Stat(t.Path); statErr == nil && fi.Mode().Perm()&0o077 != 0 {
+			if tokenPermWarnings.mark(t.Path) {
+				tokenPermWarnHook(t.Path, fi.Mode().Perm())
+			}
+		}
+	}
 	token := strings.TrimSpace(string(data))
 	token = strings.TrimPrefix(token, "\ufeff") // 清除 Windows 记事本/PowerShell 等工具保存时附带的 UTF-8 BOM
 	token = strings.TrimSpace(token)
@@ -136,6 +160,20 @@ func (t *TokenSource) Get() (string, error) {
 		return "", fmt.Errorf("令牌文件 %s 内容为空", t.Path)
 	}
 	return token, nil
+}
+
+// mark 记录某路径是否首次告警；首次返回 true。
+func (w *tokenPermWarned) mark(path string) bool {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	if w.seen == nil {
+		w.seen = make(map[string]struct{})
+	}
+	if _, ok := w.seen[path]; ok {
+		return false
+	}
+	w.seen[path] = struct{}{}
+	return true
 }
 
 // ParseLogLevel 把字符串日志级别映射为 slog 级别。

@@ -4,9 +4,64 @@ import (
 	"log/slog"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 )
+
+// TestTokenSourceWarnsOnInsecurePermissionsOnce 验证令牌文件权限过宽时告警，
+// 且同一路径只告警一次（Get 会被轮询循环频繁调用）。
+func TestTokenSourceWarnsOnInsecurePermissionsOnce(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("Windows 使用 ACL，不做 POSIX 权限检查")
+	}
+	dir := t.TempDir()
+	path := filepath.Join(dir, "token")
+	if err := os.WriteFile(path, []byte("secret\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	// 显式 chmod：WriteFile 的权限会被 umask 收紧（例如 umask 077 时变成 0600），
+	// 那样“权限过宽”的前提就不成立了。
+	if err := os.Chmod(path, 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	oldHook := tokenPermWarnHook
+	t.Cleanup(func() { tokenPermWarnHook = oldHook })
+	var warns int
+	var warnedPath string
+	var warnedPerm os.FileMode
+	tokenPermWarnHook = func(p string, perm os.FileMode) {
+		warns++
+		warnedPath = p
+		warnedPerm = perm
+	}
+
+	ts := &TokenSource{Path: path, From: path}
+	for i := 0; i < 3; i++ {
+		if got, err := ts.Get(); err != nil || got != "secret" {
+			t.Fatalf("Get() = %q, %v", got, err)
+		}
+	}
+	if warns != 1 {
+		t.Fatalf("权限过宽的同一路径应只告警一次，实际 %d 次", warns)
+	}
+	if warnedPath != path || warnedPerm.Perm()&0o077 == 0 {
+		t.Fatalf("告警参数异常: path=%q perm=%04o", warnedPath, warnedPerm.Perm())
+	}
+
+	// 0600 的令牌文件不应产生告警。
+	securePath := filepath.Join(dir, "secure-token")
+	if err := os.WriteFile(securePath, []byte("secret2\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := (&TokenSource{Path: securePath, From: securePath}).Get(); err != nil {
+		t.Fatal(err)
+	}
+	if warns != 1 {
+		t.Fatalf("0600 的令牌文件不应告警，累计告警 %d 次", warns)
+	}
+}
 
 func TestParseLogLevel(t *testing.T) {
 	cases := []struct {
