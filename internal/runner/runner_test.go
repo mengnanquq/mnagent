@@ -20,6 +20,7 @@ import (
 
 	"github.com/mengnanquq/mnagent/internal/client"
 	"github.com/mengnanquq/mnagent/internal/config"
+	"github.com/mengnanquq/mnagent/internal/dep"
 	"github.com/mengnanquq/mnagent/internal/model"
 	"github.com/mengnanquq/mnagent/internal/probe"
 	"github.com/mengnanquq/mnagent/internal/process"
@@ -325,6 +326,27 @@ type testLogger struct{ t *testing.T }
 func (l testLogger) Info(msg string, args ...any)  { l.t.Log(append([]any{msg}, args...)...) }
 func (l testLogger) Warn(msg string, args ...any)  { l.t.Log(append([]any{"WARN " + msg}, args...)...) }
 func (l testLogger) Debug(msg string, args ...any) {}
+
+// useLocalDependencyManager 让 Agent 的依赖检查指向本地测试服务，避免访问真实 GitHub。
+func useLocalDependencyManager(a *Agent, baseURL string) {
+	a.depManagerFactory = func(string) *dep.DependencyManager {
+		dm := dep.NewDependencyManager("")
+		dm.SetGitHubEndpoints(baseURL, baseURL)
+		return dm
+	}
+}
+
+// skipDependencyCheck 让 Agent 跳过依赖检查（测试不关心依赖更新，也避免访问外网）。
+func skipDependencyCheck(a *Agent) {
+	a.depManagerFactory = func(string) *dep.DependencyManager { return nil }
+}
+
+// blockedTransport 让使用 http.DefaultTransport 的请求立即失败，用于隔离外网。
+type blockedTransport struct{}
+
+func (blockedTransport) RoundTrip(*http.Request) (*http.Response, error) {
+	return nil, errors.New("测试环境禁止访问外网")
+}
 
 // TestLoggableTargetRedactsMiaospeed 验证 miaospeed 任务的日志目标不会泄露
 // 订阅 token、节点密码/UUID 或整段配置；普通探针目标保持原样便于排查。
@@ -640,6 +662,7 @@ func TestHandleUpgradeJob(t *testing.T) {
 		logger: &testLogger{t: t},
 		cfg:    &config.Config{},
 	}
+	skipDependencyCheck(testAgent)
 
 	checkSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Location", "/releases/download/v1.0.0/mnagent_linux_amd64")
@@ -1076,7 +1099,7 @@ func TestBuildMiaospeedResultDropsDuplicateOutput(t *testing.T) {
 func TestAgentCheckAndUpdateDependencies(t *testing.T) {
 	tmpDir := t.TempDir()
 	ntBin := filepath.Join(tmpDir, "nexttrace")
-	_ = os.WriteFile(ntBin, []byte("#!/bin/sh\n"), 0755)
+	_ = os.WriteFile(ntBin, []byte("#!/bin/sh\necho \"NextTrace v1.7.3\"\n"), 0755)
 
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
@@ -1102,6 +1125,7 @@ func TestAgentCheckAndUpdateDependencies(t *testing.T) {
 		cfg:    cfg,
 		logger: testLogger{t},
 	}
+	useLocalDependencyManager(a, srv.URL)
 
 	// 执行依赖检查，不应崩溃
 	a.checkAndUpdateDependencies(context.Background())
@@ -1109,6 +1133,12 @@ func TestAgentCheckAndUpdateDependencies(t *testing.T) {
 
 // TestHandleUpdateCLICheckOnly 验证 CLI --check-update 处理流程。
 func TestHandleUpdateCLICheckOnly(t *testing.T) {
+	// 固定让外部请求立即失败：该测试只验证 handled 语义，
+	// 不应依赖真实 GitHub 的可达性与响应速度。
+	origTransport := http.DefaultTransport
+	http.DefaultTransport = blockedTransport{}
+	t.Cleanup(func() { http.DefaultTransport = origTransport })
+
 	cfg := &config.Config{
 		CheckUpdateOnce: true,
 		Binary:          "nexttrace",
@@ -1383,3 +1413,226 @@ func TestRunTraceBlocksPrivateIPv6WithPort(t *testing.T) {
 		t.Fatalf("私网 IPv6 目标应被拦截，实际: %+v", res)
 	}
 }
+
+// TestAgentLoopUpdateCheckNonBlocking 验证自动更新检查在独立协程中执行：
+// 版本查询被长时间挂起时，主循环仍能继续长轮询并领取任务。
+func TestAgentLoopUpdateCheckNonBlocking(t *testing.T) {
+	var pollCount atomic.Int32
+	var jobResults sync.Map
+
+	updateStarted := make(chan struct{})
+	releaseUpdate := make(chan struct{})
+	var startOnce, releaseOnce sync.Once
+	release := func() { releaseOnce.Do(func() { close(releaseUpdate) }) }
+
+	// 模拟 GitHub 不可达：版本查询请求一直挂到测试结束。
+	updateSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		startOnce.Do(func() { close(updateStarted) })
+		<-releaseUpdate
+		w.Header().Set("Location", "/releases/download/v9.9.9/mnagent_linux_amd64")
+		w.WriteHeader(http.StatusFound)
+	}))
+	defer updateSrv.Close()
+	defer release() // LIFO：必须早于 updateSrv.Close()，否则 Close 会等待挂起的请求。
+
+	botSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/jobs":
+			c := pollCount.Add(1)
+			if c <= 8 {
+				w.Header().Set("Content-Type", "application/json")
+				_, _ = w.Write([]byte(fmt.Sprintf(`{"id":"light-%d","kind":"tcping","target":"127.0.0.1","port":9,"count":1,"timeout_ms":2000}`, c)))
+				return
+			}
+			w.WriteHeader(http.StatusNoContent)
+		case "/results":
+			var res model.Result
+			_ = json.NewDecoder(r.Body).Decode(&res)
+			jobResults.Store(res.ID, res)
+			w.WriteHeader(http.StatusNoContent)
+		case "/heartbeat":
+			w.WriteHeader(http.StatusNoContent)
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer botSrv.Close()
+
+	cfg := &config.Config{
+		BotURL:             botSrv.URL,
+		Tokens:             &config.TokenSource{Value: "tok"},
+		Binary:             "nexttrace",
+		MinBackoff:         5 * time.Millisecond,
+		MaxBackoff:         20 * time.Millisecond,
+		PollTimeout:        time.Second,
+		AllowPrivateProbes: true,
+		AutoUpdate:         true,
+		UpdateInterval:     time.Hour, // 只触发一次，避免重复检查干扰断言
+	}
+	exePath := filepath.Join(t.TempDir(), "mnagent")
+	if err := os.WriteFile(exePath, []byte("fake-binary"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	u := updater.New(updater.Config{
+		CurrentVersion: "v1.0.0",
+		Repo:           "owner/repo",
+		Platform:       "linux",
+		Arch:           "amd64",
+		Executable:     exePath,
+		SkipFile:       filepath.Join(t.TempDir(), "skip"),
+		// 超时设得足够长：本测试要验证的是“检查不阻塞主循环”，不是超时本身。
+		Client: &http.Client{
+			Timeout: 30 * time.Second,
+			CheckRedirect: func(*http.Request, []*http.Request) error {
+				return http.ErrUseLastResponse
+			},
+		},
+		DownloadClient: updateSrv.Client(),
+	})
+	u.LatestURLFunc = func() string { return updateSrv.URL }
+
+	origVersion := Version
+	Version = "v1.0.0"
+	defer func() { Version = origVersion }()
+
+	rnr := newRunner(cfg.Binary, nil)
+	a := &Agent{
+		cfg:     cfg,
+		logger:  testLogger{t},
+		client:  client.New(cfg),
+		runner:  rnr,
+		tracker: tracker.New(),
+		update:  u,
+	}
+	skipDependencyCheck(a)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	t.Cleanup(func() {
+		cancel()
+		a.tasksWG.Wait()
+	})
+	defer cancel()
+	done := make(chan error, 1)
+	go func() { done <- a.loop(ctx) }()
+
+	select {
+	case <-updateStarted:
+	case <-time.After(5 * time.Second):
+		t.Fatal("自动更新检查未启动")
+	}
+	pollsAtUpdateStart := pollCount.Load()
+
+	// 更新检查仍然挂起时，主循环必须继续轮询并完成轻任务。
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		if pollCount.Load() > pollsAtUpdateStart {
+			if _, ok := jobResults.Load("light-1"); ok {
+				break
+			}
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	if pollCount.Load() <= pollsAtUpdateStart {
+		t.Fatal("更新检查期间主循环未继续轮询（被阻塞）")
+	}
+	select {
+	case <-releaseUpdate:
+	default:
+		// 更新请求仍在挂起状态即证明主循环没有被更新检查拖住。
+	}
+	if _, ok := jobResults.Load("light-1"); !ok {
+		t.Fatal("更新检查期间主循环未能领取并执行轻任务")
+	}
+
+	cancel()
+	select {
+	case <-done:
+	case <-time.After(10 * time.Second):
+		t.Fatal("主循环未能及时退出")
+	}
+	release()
+}
+
+// TestStartAutoUpdateNoReentry 验证自动更新检查不会并发重入。
+func TestStartAutoUpdateNoReentry(t *testing.T) {
+	var calls atomic.Int32
+	block := make(chan struct{})
+	var once sync.Once
+	release := func() { once.Do(func() { close(block) }) }
+	defer release()
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		calls.Add(1)
+		<-block
+		w.WriteHeader(http.StatusNotFound)
+	}))
+	defer srv.Close()
+	defer release()
+
+	u := updater.New(updater.Config{
+		CurrentVersion: "v1.0.0",
+		Repo:           "owner/repo",
+		Platform:       "linux",
+		Arch:           "amd64",
+		Client: &http.Client{
+			Timeout: 30 * time.Second,
+			CheckRedirect: func(*http.Request, []*http.Request) error {
+				return http.ErrUseLastResponse
+			},
+		},
+		DownloadClient: srv.Client(),
+	})
+	u.LatestURLFunc = func() string { return srv.URL }
+	u.APIURLFunc = func() string { return srv.URL + "/api" }
+
+	cfg := &config.Config{AutoUpdate: true}
+	a := &Agent{cfg: cfg, logger: testLogger{t}, update: u, client: client.New(&config.Config{
+		BotURL: "http://127.0.0.1:1",
+		Tokens: &config.TokenSource{Value: "tok"},
+	})}
+	skipDependencyCheck(a)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	t.Cleanup(func() {
+		cancel()
+		a.tasksWG.Wait()
+	})
+	defer cancel()
+	for i := 0; i < 5; i++ {
+		a.startAutoUpdate(ctx)
+	}
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) && calls.Load() == 0 {
+		time.Sleep(20 * time.Millisecond)
+	}
+	if calls.Load() == 0 {
+		t.Fatal("自动更新检查未发出请求")
+	}
+	// 挂起期间重复调用不得叠加出第二批请求（之前尚未结束）。
+	time.Sleep(100 * time.Millisecond)
+	if got := calls.Load(); got > 2 {
+		t.Fatalf("自动更新检查发生重入：请求数 %d", got)
+	}
+
+	// 释放并等待本轮结束，确认 updateBusy 复位后还能再次启动。
+	release()
+	deadline = time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) && a.updateBusy.Load() {
+		time.Sleep(10 * time.Millisecond)
+	}
+	if a.updateBusy.Load() {
+		t.Fatal("updateBusy 未复位")
+	}
+	a.startAutoUpdate(ctx)
+	deadline = time.Now().Add(2 * time.Second)
+	before := calls.Load()
+	for time.Now().Before(deadline) && calls.Load() == before {
+		time.Sleep(10 * time.Millisecond)
+	}
+	if calls.Load() == before {
+		t.Fatal("updateBusy 复位后未能重新启动检查")
+	}
+	cancel()
+	a.tasksWG.Wait()
+}
+

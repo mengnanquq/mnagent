@@ -113,12 +113,12 @@ func TestUpdaterCheck(t *testing.T) {
 
 	// 1) 当前版本等于最新 → 无更新。
 	u.CurrentVersion = "v0.1.8"
-	if _, ok, err := u.Check(); err != nil || ok {
+	if _, ok, err := u.Check(context.Background()); err != nil || ok {
 		t.Fatalf("同版本应无更新: ok=%v err=%v", ok, err)
 	}
 	// 2) 旧版本 → 有更新。
 	u.CurrentVersion = "v0.1.7"
-	latest, ok, err := u.Check()
+	latest, ok, err := u.Check(context.Background())
 	if err != nil || !ok || latest != "v0.1.8" {
 		t.Fatalf("旧版本应提示更新: latest=%q ok=%v err=%v", latest, ok, err)
 	}
@@ -126,7 +126,7 @@ func TestUpdaterCheck(t *testing.T) {
 	if err := u.Skip("v0.1.8", 0); err != nil {
 		t.Fatal(err)
 	}
-	if _, ok, _ := u.Check(); ok {
+	if _, ok, _ := u.Check(context.Background()); ok {
 		t.Fatal("跳过版本后不应再提示更新")
 	}
 }
@@ -178,7 +178,7 @@ func TestUpdaterApply(t *testing.T) {
 		return base + "/releases/download/" + version + "/" + u.AssetName() + ".sha256"
 	}
 
-	if err := u.Apply("v0.1.8"); err != nil {
+	if err := u.Apply(context.Background(), "v0.1.8"); err != nil {
 		t.Fatal(err)
 	}
 	if !restarted.Load() {
@@ -225,7 +225,7 @@ func TestUpdaterCheckHTTP(t *testing.T) {
 		return base + "/releases/download/" + version + "/" + u.AssetName()
 	}
 
-	latest, ok, err := u.Check()
+	latest, ok, err := u.Check(context.Background())
 	if err != nil || !ok || latest != "v0.1.9" {
 		t.Fatalf("Check = (%q, %v, %v)", latest, ok, err)
 	}
@@ -342,7 +342,7 @@ func TestUpdaterCheckWithAPIFallback(t *testing.T) {
 		return ts.URL + "/api/latest"
 	}
 
-	latest, ok, err := u.Check()
+	latest, ok, err := u.Check(context.Background())
 	if err != nil {
 		t.Fatalf("Check 失败: %v", err)
 	}
@@ -513,13 +513,13 @@ func TestUpdaterSHA256ChecksumVerification(t *testing.T) {
 	}
 
 	// 1. 正确 Hash -> 正常替换
-	if err := u.Apply("v0.1.1"); err != nil {
+	if err := u.Apply(context.Background(), "v0.1.1"); err != nil {
 		t.Fatalf("匹配正确 Hash 应成功，但报错: %v", err)
 	}
 
 	// 2. 篡改 Hash -> 拦截报错
 	serveMismatched.Store(true)
-	if err := u.Apply("v0.1.2"); err == nil || !strings.Contains(err.Error(), "完整性校验失败") {
+	if err := u.Apply(context.Background(), "v0.1.2"); err == nil || !strings.Contains(err.Error(), "完整性校验失败") {
 		t.Fatalf("篡改 Hash 期望拦截报错，实际 got err: %v", err)
 	}
 }
@@ -543,7 +543,7 @@ func TestUpdaterChecksumFetchFailureAborts(t *testing.T) {
 	u.URLForFunc = func(version string) string { return ts.URL + "/d/" + version + "/" + u.AssetName() }
 	u.ChecksumURLFunc = func(version string) string { return ts.URL + "/d/" + version + "/" + u.AssetName() + ".sha256" }
 
-	if err := u.Apply("v0.1.1"); err == nil || !strings.Contains(err.Error(), "校验值") {
+	if err := u.Apply(context.Background(), "v0.1.1"); err == nil || !strings.Contains(err.Error(), "校验值") {
 		t.Fatalf("校验文件 502 时应中止更新，实际 err=%v", err)
 	}
 	if got, _ := os.ReadFile(exe); string(got) != "old-bin" {
@@ -553,7 +553,7 @@ func TestUpdaterChecksumFetchFailureAborts(t *testing.T) {
 		if ValidReleaseTag(bad) {
 			t.Fatalf("%q 不应被视为合法版本号", bad)
 		}
-		if err := u.Apply(bad); err == nil {
+		if err := u.Apply(context.Background(), bad); err == nil {
 			t.Fatalf("非法版本号 %q 应被拒绝", bad)
 		}
 	}
@@ -602,7 +602,7 @@ func TestUpdaterChecksumMissingOrInvalidAborts(t *testing.T) {
 			u.URLForFunc = func(version string) string { return ts.URL + "/d/" + version + "/" + u.AssetName() }
 			u.ChecksumURLFunc = func(version string) string { return ts.URL + "/d/" + version + "/" + u.AssetName() + ".sha256" }
 
-			err := u.Apply("v0.1.1")
+			err := u.Apply(context.Background(), "v0.1.1")
 			if err == nil || !strings.Contains(err.Error(), tc.wantErr) {
 				t.Fatalf("期望错误包含 %q，实际 err=%v", tc.wantErr, err)
 			}
@@ -620,13 +620,13 @@ func TestVerifyDownloadedBinary(t *testing.T) {
 	if err := os.WriteFile(okPath, []byte("#!/bin/sh\necho \"mnagent v1.2.3 (linux/amd64, go1.26.0)\"\n"), 0o755); err != nil {
 		t.Fatal(err)
 	}
-	if err := verifyDownloadedBinary(okPath, "v1.2.3"); err != nil {
+	if err := verifyDownloadedBinary(context.Background(), okPath, "v1.2.3"); err != nil {
 		t.Fatalf("版本一致应通过: %v", err)
 	}
-	if err := verifyDownloadedBinary(okPath, "1.2.3"); err != nil {
+	if err := verifyDownloadedBinary(context.Background(), okPath, "1.2.3"); err != nil {
 		t.Fatalf("忽略 v 前缀后应通过: %v", err)
 	}
-	if err := verifyDownloadedBinary(okPath, "v1.2.4"); err == nil || !strings.Contains(err.Error(), "版本不匹配") {
+	if err := verifyDownloadedBinary(context.Background(), okPath, "v1.2.4"); err == nil || !strings.Contains(err.Error(), "版本不匹配") {
 		t.Fatalf("版本不一致应拒绝，实际 err=%v", err)
 	}
 
@@ -634,7 +634,7 @@ func TestVerifyDownloadedBinary(t *testing.T) {
 	if err := os.WriteFile(badPath, []byte("not-an-executable"), 0o755); err != nil {
 		t.Fatal(err)
 	}
-	if err := verifyDownloadedBinary(badPath, "v1.2.3"); err == nil {
+	if err := verifyDownloadedBinary(context.Background(), badPath, "v1.2.3"); err == nil {
 		t.Fatal("不可执行文件应被拒绝")
 	}
 }
@@ -662,7 +662,7 @@ func TestDownloadAndReplaceRejectsBadBinary(t *testing.T) {
 	u.URLForFunc = func(version string) string { return ts.URL + "/d/" + version + "/" + u.AssetName() }
 	u.ChecksumURLFunc = func(version string) string { return ts.URL + "/d/" + version + "/" + u.AssetName() + ".sha256" }
 
-	err := u.Apply("v0.1.1")
+	err := u.Apply(context.Background(), "v0.1.1")
 	if err == nil || !strings.Contains(err.Error(), "自检失败") {
 		t.Fatalf("二进制版本不符应中止替换，实际 err=%v", err)
 	}
@@ -823,9 +823,9 @@ func TestUpdaterProxyFetchesChecksumDirect(t *testing.T) {
 		GHProxy:        "https://gh-proxy.example/",
 		DownloadClient: newRewriteClient(direct, proxy),
 	})
-	u.verifyBinary = func(string, string) error { return nil }
+	u.verifyBinary = func(context.Context, string, string) error { return nil }
 
-	if _, err := u.DownloadAndReplace("v0.1.8"); err != nil {
+	if _, err := u.DownloadAndReplace(context.Background(), "v0.1.8"); err != nil {
 		t.Fatalf("校验文件直连、二进制走代理时应允许更新: %v", err)
 	}
 	if got := directChecksumHits.Load(); got != 1 {
@@ -888,9 +888,9 @@ func TestUpdaterProxyDirectChecksumFailureFailsClosed(t *testing.T) {
 		GHProxy:        "https://gh-proxy.example/",
 		DownloadClient: newRewriteClient(direct, proxy),
 	})
-	u.verifyBinary = func(string, string) error { return nil }
+	u.verifyBinary = func(context.Context, string, string) error { return nil }
 
-	_, err := u.DownloadAndReplace("v0.1.8")
+	_, err := u.DownloadAndReplace(context.Background(), "v0.1.8")
 	if err == nil {
 		t.Fatal("直连获取校验文件失败时应拒绝更新")
 	}
@@ -933,10 +933,10 @@ func TestUpdaterDirectChecksumTimeoutFailsClosed(t *testing.T) {
 		DownloadClient: &http.Client{Transport: transport, Timeout: 5 * time.Second},
 	})
 	u.checksumTimeout = 50 * time.Millisecond
-	u.verifyBinary = func(string, string) error { return nil }
+	u.verifyBinary = func(context.Context, string, string) error { return nil }
 
 	start := time.Now()
-	_, err := u.DownloadAndReplace("v0.1.8")
+	_, err := u.DownloadAndReplace(context.Background(), "v0.1.8")
 	elapsed := time.Since(start)
 	if err == nil {
 		t.Fatal("直连获取校验文件超时时应拒绝更新")
@@ -1019,9 +1019,9 @@ func TestUpdaterNoProxyWarnsSHA256Only(t *testing.T) {
 	})
 	u.URLForFunc = func(version string) string { return ts.URL + "/d/" + version + "/" + u.AssetName() }
 	u.ChecksumURLFunc = func(version string) string { return ts.URL + "/d/" + version + "/" + u.AssetName() + ".sha256" }
-	u.verifyBinary = func(string, string) error { return nil }
+	u.verifyBinary = func(context.Context, string, string) error { return nil }
 
-	if _, err := u.DownloadAndReplace("v0.1.8"); err != nil {
+	if _, err := u.DownloadAndReplace(context.Background(), "v0.1.8"); err != nil {
 		t.Fatalf("无代理时应允许更新: %v", err)
 	}
 	warnings := logger.snapshot()
@@ -1063,9 +1063,9 @@ func TestDownloadAndReplaceRejectsOversizedBinary(t *testing.T) {
 	})
 	u.URLForFunc = func(version string) string { return ts.URL + "/d/" + version + "/" + u.AssetName() }
 	u.ChecksumURLFunc = func(version string) string { return ts.URL + "/d/" + version + "/" + u.AssetName() + ".sha256" }
-	u.verifyBinary = func(string, string) error { return nil }
+	u.verifyBinary = func(context.Context, string, string) error { return nil }
 
-	if _, err := u.DownloadAndReplace("v0.1.8"); err == nil || !strings.Contains(err.Error(), "上限") {
+	if _, err := u.DownloadAndReplace(context.Background(), "v0.1.8"); err == nil || !strings.Contains(err.Error(), "上限") {
 		t.Fatalf("超过体积上限应中止更新，实际 err=%v", err)
 	}
 	if got, _ := os.ReadFile(exe); string(got) != "old-bin" {
@@ -1124,7 +1124,7 @@ func TestUpdaterCheckAllowsProxy(t *testing.T) {
 		SkipFile:   filepath.Join(t.TempDir(), "skip"),
 	})
 
-	latest, ok, err := u.Check()
+	latest, ok, err := u.Check(context.Background())
 	if err != nil || !ok || latest != "v0.1.8" {
 		t.Fatalf("代理配置下 Check 应正常返回版本: latest=%q ok=%v err=%v", latest, ok, err)
 	}
@@ -1155,5 +1155,124 @@ func TestSkipTightensExistingStateDir(t *testing.T) {
 	}
 	if perm := fi.Mode().Perm(); perm != 0o700 {
 		t.Fatalf("已存在的状态目录权限 = %04o，期望收紧到 0700", perm)
+	}
+}
+
+// TestUpdaterSerializesConcurrentReplacement 验证 Apply/DownloadAndReplace 互斥：
+// 并发调用时二进制不会被同时下载/替换。
+func TestUpdaterSerializesConcurrentReplacement(t *testing.T) {
+	bin := []byte("#!/bin/sh\necho \"mnagent v0.1.8 (linux/amd64, go1.26.0)\"\n")
+	for len(bin) < 2048 {
+		bin = append(bin, '#', '\n')
+	}
+	inner := &fakeReleaseServer{version: "v0.1.8", body: bin}
+	var active, maxActive atomic.Int64
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if strings.HasSuffix(r.URL.Path, "/mnagent_linux_amd64") {
+			cur := active.Add(1)
+			for {
+				old := maxActive.Load()
+				if cur <= old || maxActive.CompareAndSwap(old, cur) {
+					break
+				}
+			}
+			defer active.Add(-1)
+			time.Sleep(50 * time.Millisecond)
+		}
+		inner.ServeHTTP(w, r)
+	}))
+	defer ts.Close()
+
+	exe := filepath.Join(t.TempDir(), "mnagent")
+	if err := os.WriteFile(exe, []byte("old-binary"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	u := New(Config{
+		CurrentVersion: "v0.1.7",
+		Repo:           "owner/repo",
+		Platform:       "linux",
+		Arch:           "amd64",
+		DownloadClient: &http.Client{Timeout: 5 * time.Second},
+		Executable:     exe,
+		SkipFile:       filepath.Join(t.TempDir(), "skip"),
+	})
+	u.URLForFunc = func(string) string { return ts.URL + "/releases/download/v0.1.8/" + u.AssetName() }
+	u.ChecksumURLFunc = func(string) string { return ts.URL + "/releases/download/v0.1.8/" + u.AssetName() + ".sha256" }
+	u.verifyBinary = func(context.Context, string, string) error { return nil }
+
+	start := make(chan struct{})
+	errs := make([]error, 2)
+	var wg sync.WaitGroup
+	for i := range errs {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			<-start
+			_, errs[i] = u.DownloadAndReplace(context.Background(), "v0.1.8")
+		}(i)
+	}
+	close(start)
+	wg.Wait()
+	for i, err := range errs {
+		if err != nil {
+			t.Fatalf("并发更新 %d 失败：%v", i, err)
+		}
+	}
+	if got := maxActive.Load(); got != 1 {
+		t.Fatalf("并发替换未串行化：同时下载数峰值 = %d", got)
+	}
+	if got, _ := os.ReadFile(exe); string(got) != string(bin) {
+		t.Fatalf("替换后的内容不一致")
+	}
+}
+
+// TestCleanupOldExecutablesRemovesStaleUpdateFiles 验证启动清理只删除超过阈值、
+// 匹配 mnagent-upd- 前缀的普通文件，不误删新文件、无关文件或目录。
+func TestCleanupOldExecutablesRemovesStaleUpdateFiles(t *testing.T) {
+	progDir := t.TempDir()
+	tmpDir := t.TempDir()
+	t.Setenv("TMPDIR", tmpDir)
+	t.Setenv("TEMP", tmpDir)
+	t.Setenv("TMP", tmpDir)
+	old := time.Now().Add(-2 * staleUpdateFileAge)
+
+	writeFile := func(path string, mode os.FileMode) {
+		t.Helper()
+		if err := os.WriteFile(path, []byte("x"), mode); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Chtimes(path, old, old); err != nil {
+			t.Fatal(err)
+		}
+	}
+	staleProg := filepath.Join(progDir, "mnagent-upd-stale")
+	staleTmp := filepath.Join(tmpDir, "mnagent-upd-stale")
+	freshProg := filepath.Join(progDir, "mnagent-upd-fresh")
+	unrelated := filepath.Join(progDir, "other-file")
+	oldDir := filepath.Join(progDir, "mnagent-upd-dir")
+	writeFile(staleProg, 0o600)
+	writeFile(staleTmp, 0o600)
+	writeFile(unrelated, 0o600)
+	if err := os.WriteFile(freshProg, []byte("x"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Mkdir(oldDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chtimes(oldDir, old, old); err != nil {
+		t.Fatal(err)
+	}
+
+	CleanupOldExecutables(filepath.Join(progDir, "mnagent"))
+
+	for _, removed := range []string{staleProg, staleTmp} {
+		if _, err := os.Stat(removed); !os.IsNotExist(err) {
+			t.Fatalf("过期临时文件应被清理：%s (err=%v)", removed, err)
+		}
+	}
+	for _, kept := range []string{freshProg, unrelated, oldDir} {
+		if _, err := os.Stat(kept); err != nil {
+			t.Fatalf("不应删除 %s：%v", kept, err)
+		}
 	}
 }

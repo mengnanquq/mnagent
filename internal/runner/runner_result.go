@@ -46,6 +46,24 @@ func (a *Agent) setStopContext(ctx context.Context) {
 	a.stopMu.Unlock()
 }
 
+// setLoopCancel 记录主循环上下文的取消函数，供自动更新协程在替换完二进制后
+// 请求主循环退出（不能在协程里直接 os.Exit，否则会丢掉退出阶段的未执行任务回报）。
+func (a *Agent) setLoopCancel(cancel context.CancelFunc) {
+	a.stopMu.Lock()
+	a.loopCancel = cancel
+	a.stopMu.Unlock()
+}
+
+// cancelLoop 取消主循环上下文，让 Loop 走正常退出流程，由服务管理器拉起新版本。
+func (a *Agent) cancelLoop() {
+	a.stopMu.RLock()
+	cancel := a.loopCancel
+	a.stopMu.RUnlock()
+	if cancel != nil {
+		cancel()
+	}
+}
+
 // stopContext 返回退出阶段的共享预算；未进入退出流程时返回 Background。
 func (a *Agent) stopContext() context.Context {
 	a.stopMu.RLock()
@@ -58,6 +76,9 @@ func (a *Agent) stopContext() context.Context {
 }
 
 // waitTasks 等待在途任务结束；ctx 到期后放弃等待，避免退出被卡死。
+// 注意：ctx 到期后这个等待协程会留到 WaitGroup 归零才退出（协程里无法中断
+// WaitGroup.Wait）。这是有意接受的：在途任务都受 ctx 取消约束，会很快结束，
+// 因此最多短暂滞留一个协程，换来的是退出流程绝不被卡死。
 func (a *Agent) waitTasks(ctx context.Context) {
 	done := make(chan struct{})
 	go func() {

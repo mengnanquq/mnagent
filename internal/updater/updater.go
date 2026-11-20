@@ -20,6 +20,7 @@ import (
 	"runtime"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/mengnanquq/mnagent/internal/statedir"
@@ -34,7 +35,10 @@ const (
 	// DefaultChecksumTimeout 是获取 .sha256 校验文件的独立短超时：
 	// 校验文件很小，不应沿用 5 分钟的二进制下载超时，避免离线/被墙时长时间挂起。
 	DefaultChecksumTimeout = 30 * time.Second
-	minBinaryBytes         = 1024 // 校验下载内容不是 404 HTML 或空文件。
+	// DefaultVersionQueryTimeout 是版本查询（含 GitHub API 兜底）的独立短超时：
+	// 版本查询只决定“是否有新版本”，卡住时不应让更新流程（乃至调用方）长时间等待。
+	DefaultVersionQueryTimeout = 20 * time.Second
+	minBinaryBytes             = 1024 // 校验下载内容不是 404 HTML 或空文件。
 )
 
 // maxBinaryBytes 限制单次更新下载的二进制体积（128MB）。
@@ -226,12 +230,16 @@ type Updater struct {
 
 	// verifyBinary 在替换前执行下载的临时文件，确认其可运行且版本匹配。
 	// 测试可注入空实现；生产环境使用 verifyDownloadedBinary。
-	verifyBinary func(path, version string) error
+	verifyBinary func(ctx context.Context, path, version string) error
 
 	logger Logger
 
 	// checksumTimeout 仅用于测试缩短校验文件请求超时；0 表示 DefaultChecksumTimeout。
 	checksumTimeout time.Duration
+
+	// applyMu 串行化 DownloadAndReplace/Apply，避免后台自动更新与远程升级
+	// 同时替换二进制或互相覆盖临时文件。
+	applyMu sync.Mutex
 }
 
 // New 创建一个新的 Updater 实例。
@@ -332,17 +340,21 @@ func (u *Updater) urlForOrFallback(version string) string {
 	return u.ProxyURL(raw)
 }
 
-func (u *Updater) latestVersionByAPI() (string, error) {
+func (u *Updater) latestVersionByAPI(ctx context.Context) (string, error) {
 	apiTarget := "https://api.github.com/repos/" + u.Repo + "/releases/latest"
 	if u.APIURLFunc != nil {
 		apiTarget = u.APIURLFunc()
 	}
 
+	// 版本查询用独立短超时：DownloadClient 的 5 分钟下载超时对一个小 JSON 响应毫无意义。
+	ctx, cancel := context.WithTimeout(ctx, DefaultVersionQueryTimeout)
+	defer cancel()
+
 	cli := u.DownloadClient
 	if cli == nil {
 		cli = &http.Client{Timeout: DefaultCheckTimeout}
 	}
-	req, err := http.NewRequest(http.MethodGet, apiTarget, nil)
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, apiTarget, nil)
 	if err != nil {
 		return "", err
 	}
@@ -372,8 +384,13 @@ func (u *Updater) latestVersionByAPI() (string, error) {
 	return tag, nil
 }
 
-func (u *Updater) latestVersion() (string, string, error) {
-	req, err := http.NewRequest(http.MethodHead, u.urlForOrFallback("latest"), nil)
+func (u *Updater) latestVersion(ctx context.Context) (string, string, error) {
+	// 版本查询（重定向探测 + API 兜底）整体受一个 20s 预算约束，
+	// 避免上游不可达时代理/下载客户端的超时把调用方拖住。
+	ctx, cancel := context.WithTimeout(ctx, DefaultVersionQueryTimeout)
+	defer cancel()
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodHead, u.urlForOrFallback("latest"), nil)
 	if err != nil {
 		return "", "", err
 	}
@@ -381,7 +398,7 @@ func (u *Updater) latestVersion() (string, string, error) {
 
 	resp, err := u.Client.Do(req)
 	if err != nil {
-		if v, apiErr := u.latestVersionByAPI(); apiErr == nil {
+		if v, apiErr := u.latestVersionByAPI(ctx); apiErr == nil {
 			return v, u.urlForOrFallback(v), nil
 		}
 		return "", "", fmt.Errorf("检查最新版本失败：%w", err)
@@ -400,7 +417,7 @@ func (u *Updater) latestVersion() (string, string, error) {
 		}
 	}
 
-	if v, apiErr := u.latestVersionByAPI(); apiErr == nil {
+	if v, apiErr := u.latestVersionByAPI(ctx); apiErr == nil {
 		return v, u.urlForOrFallback(v), nil
 	}
 
@@ -411,10 +428,10 @@ func (u *Updater) latestVersion() (string, string, error) {
 }
 
 // Check 返回是否有可应用的新版本。
-func (u *Updater) Check() (string, bool, error) {
+func (u *Updater) Check(ctx context.Context) (string, bool, error) {
 	// 版本号经代理获取可以接受：它只决定“是否有新版本”，最终能否更新仍由
 	// 直连获取的 .sha256 与下载后二进制的 -version 自检兜底。
-	latest, _, err := u.latestVersion()
+	latest, _, err := u.latestVersion(ctx)
 	if err != nil {
 		return "", false, err
 	}
@@ -473,7 +490,7 @@ func (u *Updater) directChecksumHint(err error) error {
 var sha256HexPattern = regexp.MustCompile(`^[0-9a-fA-F]{64}$`)
 
 // fetchChecksumBody 下载目标资产的 sha256 校验文件原始内容。
-func (u *Updater) fetchChecksumBody(version string) ([]byte, error) {
+func (u *Updater) fetchChecksumBody(ctx context.Context, version string) ([]byte, error) {
 	targetURL := u.checksumURLFor(version)
 	// 校验文件很小，使用独立短超时；这里只绕过 gh-proxy 前缀，不修改 Transport，
 	// 默认 Transport 仍会遵循 HTTPS_PROXY/HTTP_PROXY 等宿主环境变量。
@@ -481,7 +498,7 @@ func (u *Updater) fetchChecksumBody(version string) ([]byte, error) {
 	if timeout <= 0 {
 		timeout = DefaultChecksumTimeout
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), timeout)
+	ctx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, targetURL, nil)
 	if err != nil {
@@ -559,12 +576,19 @@ func (u *Updater) parseChecksum(body []byte) (string, error) {
 }
 
 // DownloadAndReplace 下载并原子替换二进制文件，支持 SHA-256 完整性校验，返回目标版本号，但不触发重启。
-func (u *Updater) DownloadAndReplace(version string) (string, error) {
+// 同一 Updater 上的替换操作由 applyMu 串行化，防止自动更新与远程升级并发替换。
+func (u *Updater) DownloadAndReplace(ctx context.Context, version string) (string, error) {
+	u.applyMu.Lock()
+	defer u.applyMu.Unlock()
+	return u.downloadAndReplace(ctx, version)
+}
+
+func (u *Updater) downloadAndReplace(ctx context.Context, version string) (string, error) {
 	if !ValidReleaseTag(version) {
 		return "", fmt.Errorf("非法的目标版本号：%q", version)
 	}
 	// 必须拿到有效校验值：缺失、为空或格式非法都中止更新，避免校验被静默跳过。
-	checksumBody, err := u.fetchChecksumBody(version)
+	checksumBody, err := u.fetchChecksumBody(ctx, version)
 	if err != nil {
 		return "", fmt.Errorf("获取 SHA-256 校验值失败，已中止更新：%w", err)
 	}
@@ -597,7 +621,7 @@ func (u *Updater) DownloadAndReplace(version string) (string, error) {
 	hasher := sha256.New()
 	multiWriter := io.MultiWriter(tmpFile, hasher)
 
-	if err := u.downloadTo(downloadURL, multiWriter); err != nil {
+	if err := u.downloadTo(ctx, downloadURL, multiWriter); err != nil {
 		_ = tmpFile.Close()
 		return "", fmt.Errorf("下载新版本失败：%w", err)
 	}
@@ -621,7 +645,7 @@ func (u *Updater) DownloadAndReplace(version string) (string, error) {
 	// 替换前先跑一次 -version：能挡住架构不匹配、截断、损坏的二进制，
 	// 避免坏版本落盘后让 systemd/procd 进入无限重启。
 	if u.verifyBinary != nil {
-		if err := u.verifyBinary(tmpPath, version); err != nil {
+		if err := u.verifyBinary(ctx, tmpPath, version); err != nil {
 			return "", fmt.Errorf("新版本二进制自检失败，已中止替换：%w", err)
 		}
 	}
@@ -641,8 +665,11 @@ func (u *Updater) Restart() error {
 }
 
 // Apply 依次执行“下载 → 原子替换 → 重启服务”。
-func (u *Updater) Apply(version string) error {
-	if _, err := u.DownloadAndReplace(version); err != nil {
+// 整个流程（包括重启）持有 applyMu，避免另一轮更新在重启前替换文件。
+func (u *Updater) Apply(ctx context.Context, version string) error {
+	u.applyMu.Lock()
+	defer u.applyMu.Unlock()
+	if _, err := u.downloadAndReplace(ctx, version); err != nil {
 		return err
 	}
 	if u.RestartFunc != nil {
@@ -653,8 +680,8 @@ func (u *Updater) Apply(version string) error {
 	return nil
 }
 
-func (u *Updater) downloadTo(targetURL string, w io.Writer) error {
-	req, err := http.NewRequest(http.MethodGet, targetURL, nil)
+func (u *Updater) downloadTo(ctx context.Context, targetURL string, w io.Writer) error {
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, targetURL, nil)
 	if err != nil {
 		return err
 	}
@@ -858,12 +885,12 @@ var binaryVersionPattern = regexp.MustCompile(`v?(\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]
 
 // verifyDownloadedBinary 执行临时二进制的 -version，确认能运行且版本号为目标版本。
 // 可拦截架构不匹配（exec format error）、下载截断与内容错误。
-func verifyDownloadedBinary(path, version string) error {
+func verifyDownloadedBinary(ctx context.Context, path, version string) error {
 	want, ok := ParseVersion(version)
 	if !ok {
 		return fmt.Errorf("目标版本号非法：%q", version)
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	ctx, cancel := context.WithTimeout(ctx, 10*time.Second)
 	defer cancel()
 	out, err := exec.CommandContext(ctx, path, "-version").CombinedOutput()
 	if ctx.Err() == context.DeadlineExceeded {
@@ -891,8 +918,43 @@ func truncateForLog(s string, n int) string {
 	return s[:n] + "..."
 }
 
-// CleanupOldExecutables 清理可执行文件周边的 .old 遗留备份文件（主要针对 Windows）。
+// staleUpdateFileAge 是清理残留更新临时文件的最小年龄：进程内已用 applyMu 串行化，
+// 这个阈值只用于避免误删另一个仍在运行的旧进程刚创建的临时文件。
+const staleUpdateFileAge = time.Hour
+
+// cleanupStaleUpdateFiles 删除 dir 下超过 staleUpdateFileAge 的 mnagent-upd-* 普通文件，
+// 不跟随符号链接、不递归、不删除目录。
+func cleanupStaleUpdateFiles(dir string) {
+	if dir == "" {
+		return
+	}
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		return
+	}
+	for _, entry := range entries {
+		if !strings.HasPrefix(entry.Name(), "mnagent-upd-") {
+			continue
+		}
+		info, err := entry.Info()
+		if err != nil || !info.Mode().IsRegular() {
+			continue
+		}
+		if time.Since(info.ModTime()) < staleUpdateFileAge {
+			continue
+		}
+		_ = os.Remove(filepath.Join(dir, entry.Name()))
+	}
+}
+
+// CleanupOldExecutables 清理可执行文件周边的 .old 遗留备份文件（主要针对 Windows），
+// 以及程序目录/系统临时目录中残留的 mnagent-upd-* 更新临时文件。
 func CleanupOldExecutables(targetPath string) {
+	if targetPath != "" {
+		cleanupStaleUpdateFiles(filepath.Dir(targetPath))
+	}
+	// 旧版本或异常退出可能在系统临时目录留下更新文件；只清匹配前缀且超过阈值的普通文件。
+	cleanupStaleUpdateFiles(os.TempDir())
 	if runtime.GOOS != "windows" || targetPath == "" {
 		return
 	}
@@ -924,6 +986,6 @@ func ApplyGHProxy(rawURL, ghProxy string) string {
 }
 
 // LatestVersion 返回最新版本号及下载地址。
-func (u *Updater) LatestVersion() (string, string, error) {
-	return u.latestVersion()
+func (u *Updater) LatestVersion(ctx context.Context) (string, string, error) {
+	return u.latestVersion(ctx)
 }

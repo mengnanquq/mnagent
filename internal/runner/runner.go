@@ -347,6 +347,17 @@ type Agent struct {
 	stopMu  sync.RWMutex
 	stopCtx context.Context
 
+	// loopCancel 取消主循环上下文：自动更新协程在替换完二进制后用它
+	// 请求主循环走正常退出流程（由服务管理器拉起新版本）。
+	loopCancel context.CancelFunc
+	// updateBusy 防止自动更新检查在上一次尚未结束时重复启动。
+	updateBusy atomic.Bool
+	// updateMu 串行化自动更新与远程升级，避免二者并发替换二进制并互相覆盖 SetPaused 状态。
+	updateMu sync.Mutex
+	// depManagerFactory 可选：创建依赖检查用的管理器。测试可注入本地端点，
+	// 或返回 nil 跳过依赖检查，避免访问真实 GitHub；零值时使用默认实现。
+	depManagerFactory dependencyManagerFactory
+
 	dedupOnce sync.Once
 	dedup     *jobDedup
 
@@ -365,9 +376,10 @@ func (a *Agent) Loop(ctx context.Context) error {
 	// 主循环返回（包括自更新重启路径）时主动取消内部协程，确保 heavyWorker/
 	// 心跳不会继续运行，也避免退出阶段白等 40s 在途任务。
 	ctx, cancel := context.WithCancel(ctx)
+	a.setLoopCancel(cancel)
 	defer func() {
 		// 退出/重启时的所有网络写操作共享同一个 60s 停止预算，必须明显小于
-		// systemd 的 TimeoutStopSec=90s，否则服务会在回传途中被 SIGKILL。
+		// systemd 的 TimeoutStopSec=80s，否则服务会在回传途中被 SIGKILL。
 		stopCtx, cancel := context.WithTimeout(context.Background(), config.DefaultExitResultTimeout)
 		defer cancel()
 		a.setStopContext(stopCtx)
@@ -410,12 +422,12 @@ func (a *Agent) Loop(ctx context.Context) error {
 			return nil
 		}
 		if a.update != nil && a.cfg.AutoUpdate && time.Now().After(nextCheck) {
-			if a.updateOnce(ctx) {
-				return nil // 已应用更新并重启：进程即将被替换。
-			}
 			// 加入抖动，避免多个部署实例在完全相同的时间并发请求。
 			jitter := time.Duration(rand.Int64N(int64(updater.DefaultJitter)))
 			nextCheck = time.Now().Add(a.cfg.UpdateInterval + jitter)
+			// 自动更新检查/下载是耗时网络操作（GitHub 不可达时可能拖到数十秒），
+			// 绝不能占用主循环：放到独立协程执行，本轮长轮询立即继续。
+			a.startAutoUpdate(ctx)
 		}
 		job, err := a.client.Poll(ctx)
 		if err != nil {

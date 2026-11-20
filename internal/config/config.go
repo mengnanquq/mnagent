@@ -28,8 +28,9 @@ const (
 	DefaultResultTimeout = 4 * time.Minute
 	// 一次结果回传（含重试）的整体预算：3 次 × 单次超时不再无限累加。
 	DefaultResultTotalTimeout = 6 * time.Minute
-	// 退出/重启时的回报预算：必须明显小于 systemd 的 TimeoutStopSec=90s，
-	// 否则服务会在等待旧进程回报时被 SIGKILL，反而丢结果。
+	// 退出/重启时的回报预算：必须明显小于 systemd 的 TimeoutStopSec=80s
+	// （见 install.sh / deploy/mnagent.service），否则服务会在等待旧进程回报时
+	// 被 SIGKILL，反而丢结果。
 	DefaultExitResultTimeout = 60 * time.Second
 )
 

@@ -59,7 +59,7 @@ func HandleUpdateCLI(cfg *config.Config, log Logger) (handled bool, err error) {
 		fmt.Printf("已跳过版本 %s（24 小时内不再提示）\n", ver)
 		return true, nil
 	case cfg.CheckUpdateOnce:
-		latest, ok, err := u.Check()
+		latest, ok, err := u.Check(context.Background())
 		if err != nil {
 			return true, err
 		}
@@ -77,7 +77,7 @@ func HandleUpdateCLI(cfg *config.Config, log Logger) (handled bool, err error) {
 	case cfg.ApplyUpdate != "":
 		ver := cfg.ApplyUpdate
 		if ver == "latest" {
-			l, _, err := u.LatestVersion()
+			l, _, err := u.LatestVersion(context.Background())
 			if err != nil {
 				return true, err
 			}
@@ -101,7 +101,7 @@ func HandleUpdateCLI(cfg *config.Config, log Logger) (handled bool, err error) {
 		}
 
 		fmt.Printf("正在下载并安装 %s ...\n", ver)
-		if err := u.Apply(ver); err != nil {
+		if err := u.Apply(context.Background(), ver); err != nil {
 			return true, err
 		}
 		fmt.Printf("已安装 %s，服务已重启\n", ver)
@@ -110,12 +110,31 @@ func HandleUpdateCLI(cfg *config.Config, log Logger) (handled bool, err error) {
 	return false, nil
 }
 
+// dependencyManagerFactory 创建依赖管理器。测试可替换为指向本地 httptest 服务的实现，
+// 返回 nil 表示跳过依赖检查；生产环境始终使用 dep.NewDependencyManager。
+type dependencyManagerFactory func(ghProxy string) *dep.DependencyManager
+
+// newDependencyManager 返回依赖检查使用的管理器；未注入工厂时保持默认行为。
+func (a *Agent) newDependencyManager() *dep.DependencyManager {
+	ghProxy := ""
+	if a.cfg != nil {
+		ghProxy = a.cfg.GHProxy
+	}
+	if a.depManagerFactory != nil {
+		return a.depManagerFactory(ghProxy)
+	}
+	return dep.NewDependencyManager(ghProxy)
+}
+
 // checkAndUpdateDependencies 检查各依赖项（如 nexttrace、miaospeed）版本，若启用 autoUpdate 则自动更新。
 func (a *Agent) checkAndUpdateDependencies(ctx context.Context) {
 	if a.cfg == nil {
 		return
 	}
-	dm := dep.NewDependencyManager(a.cfg.GHProxy)
+	dm := a.newDependencyManager()
+	if dm == nil {
+		return
+	}
 	statuses := dm.CheckAll(ctx, a.cfg.Binary, a.cfg.MiaospeedBinary)
 	for _, st := range statuses {
 		if st.Error != nil {
@@ -141,15 +160,39 @@ func (a *Agent) checkAndUpdateDependencies(ctx context.Context) {
 	}
 }
 
+// startAutoUpdate 在独立协程中执行一次自动更新检查。
+// 版本查询与下载都是耗时网络操作（GitHub 不可达时可能数十秒），放在主循环里会阻塞
+// 长轮询与轻任务；updateBusy 保证同一时刻只有一轮检查/更新在跑，不会重入。
+func (a *Agent) startAutoUpdate(ctx context.Context) {
+	if a.update == nil {
+		return
+	}
+	if !a.updateBusy.CompareAndSwap(false, true) {
+		a.logger.Debug("上一轮自动更新检查尚未结束，跳过本轮")
+		return
+	}
+	a.tasksWG.Add(1)
+	go func() {
+		defer a.tasksWG.Done()
+		defer a.updateBusy.Store(false)
+		if a.updateOnce(ctx) {
+			a.logger.Info("更新已应用，请求主循环退出以完成重启", "version", Version)
+			a.cancelLoop()
+		}
+	}()
+}
+
 // updateOnce 执行一次自动更新检查；返回 true 表示已应用更新（进程将被重启）。
 func (a *Agent) updateOnce(ctx context.Context) bool {
+	a.updateMu.Lock()
+	defer a.updateMu.Unlock()
 	// 无论 mnagent 自身是否有更新，先检查并更新依赖项
 	a.checkAndUpdateDependencies(ctx)
 
 	if a.update == nil {
 		return false
 	}
-	latest, ok, err := a.update.Check()
+	latest, ok, err := a.update.Check(ctx)
 	if err != nil {
 		a.logger.Warn("检查更新失败", "error", err)
 		return false
@@ -160,7 +203,7 @@ func (a *Agent) updateOnce(ctx context.Context) bool {
 	a.logger.Info("发现新版本，开始更新", "from", Version, "to", latest)
 	a.client.SetPaused(true) // 更新期间暂停轮询，避免新旧版本交替领取任务。
 	defer a.client.SetPaused(false)
-	if err := a.update.Apply(latest); err != nil {
+	if err := a.update.Apply(ctx, latest); err != nil {
 		a.logger.Warn("应用更新失败", "Version", latest, "error", err)
 		return false
 	}
@@ -192,28 +235,31 @@ func evaluateRemoteTarget(current, target string, allowDowngrade bool) (noop boo
 
 // handleUpgradeJob 处理来自机器人的远程更新指令。
 func (a *Agent) handleUpgradeJob(ctx context.Context, job model.Job) {
+	a.updateMu.Lock()
+	defer a.updateMu.Unlock()
 	a.logger.Info("收到远程更新指令，开始处理", "job", job.ID, "current_version", Version, "target", job.Target)
 
 	var depNotes []string
 	if a.cfg != nil {
-		dm := dep.NewDependencyManager(a.cfg.GHProxy)
-		statuses := dm.CheckAll(ctx, a.cfg.Binary, a.cfg.MiaospeedBinary)
-		for _, st := range statuses {
-			if st.Error != nil {
-				depNotes = append(depNotes, fmt.Sprintf("• 依赖 %s 检查失败：%v", st.Name, st.Error))
-				continue
-			}
-			if !st.Installed {
-				continue
-			}
-			if st.HasUpdate {
-				if _, err := dm.UpdateDependency(ctx, st.Name, st.BinaryPath, st.LatestVersion, a.logger); err != nil {
-					depNotes = append(depNotes, fmt.Sprintf("• 依赖 %s 更新至 %s 失败：%v", st.Name, st.LatestVersion, err))
-				} else {
-					depNotes = append(depNotes, fmt.Sprintf("• 依赖 %s 已成功更新至 %s", st.Name, st.LatestVersion))
+		if dm := a.newDependencyManager(); dm != nil {
+			statuses := dm.CheckAll(ctx, a.cfg.Binary, a.cfg.MiaospeedBinary)
+			for _, st := range statuses {
+				if st.Error != nil {
+					depNotes = append(depNotes, fmt.Sprintf("• 依赖 %s 检查失败：%v", st.Name, st.Error))
+					continue
 				}
-			} else {
-				depNotes = append(depNotes, fmt.Sprintf("• 依赖 %s 已是最新版（%s）", st.Name, st.CurrentVersion))
+				if !st.Installed {
+					continue
+				}
+				if st.HasUpdate {
+					if _, err := dm.UpdateDependency(ctx, st.Name, st.BinaryPath, st.LatestVersion, a.logger); err != nil {
+						depNotes = append(depNotes, fmt.Sprintf("• 依赖 %s 更新至 %s 失败：%v", st.Name, st.LatestVersion, err))
+					} else {
+						depNotes = append(depNotes, fmt.Sprintf("• 依赖 %s 已成功更新至 %s", st.Name, st.LatestVersion))
+					}
+				} else {
+					depNotes = append(depNotes, fmt.Sprintf("• 依赖 %s 已是最新版（%s）", st.Name, st.CurrentVersion))
+				}
 			}
 		}
 	}
@@ -242,7 +288,7 @@ func (a *Agent) handleUpgradeJob(ctx context.Context, job model.Job) {
 		checkErr  error
 	)
 	if targetVer == "latest" {
-		newVer, hasUpdate, checkErr = a.update.Check()
+		newVer, hasUpdate, checkErr = a.update.Check(ctx)
 	} else {
 		allowDowngrade := a.cfg != nil && a.cfg.AllowRemoteDowngrade
 		noop, targetErr := evaluateRemoteTarget(Version, targetVer, allowDowngrade)
@@ -280,7 +326,7 @@ func (a *Agent) handleUpgradeJob(ctx context.Context, job model.Job) {
 	defer a.client.SetPaused(false)
 
 	a.logger.Info("开始下载并替换二进制", "from", Version, "to", newVer)
-	installedVer, applyErr := a.update.DownloadAndReplace(newVer)
+	installedVer, applyErr := a.update.DownloadAndReplace(ctx, newVer)
 	if applyErr != nil {
 		errMsg := fmt.Sprintf("下载或安装更新失败：%v", applyErr)
 		a.logger.Warn(errMsg, "target", newVer, "error", applyErr)
