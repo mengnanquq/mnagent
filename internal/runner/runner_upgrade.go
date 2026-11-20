@@ -2,6 +2,7 @@ package runner
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"os"
 	"strings"
@@ -13,6 +14,30 @@ import (
 	"github.com/mengnanquq/mnagent/internal/service"
 	"github.com/mengnanquq/mnagent/internal/updater"
 )
+
+// botDigestClient 构造服务端代取校验值的客户端。
+// 端点不可信（未启用 / 公网明文 HTTP）、缺少令牌或缺少 BotURL 时返回 nil，
+// 相当于退回旧版行为（只走直连校验来源）。
+func botDigestClient(cfg *config.Config) *updater.BotDigestClient {
+	if cfg == nil || !cfg.BotChecksumTrusted || cfg.Tokens == nil {
+		return nil
+	}
+	baseURL := strings.TrimSpace(cfg.BotURL)
+	if baseURL == "" {
+		return nil
+	}
+	return &updater.BotDigestClient{
+		BaseURL: baseURL,
+		Token:   cfg.Tokens,
+		Version: Version,
+	}
+}
+
+// NewBotDigestClient 返回按配置构造的服务端代取客户端，供 CLI/诊断路径
+// 为 Runner 注入与 Updater/Agent 相同的代取能力；不可信或未配置时返回 nil。
+func NewBotDigestClient(cfg *config.Config) *updater.BotDigestClient {
+	return botDigestClient(cfg)
+}
 
 func newUpdater(cfg *config.Config, log Logger) *updater.Updater {
 	exe, err := os.Executable()
@@ -28,6 +53,7 @@ func newUpdater(cfg *config.Config, log Logger) *updater.Updater {
 		Executable:     exe,
 		GHProxy:        cfg.GHProxy,
 		Logger:         log,
+		BotDigest:      botDigestClient(cfg),
 		Restart: func() error {
 			if log != nil {
 				log.Info("正在重启服务以应用新版本", "Version", Version)
@@ -69,6 +95,7 @@ func HandleUpdateCLI(cfg *config.Config, log Logger) (handled bool, err error) {
 			fmt.Printf("已是最新版本（%s）\n", Version)
 		}
 		dm := dep.NewDependencyManager(cfg.GHProxy)
+		dm.SetBotDigest(botDigestClient(cfg))
 		statuses := dm.CheckAll(context.Background(), cfg.Binary, cfg.MiaospeedBinary)
 		for _, st := range statuses {
 			fmt.Println(st.Summary())
@@ -88,6 +115,7 @@ func HandleUpdateCLI(cfg *config.Config, log Logger) (handled bool, err error) {
 
 		// 更新依赖项
 		dm := dep.NewDependencyManager(cfg.GHProxy)
+		dm.SetBotDigest(botDigestClient(cfg))
 		statuses := dm.CheckAll(context.Background(), cfg.Binary, cfg.MiaospeedBinary)
 		for _, st := range statuses {
 			if st.HasUpdate {
@@ -120,10 +148,16 @@ func (a *Agent) newDependencyManager() *dep.DependencyManager {
 	if a.cfg != nil {
 		ghProxy = a.cfg.GHProxy
 	}
+	var dm *dep.DependencyManager
 	if a.depManagerFactory != nil {
-		return a.depManagerFactory(ghProxy)
+		dm = a.depManagerFactory(ghProxy)
+	} else {
+		dm = dep.NewDependencyManager(ghProxy)
 	}
-	return dep.NewDependencyManager(ghProxy)
+	if dm != nil {
+		dm.SetBotDigest(botDigestClient(a.cfg))
+	}
+	return dm
 }
 
 // dependencyTargetPath 返回依赖的配置路径（用于缺失时自动安装）。
@@ -276,23 +310,121 @@ func evaluateRemoteTarget(current, target string, allowDowngrade bool) (noop boo
 	return false, nil
 }
 
+// 升级任务阶段预算：
+//   - 服务端默认下发 TimeoutMS=120s；任务没带该值时按 120s 计算，带值时用
+//     job.Timeout() 并夹取到 [1s, 115s]；
+//   - 预算从进入 handleUpgradeJob（任务被接收）开始计时，包含等待 updateMu 的时间；
+//     预留 5s 给结果回传。结果回传本身使用独立 ctx（sendResult 自带 result-timeout），
+//     不受 workCtx 约束，预留只是时间余量；
+//   - 依赖阶段单独限时，超时只跳过依赖，不能拖住自身更新。
+const (
+	upgradeServerDefaultTimeout = 120 * time.Second
+	upgradeResultReserve        = 5 * time.Second
+	upgradeMinWorkBudget        = time.Second
+)
+
+// upgradeDependencyPhaseTimeout 是升级任务依赖阶段的紧凑预算；其他路径（启动补齐、
+// 定期检查、运行时安装、CLI）使用 dep 包的 5 分钟宽松预算。变量便于测试缩短。
+var upgradeDependencyPhaseTimeout = 40 * time.Second
+
+// upgradeWorkBudget 计算升级自身更新可用的时间预算：
+// 优先使用服务端下发的 TimeoutMS，减去结果回传预留后夹取到合理区间；
+// 没带 TimeoutMS 时默认 120s-5s=115s。
+func upgradeWorkBudget(job model.Job) time.Duration {
+	if job.TimeoutMS <= 0 {
+		return upgradeServerDefaultTimeout - upgradeResultReserve
+	}
+	budget := job.Timeout() - upgradeResultReserve
+	if budget < upgradeMinWorkBudget {
+		budget = upgradeMinWorkBudget
+	}
+	if maxBudget := upgradeServerDefaultTimeout - upgradeResultReserve; budget > maxBudget {
+		budget = maxBudget
+	}
+	return budget
+}
+
+// acquireUpdateMu 在 ctx 结束前尝试获取更新锁。
+// ctx 先到期时返回 false；后台协程稍后拿到锁会立即释放，避免锁被“幽灵”占用。
+func (a *Agent) acquireUpdateMu(ctx context.Context) bool {
+	acquired := make(chan struct{})
+	go func() {
+		a.updateMu.Lock()
+		close(acquired)
+	}()
+	select {
+	case <-acquired:
+		return true
+	case <-ctx.Done():
+		go func() {
+			<-acquired
+			a.updateMu.Unlock()
+		}()
+		return false
+	}
+}
+
+// isCancellationError 判断错误是否由 ctx 取消/超时导致，
+// 用于在真实失败与“取消”之间选择准确的回传文案。
+func isCancellationError(err error) bool {
+	return errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded)
+}
+
+const (
+	upgradeCancelledMessage = "升级已取消；如新二进制已落盘将在下次重启生效（本次未重启服务）"
+	upgradeBusyMessage      = "节点正忙于其他更新，请稍后重试"
+)
+
 // handleUpgradeJob 处理来自机器人的远程更新指令。
 func (a *Agent) handleUpgradeJob(ctx context.Context, job model.Job) {
-	a.updateMu.Lock()
+	// 预算从进入处理函数（任务被接收）开始计时，包含等待 updateMu 的时间。
+	budget := upgradeWorkBudget(job)
+
+	// taskCtx 只反映取消（调用方退出/tracker 取消）；workCtx 额外叠加本次预算。
+	// 两者分开是为了在预算耗尽与主动取消之间给出准确文案，并避免预算耗尽阻止
+	// 已安装成功后的重启。
+	taskCtx, taskCancel := context.WithCancel(ctx)
+	defer taskCancel()
+	workCtx, workCancel := context.WithTimeout(taskCtx, budget)
+	defer workCancel()
+
+	// 注册 tracker，使远程取消可以中止正在进行的升级与等待。
+	if a.tracker != nil {
+		a.tracker.Register(job.ID, taskCancel)
+		defer a.tracker.Unregister(job.ID)
+	}
+	if err := taskCtx.Err(); err != nil {
+		a.logger.Info("升级任务在开始前已被取消", "job", job.ID, "error", err)
+		a.sendUpgradeResult(job, -1, "升级已取消，未做任何修改", err.Error())
+		return
+	}
+
+	if !a.acquireUpdateMu(workCtx) {
+		if err := taskCtx.Err(); err != nil {
+			a.logger.Info("升级任务在等待更新锁时被取消", "job", job.ID, "error", err)
+			a.sendUpgradeResult(job, -1, "升级已取消，未做任何修改", err.Error())
+			return
+		}
+		a.logger.Warn("节点正忙于其他更新，升级任务等待超过预算", "job", job.ID, "budget", budget)
+		a.sendUpgradeResult(job, -1, upgradeBusyMessage, "update lock busy")
+		return
+	}
 	defer a.updateMu.Unlock()
-	a.logger.Info("收到远程更新指令，开始处理", "job", job.ID, "current_version", Version, "target", job.Target)
+
+	a.logger.Info("收到远程更新指令，开始处理", "job", job.ID, "current_version", Version, "target", job.Target, "budget", budget)
 
 	var depNotes []string
 	if a.cfg != nil {
+		depPhaseCtx, depPhaseCancel := context.WithTimeout(workCtx, upgradeDependencyPhaseTimeout)
 		if dm := a.newDependencyManager(); dm != nil {
-			statuses := dm.CheckAll(ctx, a.cfg.Binary, a.cfg.MiaospeedBinary)
+			statuses := dm.CheckAll(depPhaseCtx, a.cfg.Binary, a.cfg.MiaospeedBinary)
 			for _, st := range statuses {
 				if !st.Installed {
 					version := st.LatestVersion
 					if version == "" {
 						version = "latest"
 					}
-					if _, err := dm.EnsureDependency(ctx, st.Name, dependencyTargetPath(a.cfg, st.Name), version, a.logger); err != nil {
+					if _, err := dm.EnsureDependencyWithin(depPhaseCtx, upgradeDependencyPhaseTimeout, st.Name, dependencyTargetPath(a.cfg, st.Name), version, a.logger); err != nil {
 						depNotes = append(depNotes, fmt.Sprintf("• 依赖 %s 自动安装失败：%v", st.Name, err))
 					} else {
 						depNotes = append(depNotes, fmt.Sprintf("• 依赖 %s 已自动安装", st.Name))
@@ -304,7 +436,7 @@ func (a *Agent) handleUpgradeJob(ctx context.Context, job model.Job) {
 					continue
 				}
 				if st.HasUpdate {
-					if _, err := dm.EnsureDependency(ctx, st.Name, st.BinaryPath, st.LatestVersion, a.logger); err != nil {
+					if _, err := dm.EnsureDependencyWithin(depPhaseCtx, upgradeDependencyPhaseTimeout, st.Name, st.BinaryPath, st.LatestVersion, a.logger); err != nil {
 						depNotes = append(depNotes, fmt.Sprintf("• 依赖 %s 更新至 %s 失败：%v", st.Name, st.LatestVersion, err))
 					} else {
 						depNotes = append(depNotes, fmt.Sprintf("• 依赖 %s 已成功更新至 %s", st.Name, st.LatestVersion))
@@ -314,10 +446,28 @@ func (a *Agent) handleUpgradeJob(ctx context.Context, job model.Job) {
 				}
 			}
 		}
+		depTimedOut := errors.Is(depPhaseCtx.Err(), context.DeadlineExceeded) && taskCtx.Err() == nil
+		depPhaseCancel()
+		if depTimedOut {
+			depNotes = append(depNotes, fmt.Sprintf("• 依赖更新超过 %s 未完成，已跳过剩余依赖并继续更新自身", upgradeDependencyPhaseTimeout))
+			a.logger.Warn("升级时依赖更新超时，跳过剩余依赖", "job", job.ID, "timeout", upgradeDependencyPhaseTimeout)
+		}
 	}
 	depSummary := strings.Join(depNotes, "\n")
 	if depSummary != "" {
 		depSummary = "\n" + depSummary
+	}
+
+	// 依赖阶段可能因取消或整体预算结束：调用方/tracker 结束时不再进入自身更新。
+	if err := taskCtx.Err(); err != nil {
+		a.logger.Info("升级任务已取消，跳过自身更新", "job", job.ID, "error", err)
+		a.sendUpgradeResult(job, -1, upgradeCancelledMessage+depSummary, err.Error())
+		return
+	}
+	if errors.Is(workCtx.Err(), context.DeadlineExceeded) {
+		a.logger.Warn("升级任务预算已用尽，跳过自身更新", "job", job.ID, "budget", budget)
+		a.sendUpgradeResult(job, -1, fmt.Sprintf("升级任务超过预算（%s），未完成自身更新%s", budget, depSummary), "upgrade budget exhausted")
+		return
 	}
 
 	if a.update == nil {
@@ -340,7 +490,7 @@ func (a *Agent) handleUpgradeJob(ctx context.Context, job model.Job) {
 		checkErr  error
 	)
 	if targetVer == "latest" {
-		newVer, hasUpdate, checkErr = a.update.Check(ctx)
+		newVer, hasUpdate, checkErr = a.update.Check(workCtx)
 	} else {
 		allowDowngrade := a.cfg != nil && a.cfg.AllowRemoteDowngrade
 		noop, targetErr := evaluateRemoteTarget(Version, targetVer, allowDowngrade)
@@ -378,11 +528,30 @@ func (a *Agent) handleUpgradeJob(ctx context.Context, job model.Job) {
 	defer a.client.SetPaused(false)
 
 	a.logger.Info("开始下载并替换二进制", "from", Version, "to", newVer)
-	installedVer, applyErr := a.update.DownloadAndReplace(ctx, newVer)
+	installedVer, applyErr := a.update.DownloadAndReplace(workCtx, newVer)
 	if applyErr != nil {
-		errMsg := fmt.Sprintf("下载或安装更新失败：%v", applyErr)
-		a.logger.Warn(errMsg, "target", newVer, "error", applyErr)
-		a.sendUpgradeResult(job, -1, errMsg+depSummary, applyErr.Error())
+		switch {
+		case taskCtx.Err() != nil && isCancellationError(applyErr):
+			// 只有确实是取消导致的失败才改写成“已取消”；
+			// 真实失败（校验不一致、替换失败等）即使同时收到取消也保留原始原因。
+			a.logger.Info("升级已取消，未重启服务", "job", job.ID, "error", taskCtx.Err())
+			a.sendUpgradeResult(job, -1, upgradeCancelledMessage+depSummary, taskCtx.Err().Error())
+		case errors.Is(workCtx.Err(), context.DeadlineExceeded):
+			errMsg := fmt.Sprintf("升级任务超过预算（%s）未完成：%v", budget, applyErr)
+			a.logger.Warn(errMsg, "job", job.ID)
+			a.sendUpgradeResult(job, -1, errMsg+depSummary, applyErr.Error())
+		default:
+			errMsg := fmt.Sprintf("下载或安装更新失败：%v", applyErr)
+			a.logger.Warn(errMsg, "target", newVer, "error", applyErr)
+			a.sendUpgradeResult(job, -1, errMsg+depSummary, applyErr.Error())
+		}
+		return
+	}
+
+	// 替换完成后、重启前再次检查取消：取消升级时不能重启服务。
+	if err := taskCtx.Err(); err != nil {
+		a.logger.Info("升级已取消，未重启服务", "job", job.ID, "error", err)
+		a.sendUpgradeResult(job, -1, upgradeCancelledMessage+depSummary, err.Error())
 		return
 	}
 
@@ -392,13 +561,24 @@ func (a *Agent) handleUpgradeJob(ctx context.Context, job model.Job) {
 	a.logger.Info("已成功更新并回传结果，即将平滑重启服务", "new_version", installedVer)
 	a.sendUpgradeResult(job, 0, strings.TrimSpace(successMsg), "")
 
-	// 重启前通知在途轻任务取消，避免直接硬杀导致任务状态丢失
+	// 重启前通知在途轻任务取消，避免直接硬杀导致任务状态丢失。
+	// 先注销自身，避免 CancelAll 把本轮升级的 context 也取消掉。
 	if a.tracker != nil {
+		a.tracker.Unregister(job.ID)
 		a.tracker.CancelAll()
 	}
 
-	// 短暂休眠确保结果数据包送出网络缓冲区，随后触发重启
-	time.Sleep(500 * time.Millisecond)
+	// 短暂休眠确保结果数据包送出网络缓冲区，随后触发重启。
+	// 只受取消影响：预算在安装成功后耗尽也应重启让新版本生效。
+	if !sleep(taskCtx, 500*time.Millisecond) {
+		a.logger.Info("升级任务在重启前被取消，未重启服务", "job", job.ID)
+		return
+	}
+	// Unregister 之后仍可能收到取消（Cancel 只记录标记）：重启前再确认一次。
+	if a.tracker != nil && a.tracker.IsCancelled(job.ID) {
+		a.logger.Info("升级任务在重启前被取消，未重启服务", "job", job.ID)
+		return
+	}
 	if err := a.update.Restart(); err != nil {
 		a.logger.Warn("服务重启失败", "error", err)
 	}
