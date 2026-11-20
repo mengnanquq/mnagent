@@ -47,33 +47,23 @@ Remove-Item Env:MNAGENT_TOKEN
 > 安装脚本从 **v0.3.102** 起随每个 Release 作为附件发布（`releases/latest/download/install.sh` 与 `install.ps1`）。更早的 Release 没有这两个附件，可改用 raw main 分支的脚本：`https://raw.githubusercontent.com/mengnanquq/mnagent/main/install.sh`（Windows 对应 `install.ps1`）。为避免令牌出现在进程 argv 与命令历史中，推荐环境变量 `MNAGENT_TOKEN`、`--token-file`（Linux）或 `-TokenFile`（Windows，需先存在令牌文件），也支持 Linux 下的 `--token-stdin`。`--token` 仅为兼容旧命令保留，使用时会打印警告。
 >
 > **网络受限 / 国内加速**：
-> 在安装参数中附加 `--gh-proxy https://gh-proxy.com/`（Windows 添加 `-GhProxy "https://gh-proxy.com/"`），脚本自身、Agent 更新以及依赖下载均会自动经由加速代理。
+> 在安装参数中附加 `--gh-proxy https://gh-proxy.com/`（Windows 添加 `-GhProxy "https://gh-proxy.com/"`），脚本自身、Agent 更新二进制以及依赖下载均会自动经由加速代理（更新所需的 `.sha256` 校验文件除外，见下）。
 >
-> **⚠️ gh-proxy 信任说明**：自更新与依赖安装会强制校验 SHA-256，但配置代理时二进制与对应的 `.sha256` 校验文件都经同一代理下载，代理运营方理论上可以同时替换两者。也就是说，**启用 gh-proxy 等同于信任该代理运营方**；在可信网络环境下建议不要配置代理，必须使用时请选择你信任的服务。
+> **⚠️ gh-proxy 信任说明**：
+> - 使用 `--gh-proxy` 安装时，二进制仍可经代理下载，但 `.sha256` 校验文件默认**不经 gh-proxy 镜像获取（仍遵循系统 `HTTPS_PROXY` 环境变量）**；获取失败会中止安装并提示。只有在确认代理可信时，才可用 `--insecure-proxy-checksum`（Windows 为 `-InsecureProxyChecksum`）允许经代理获取校验文件。
+> - Agent 自动更新在配置了 `-gh-proxy` 时，`.sha256` 校验文件会**不经 gh-proxy 镜像获取（仍遵循系统 `HTTPS_PROXY` 环境变量）**（二进制仍走代理）；获取校验文件失败即拒绝更新（fail-closed），因为代理可同时替换二进制与同源 `.sha256`。这是默认的完整性校验方式。
+> - 依赖（nexttrace/miaospeed）的 SHA-256 摘要来自直连的 `api.github.com`，不经代理；安装脚本中的依赖 `.sha256` 附件同样优先直连获取。
+> - 为避免离线/被墙时长时间挂起，安装脚本中校验文件的直连尝试限时 30 秒（`curl --connect-timeout 5 --max-time 30` / `wget --timeout=30 --tries=2`），失败提示会区分 404 与网络不可达。
 >
-> 安装脚本还支持 `--sha256 <hex>`（配合 `--binary <url>` 强制校验自定义二进制）与 `--from-source`（显式从源码编译）。Release 下载失败时脚本会直接报错，**不会**自动改为编译 main 分支。
+> **订阅拉取不使用环境代理**：miaospeed 订阅与进程内探针的 HTTP 客户端均显式设置 `Proxy: nil`，不会读取 `HTTP_PROXY` / `HTTPS_PROXY`。这是为了避免代理自行解析目标地址、绕过按解析 IP 做的 SSRF 校验；如需经代理拉取订阅，请改用服务端中转或本地自定义方案，而不是设置环境代理。
+>
+> 安装脚本还支持 `--sha256 <hex>`（配合 `--binary <url>` 强制校验自定义二进制）与 `--from-source`（显式从源码编译）。使用 `--binary <url>` 时默认必须能取得同名 `.sha256`（或显式提供 `--sha256`），否则安装会中止；只有在确认自定义来源可信且确实无法提供校验文件时，才可显式加 `--insecure-skip-verify` 跳过校验。`--from-source` 在 `--version latest`（默认）时会编译 main 分支最新代码并打印醒目警告，生产环境建议用 `--version <已发布标签>` 固定版本。Release 下载失败时脚本会直接报错，**不会**自动改为编译 main 分支。
 
 ---
 
-## 🔐 更新签名（可选，推荐）
+## 🔐 更新校验
 
-自更新默认校验 SHA-256；如果发布方希望防御“二进制与 `.sha256` 被同时替换”的攻击，可以启用 Ed25519 签名：
-
-1. 在本地生成密钥对（**不要提交私钥**）：
-   ```sh
-   go run ./scripts/gen-signing-key.go
-   # 生成 signing-private.key（0600）与 signing-public.key（0644）
-   ```
-2. 把私钥内容保存为仓库 Secret `MNAGENT_SIGNING_PRIVATE_KEY`，然后删除本地私钥文件：
-   ```sh
-   gh secret set MNAGENT_SIGNING_PRIVATE_KEY < signing-private.key
-   rm -f signing-private.key
-   ```
-3. 下一次 Release 工作流会从私钥推导公钥并：
-   - 通过 `-ldflags "-X github.com/mengnanquq/mnagent/internal/updater.SigningPublicKeyBase64=<公钥>"` 把公钥内置进所有二进制；
-   - 为每个 `<资产>.sha256` 生成 `<资产>.sha256.sig`（base64 Ed25519 签名），并额外签名统一的 `checksums.txt`。
-
-二进制**内置了公钥时强制验签**：签名缺失、校验清单被篡改或密钥不匹配都会中止更新；未内置公钥的旧版本/本地构建保持原有 SHA-256 校验行为，并在更新时打印警告。没有配置 Secret 时 Release 仍可正常发布，只是不生成 `.sig`，构建出的二进制也不会强制验签。
+所有更新与安装仅做 SHA-256 校验；配置 `gh-proxy` 时，`.sha256` 校验文件直连 `github.com` 获取（仍遵循系统 `HTTPS_PROXY` 环境变量），获取失败即拒绝更新或安装。
 
 ---
 
@@ -136,7 +126,7 @@ mnagent -apply-update latest         # 立即升级到最新版本并平滑重�
 - **miaospeed 单次响应上限 8MB**：单条 WebSocket JSON 响应超过 8MB 会直接报错并放弃，避免异常/恶意服务端把节点内存耗尽（正常 500 节点结果约 3MB）。同时累积缓冲的复用阈值降到 256KB，大缓冲交给 GC 回收。
 - **WebSocket 任务缓冲由 64 改为 16**：WS 降级模式下待执行任务队列变短，队列满时立即回报明确的失败结果，而不是阻塞长连接读循环（否则连 ping/ack 都会被拖住），常驻内存更可控。
 - **状态目录属主校验**：`/var/lib/mnagent`（Windows 为 `%ProgramData%\mnagent`）必须属于 root/SYSTEM/Administrators 或当前用户，且不允许组/其他用户写入；否则会拒绝使用并输出 `WARN` 告警，Linux 上可执行 `sudo chown root:root /var/lib/mnagent` 修复，详见下文「常见问题排查」。
-- **发布新增 `mnagent_linux_armv7` 别名**：内容与 `mnagent_linux_arm` 完全相同（并带 `.sha256` 与签名），用于线上 v0.3.102 等旧版 ARM 节点（它们按旧资产名请求），使这些节点能自动升级。等所有 ARM 节点升级完成后，该别名会在 v0.3.104 或之后移除。
+- **发布新增 `mnagent_linux_armv7` 别名**：内容与 `mnagent_linux_arm` 完全相同（并带 `.sha256`），用于线上 v0.3.102 等旧版 ARM 节点（它们按旧资产名请求），使这些节点能自动升级。等所有 ARM 节点升级完成后，该别名会在 v0.3.104 或之后移除。
 - **服务停止超时放宽**：systemd 单元新增 `TimeoutStopSec=80`、OpenWrt procd 新增 `term_timeout 70`，确保退出时能在 60s 预算内回传在途结果，不被守护进程提前强杀（重新执行安装脚本即可更新已有单元）。
 - **缓存结果重发同样受 `-result-timeout` 约束**：重复下发任务的缓存结果上传不再使用固定的 6 分钟预算，而是跟随配置的单次回传超时。
 
