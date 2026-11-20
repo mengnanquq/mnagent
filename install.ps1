@@ -35,6 +35,7 @@ param(
     [switch]$NoInstallMiaoSpeed,
     [string]$MiaoSpeedVersion = "latest",
     [switch]$InsecureProxyChecksum,
+    [switch]$AllowInsecureHttp,
     [switch]$Uninstall,
     [switch]$Help
 )
@@ -58,15 +59,54 @@ function Assert-UrlSafe([string]$value, [string]$name) {
     }
 }
 
+# 判断 IPv4 字节是否为回环/私网/链路本地（与 agent 的 IsLoopback/IsPrivate/IsLinkLocalUnicast 一致）。
+function Test-PrivateIPv4Bytes([byte[]]$b) {
+    return [bool](($b[0] -eq 127) -or ($b[0] -eq 10) -or
+        ($b[0] -eq 192 -and $b[1] -eq 168) -or
+        ($b[0] -eq 172 -and $b[1] -ge 16 -and $b[1] -le 31) -or
+        ($b[0] -eq 169 -and $b[1] -eq 254))
+}
+
+# 判断明文 HTTP 目标是否为回环/内网地址（agent 侧才是权威校验，这里提前拦截）。
+# 必须与 internal/config.isLocalHTTPHost 逐条一致：仅 localhost/*.localhost 与字面
+# 回环/私网/链路本地 IP；*.lan/*.local、单标签主机名与字符串前缀都不算本地。
+function Test-LocalBotHost([string]$hostName) {
+    if ([string]::IsNullOrWhiteSpace($hostName)) { return $true }
+    $h = $hostName.ToLowerInvariant().TrimStart('[').TrimEnd(']')
+    if ($h -eq "localhost" -or $h.EndsWith(".localhost")) { return $true }
+
+    # 严格 IPv4：四段十进制、无前导零（与 Go net.ParseIP 一致）。
+    $v4Pattern = '^(?:(?:25[0-5]|2[0-4][0-9]|1[0-9][0-9]|[1-9]?[0-9])\.){3}(?:25[0-5]|2[0-4][0-9]|1[0-9][0-9]|[1-9]?[0-9])$'
+    if ($h -match $v4Pattern) {
+        $v4 = [System.Net.IPAddress]::Parse($h)
+        return Test-PrivateIPv4Bytes $v4.GetAddressBytes()
+    }
+
+    # 仅把含冒号且通过 .NET 严格解析的值当作 IPv6 字面量；否则视为域名。
+    if ($h.Contains(":") -and $h -match '^[0-9A-Fa-f:.]+$') {
+        $ip = $null
+        if ([System.Net.IPAddress]::TryParse($h, [ref]$ip) -and
+            $ip.AddressFamily -eq [System.Net.Sockets.AddressFamily]::InterNetworkV6) {
+            if ($ip.IsIPv4MappedToIPv6) {
+                return Test-PrivateIPv4Bytes $ip.MapToIPv4().GetAddressBytes()
+            }
+            if ($ip.IsIPv6Loopback -or $ip.IsIPv6LinkLocal) { return $true }
+            $b = $ip.GetAddressBytes()
+            # fc00::/7（唯一本地地址）。
+            return [bool](($b[0] -band 0xFE) -eq 0xFC)
+        }
+    }
+    return $false
+}
+
 # 默认安装路径确定（优先真正的 64 位 Program Files 目录）
 $programFilesDir = ${env:ProgramW6432}
 if (-not $programFilesDir) { $programFilesDir = $env:ProgramFiles }
 if ([string]::IsNullOrWhiteSpace($InstallDir)) {
     $InstallDir = Join-Path $programFilesDir "mnagent"
 }
-if ([string]::IsNullOrWhiteSpace($LogFile)) {
-    $LogFile = Join-Path $InstallDir "mnagent.log"
-}
+# -LogFile 未显式指定时先尝试从旧服务 ImagePath 继承，真正继承不到才用默认值。
+$logFileExplicit = $PSBoundParameters.ContainsKey("LogFile") -and -not [string]::IsNullOrWhiteSpace($LogFile)
 
 function Show-Usage {
     Write-Host @"
@@ -87,6 +127,8 @@ mnagent Windows 一键安装脚本
   -GhProxy <URL>             GitHub 代理加速前缀（如 https://gh-proxy.com/）
   -InsecureProxyChecksum     使用 -GhProxy 时允许经代理获取 .sha256 校验文件
                               （默认必须直连 github.com；确认代理可信时才使用）
+  -AllowInsecureHttp         -Bot 使用明文 HTTP 连接公网地址时允许继续（默认拒绝；
+                              会向 agent 传递 -allow-insecure-http，令牌可能被窃听，慎用）
   -AutoUpdate                开启自动检查更新（默认开启）
   -NoAutoUpdate              关闭自动更新
   -UpdateInterval <间隔>     自动更新检查间隔（默认: 6h）
@@ -155,14 +197,59 @@ if ($Uninstall) {
     Get-Process -Name "mnagent", "nexttrace", "miaospeed" -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
 
     if (Test-Path $InstallDir) {
-        $confirm = Read-Host "是否删除安装目录 $InstallDir 及配置文件？[y/N]"
-        if ($confirm -match '^[Yy]') {
-            Remove-Item -Path $InstallDir -Recurse -Force -ErrorAction SilentlyContinue
-            Write-Host "已清理安装目录: $InstallDir" -ForegroundColor Green
+        # 递归删除必须可验证：只删看起来真是安装目录（含 mnagent.exe）的目录；
+        # 非默认安装目录还需要额外输入 DELETE 确认，避免 -InstallDir 误传导致误删。
+        $defaultInstallDir = Join-Path $programFilesDir "mnagent"
+        $installFull = [System.IO.Path]::GetFullPath($InstallDir).TrimEnd('\')
+        $defaultFull = [System.IO.Path]::GetFullPath($defaultInstallDir).TrimEnd('\')
+        $hasBinary = Test-Path (Join-Path $InstallDir "mnagent.exe")
+        if (-not $hasBinary) {
+            Write-Warning "目录 $InstallDir 下没有 mnagent.exe，不像是安装目录，已跳过递归删除（请手动确认后清理）。"
+        } else {
+            $confirm = Read-Host "是否删除安装目录 $InstallDir 及配置文件？[y/N]"
+            if ($confirm -match '^[Yy]') {
+                $allowDelete = $true
+                if (-not [string]::Equals($installFull, $defaultFull, [StringComparison]::OrdinalIgnoreCase)) {
+                    Write-Warning "$InstallDir 不是默认安装目录（$defaultInstallDir），递归删除存在误删其他文件的风险。"
+                    $confirm2 = Read-Host "如确认要删除该目录，请再次输入 DELETE"
+                    if ($confirm2 -cne "DELETE") {
+                        Write-Host "已取消目录删除。" -ForegroundColor Yellow
+                        $allowDelete = $false
+                    }
+                }
+                if ($allowDelete) {
+                    Remove-Item -Path $InstallDir -Recurse -Force -ErrorAction SilentlyContinue
+                    Write-Host "已清理安装目录: $InstallDir" -ForegroundColor Green
+                }
+            }
         }
     }
     Write-Host "mnagent 卸载完成。" -ForegroundColor Green
     exit 0
+}
+
+# 现有服务的 ImagePath：既要判断旧配置是否已允许明文 HTTP，也要在重装时继承手工参数。
+$existingImagePath = ""
+try {
+    $existingImagePath = [string](Get-ItemProperty -Path "HKLM:\SYSTEM\CurrentControlSet\Services\mnagent" -Name ImagePath -ErrorAction SilentlyContinue).ImagePath
+} catch {
+    $existingImagePath = ""
+}
+
+# 与 install.sh 一致：未显式传 -LogFile 时继承旧服务里手工追加的 -log-file，
+# 避免重装把用户自定义日志路径重置为默认值；继承不到时才使用 <安装目录>\mnagent.log。
+if (-not $logFileExplicit) {
+    $logFileMatch = [regex]::Match($existingImagePath, '(?:^|\s)-{1,2}log-file(?:\s+|=)"([^"]+)"')
+    if (-not $logFileMatch.Success) {
+        $logFileMatch = [regex]::Match($existingImagePath, '(?:^|\s)-{1,2}log-file[=\s]+(\S+)')
+    }
+    if ($logFileMatch.Success -and -not [string]::IsNullOrWhiteSpace($logFileMatch.Groups[1].Value)) {
+        $LogFile = $logFileMatch.Groups[1].Value
+        Write-Host "已从现有服务配置继承 -log-file: $LogFile" -ForegroundColor Gray
+    }
+}
+if ([string]::IsNullOrWhiteSpace($LogFile)) {
+    $LogFile = Join-Path $InstallDir "mnagent.log"
 }
 
 # 3. 校验参数
@@ -178,8 +265,70 @@ if (-not ($Bot -match '^https?://.+')) {
     exit 1
 }
 Assert-UrlSafe $Bot "-Bot"
+# agent 会拒绝这些形态（客户端直接在地址后拼接 /jobs、/results），安装阶段就拦住，
+# 避免装完才因 agent 退出而陷入重启循环。
+if ($Bot.Contains("?") -or $Bot.Contains("#")) {
+    Write-Error "错误：-Bot 不允许包含查询参数或 fragment（?/#），agent 会直接在地址后拼接 /jobs 等路径"
+    exit 1
+}
+$botUri = $null
+if (-not [System.Uri]::TryCreate($Bot, [System.UriKind]::Absolute, [ref]$botUri)) {
+    Write-Error "错误：-Bot 不是合法地址: $Bot"
+    exit 1
+}
+if (-not [string]::IsNullOrEmpty($botUri.UserInfo)) {
+    Write-Error "错误：-Bot 不允许包含 userinfo（user:pass@），凭据请改用 -Token / -TokenFile"
+    exit 1
+}
 if (-not [string]::IsNullOrWhiteSpace($GhProxy)) {
     Assert-UrlSafe $GhProxy "-GhProxy"
+}
+
+# 明文 HTTP 仅允许回环/内网/单标签主机名（与 agent 的 -allow-insecure-http 规则一致）；
+# 升级时若旧服务已带 -allow-insecure-http，则保持允许，避免重装后 agent 直接退出。
+$enableInsecureHttp = [bool]$AllowInsecureHttp
+if (-not $enableInsecureHttp -and $existingImagePath -match '(^|\s)-allow-insecure-http(\s|$)') {
+    $enableInsecureHttp = $true
+    Write-Host "已从现有服务配置继承 -allow-insecure-http 设置。" -ForegroundColor Gray
+}
+if ($Bot -match '^http://' -and -not (Test-LocalBotHost $botUri.Host)) {
+    if (-not $enableInsecureHttp) {
+        Write-Error "错误：-Bot 使用明文 HTTP 连接非回环/内网地址 $($botUri.Host)，agent 会拒绝启动（令牌与任务内容可能被窃听）。请改用 https://，或确需如此时加 -AllowInsecureHttp"
+        exit 1
+    }
+    Write-Warning "-Bot 使用明文 HTTP 连接 $($botUri.Host)：令牌与任务内容可能被窃听，请仅在可信网络使用。"
+}
+
+# -InstallDir / -LogFile 会拼进服务 ImagePath（双引号包裹）与 icacls 命令行：
+# 引号会提前结束参数、% 会在 ExpandString 类型的 ImagePath 里被 SCM 展开、
+# 换行/控制字符会破坏注册表值，均一律拒绝；末尾反斜杠会转义 ImagePath 的
+# 结束引号，也必须拒绝。
+function Assert-ImagePathValue([string]$value, [string]$name) {
+    if ([string]::IsNullOrWhiteSpace($value)) { throw "$name 不能为空" }
+    if ($value.IndexOfAny([char[]](0..31) + [char]127) -ge 0) {
+        throw "$name 含控制字符（含换行）: $value"
+    }
+    if ($value -match '["%$`]') {
+        throw "$name 含不允许的字符（禁止引号、%、`$、反引号）: $value"
+    }
+    if ($value -notmatch '^[A-Za-z]:[\\/]') {
+        throw "$name 必须是绝对路径（如 C:\Program Files\mnagent）: $value"
+    }
+    if ($value.EndsWith('\') -or $value.EndsWith('/')) {
+        throw "$name 不能以路径分隔符结尾: $value"
+    }
+}
+Assert-ImagePathValue $InstallDir "-InstallDir"
+Assert-ImagePathValue $LogFile "-LogFile"
+
+# -Version 会拼入下载 URL，-UpdateInterval 会拼入 ImagePath：必须限定为安全格式。
+if ($Version -ne "latest" -and $Version -notmatch '^v?\d+\.\d+\.\d+(-[0-9A-Za-z.]+)?$') {
+    Write-Error "错误：-Version 取值非法：$Version（只允许 latest 或 vX.Y.Z[-pre]）"
+    exit 1
+}
+if ($UpdateInterval -notmatch '^([0-9]+(\.[0-9]+)?(ns|us|ms|s|m|h))+$') {
+    Write-Error "错误：-UpdateInterval 取值非法：$UpdateInterval（只允许 Go duration 形式，如 6h、30m、1h30m）"
+    exit 1
 }
 
 if ([string]::IsNullOrWhiteSpace($Token) -and [string]::IsNullOrWhiteSpace($TokenFile)) {
@@ -337,9 +486,140 @@ function Move-ExecutableSafely([string]$source, [string]$destination) {
     if (Test-Path "$destination.old") { Remove-Item -Path "$destination.old" -Force -ErrorAction SilentlyContinue }
 }
 
+# 把服务 ImagePath 按 Windows 命令行规则切成参数（支持 "..." 引号，引号内不切分）。
+function Split-ServiceArguments([string]$commandLine) {
+    $tokens = New-Object System.Collections.Generic.List[string]
+    $current = New-Object System.Text.StringBuilder
+    $inQuotes = $false
+    $hasToken = $false
+    foreach ($ch in $commandLine.ToCharArray()) {
+        if ($ch -eq '"') {
+            $inQuotes = -not $inQuotes
+            $hasToken = $true
+            continue
+        }
+        if (-not $inQuotes -and [char]::IsWhiteSpace($ch)) {
+            if ($hasToken) {
+                $tokens.Add($current.ToString())
+                $current.Clear() | Out-Null
+                $hasToken = $false
+            }
+            continue
+        }
+        $current.Append($ch) | Out-Null
+        $hasToken = $true
+    }
+    if ($hasToken) { $tokens.Add($current.ToString()) }
+    return ,$tokens
+}
+
+# 可继承的 agent 常驻参数（与 internal/config 的 flag 定义保持一致）。
+# 带取值的参数后必须跟一个值；其余为布尔开关。一次性 CLI 参数（-diag、-version 等）
+# 不在其中：它们出现在服务 ImagePath 里会让进程启动后立即退出。
+$agentValueFlags = @("-bot", "-token", "-token-file", "-nexttrace", "-miaospeed", "-min-backoff", "-max-backoff",
+    "-poll-timeout", "-result-timeout", "-update-interval", "-gh-proxy", "-log-level", "-log-file")
+$agentBoolFlags = @("-allow-private-probes", "-allow-remote-downgrade")
+# 由本脚本重新生成的参数：跳过它们及其取值，避免旧值覆盖新值或重复追加。
+$installerRegeneratedFlags = @("-bot", "-token", "-token-file", "-nexttrace", "-miaospeed", "-auto-update",
+    "-update-interval", "-gh-proxy", "-log-file", "-allow-insecure-http", "-allow-auto-install-deps")
+
+# 读取旧服务 ImagePath，取出本脚本不重新生成的 agent 参数（如手工追加的 -log-level、
+# -allow-private-probes、-min-backoff），重跑安装时原样保留，避免升级静默丢弃用户配置。
+# 无法识别（不在白名单）、缺少取值或含不安全字符（空白、引号、%、$、反引号等）时
+# 整批放弃并告警：宁可回退到默认参数，也不能写出半截参数导致服务起不来。
+function Get-InheritedServiceArgs([string]$commandLine) {
+    if ([string]::IsNullOrWhiteSpace($commandLine)) { return @() }
+    $tokens = Split-ServiceArguments $commandLine
+    if ($tokens.Count -le 1) { return @() }
+    $kept = New-Object System.Collections.Generic.List[string]
+    $bad = New-Object System.Collections.Generic.List[string]
+    $skipValue = $false
+    $expectValue = $false
+    # 白名单字符集：拒绝空白、引号、%、$、反引号、通配符与 shell/SCM 元字符。
+    $safePattern = '^[A-Za-z0-9_.:\\/@+=,-]+$'
+    for ($i = 1; $i -lt $tokens.Count; $i++) {
+        $tok = $tokens[$i]
+        if ([string]::IsNullOrWhiteSpace($tok)) { continue }
+        $isFlag = $tok.StartsWith("-")
+        if ($skipValue) {
+            # 跳过上一个（由本脚本重新生成的）参数的取值；取值可能未加引号并含空格
+            # （如 C:\Program Files\mnagent\x.log），因此一直跳到下一个 '-' 开头的参数。
+            if (-not $isFlag) { continue }
+            $skipValue = $false
+        }
+        if (-not $isFlag) {
+            if (-not $expectValue) {
+                # 既不是参数、也不是已知参数的取值：整批放弃。
+                $bad.Add($tok)
+                continue
+            }
+            $expectValue = $false
+            if ($tok -notmatch $safePattern) { $bad.Add($tok); continue }
+            $kept.Add($tok)
+            continue
+        }
+        if ($expectValue) {
+            # 上一个参数缺取值（例如 -log-level -log-file）：整批放弃。
+            $bad.Add($tok)
+            continue
+        }
+        $flag = $tok
+        $hasInlineValue = $false
+        $eq = $tok.IndexOf('=')
+        if ($eq -gt 0) {
+            $flag = $tok.Substring(0, $eq)
+            $hasInlineValue = $true
+        }
+        if ($flag.StartsWith("--")) { $flag = "-" + $flag.Substring(2) }
+        if ($installerRegeneratedFlags -contains $flag) {
+            if (-not $hasInlineValue) { $skipValue = $true }
+            continue
+        }
+        if ($tok -notmatch $safePattern) { $bad.Add($tok); continue }
+        if ($agentValueFlags -contains $flag) {
+            $kept.Add($tok)
+            if (-not $hasInlineValue) { $expectValue = $true }
+            continue
+        }
+        if ($agentBoolFlags -contains $flag) {
+            $kept.Add($tok)
+            continue
+        }
+        # 无法识别的参数：整批放弃并告警，避免拼写错误/一次性参数写进 ImagePath。
+        $bad.Add($tok)
+    }
+    if ($expectValue) { $bad.Add("<缺少取值>") }
+    if ($bad.Count -gt 0) {
+        Write-Warning "旧服务配置中存在无法识别或不安全的参数，已全部忽略（请重新执行安装命令显式指定）：$($bad -join ' ')"
+        return @()
+    }
+    return $kept.ToArray()
+}
+
 # 6. 准备安装目录
 if (-not (Test-Path $InstallDir)) {
     New-Item -ItemType Directory -Force -Path $InstallDir | Out-Null
+}
+
+# 状态目录（跳过版本记录、降级依赖等）默认在 %ProgramData%\mnagent，由 agent 自己使用。
+# Windows 没有 POSIX 权限位，internal/statedir 会拒绝 DACL 允许 Everyone/
+# Authenticated Users/Users 写入的目录，因此这里显式创建并只授权给
+# SYSTEM 与 Administrators（与令牌文件同样的 SID 写法，避免非英文系统匹配失败）。
+$stateDir = ""
+if (-not [string]::IsNullOrWhiteSpace($env:ProgramData)) {
+    $stateDir = Join-Path $env:ProgramData "mnagent"
+    try {
+        if (-not (Test-Path $stateDir)) {
+            New-Item -ItemType Directory -Force -Path $stateDir | Out-Null
+        }
+        & icacls.exe "$stateDir" /reset | Out-Null
+        if ($LASTEXITCODE -ne 0) { throw "icacls /reset 退出码 $LASTEXITCODE" }
+        & icacls.exe "$stateDir" /inheritance:r /grant:r "*S-1-5-18:(OI)(CI)F" "*S-1-5-32-544:(OI)(CI)F" | Out-Null
+        if ($LASTEXITCODE -ne 0) { throw "icacls 收紧 DACL 退出码 $LASTEXITCODE" }
+        Write-Host "已收紧状态目录权限（仅 SYSTEM 与 Administrators 可写）: $stateDir" -ForegroundColor Green
+    } catch {
+        throw "收紧状态目录 DACL 失败（agent 会因目录不安全而拒绝使用，影响自动更新记录）：$_"
+    }
 }
 
 $mnagentBin = Join-Path $InstallDir "mnagent.exe"
@@ -481,6 +761,12 @@ if ($enableMiaoSpeed) {
 # 12. 注册并配置 Windows 服务
 Write-Host "正在配置 Windows 原生系统服务..." -ForegroundColor Cyan
 
+# 旧服务已存在时，把手工追加的 agent 参数（-log-level、-allow-private-probes 等）继承下来。
+$inheritedArgs = @()
+if ($existingSvc) {
+    $inheritedArgs = @(Get-InheritedServiceArgs $existingImagePath)
+}
+
 $serviceArgs = @(
     "-bot `"$Bot`"",
     "-token-file `"$tokenPath`"",
@@ -494,6 +780,16 @@ if ($enableAutoUpdate) {
 }
 if (-not [string]::IsNullOrWhiteSpace($GhProxy)) {
     $serviceArgs += "-gh-proxy `"$GhProxy`""
+}
+if ($enableInsecureHttp) {
+    $serviceArgs += "-allow-insecure-http"
+}
+# 安装时已自动安装过 miaospeed，运行时再允许一次自动补装以保持既有行为；
+# agent 的该开关默认关闭（远程任务不应单方面触发以 root 下载安装依赖）。
+$serviceArgs += "-allow-auto-install-deps"
+if ($inheritedArgs.Count -gt 0) {
+    $serviceArgs += $inheritedArgs
+    Write-Host "已从现有服务配置继承附加参数: $($inheritedArgs -join ' ')" -ForegroundColor Gray
 }
 
 $binPathValue = "`"$mnagentBin`" " + ($serviceArgs -join " ")

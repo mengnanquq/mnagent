@@ -48,6 +48,9 @@ UPDATE_INTERVAL="6h"
 INSTALL_NEXTTRACE="yes" # 缺少 nexttrace 时默认自动按照官方脚本/包管理器安装
 INSTALL_MIAOSPEED="yes" # 缺少 miaospeed 时默认自动从 GitHub Releases 下载安装
 GH_PROXY="${GH_PROXY:-${MNAGENT_GH_PROXY:-}}" # GitHub 代理前缀，例如 https://gh-proxy.com/
+# 明文 HTTP 的 --bot 只允许回环/内网地址（与 agent 的 -allow-insecure-http 规则一致）；
+# 公网明文 HTTP 必须显式 --allow-insecure-http，否则装完 agent 会拒绝启动、陷入重启循环。
+ALLOW_INSECURE_HTTP="no"
 # 使用 gh-proxy 时默认只允许直连 github.com 获取 .sha256；显式 --insecure-proxy-checksum
 # 才允许经代理获取校验文件（代理可同时替换二进制与同源校验文件）。
 INSECURE_PROXY_CHECKSUM="no"
@@ -59,7 +62,17 @@ PREFIX_SET="no"
 
 log()  { printf '\033[1;32m==>\033[0m %s\n' "$*"; }
 warn() { printf '\033[1;33m警告:\033[0m %s\n' "$*" >&2; }
-die()  { printf '\033[1;31m错误:\033[0m %s\n' "$*" >&2; exit 1; }
+# cleanup_partial_install：清理安装过程中的半成品文件（下载失败/中断/校验失败时）。
+# 残留的 .mnagent.new 可能被误当成已下载的新版本，或被下次安装沿用。
+cleanup_partial_install() {
+	[ -n "${PREFIX:-}" ] || return 0
+	rm -f "$PREFIX/.mnagent.new" "$PREFIX/.mnagent.new.sha256" "$PREFIX/.mnagent.build.$$" 2>/dev/null || true
+}
+die()  {
+	cleanup_partial_install
+	printf '\033[1;31m错误:\033[0m %s\n' "$*" >&2
+	exit 1
+}
 
 # validate_url_safe <值> <参数名>：URL 只允许安全字符，禁止空白、换行、引号、反斜杠、%、$、反引号等。
 # 这些值会被写入 systemd/procd 命令行，必须从源头阻断命令注入与单元文件注入。
@@ -197,6 +210,8 @@ usage() {
   --no-install-nexttrace 缺少 nexttrace 时不自动安装（等同于 --install-nexttrace no）
   --install-miaospeed [yes|no] 缺少 miaospeed 时是否自动安装（默认 yes）
   --no-install-miaospeed 缺少 miaospeed 时不自动安装（等同于 --install-miaospeed no）
+  --allow-insecure-http -Bot 使用明文 HTTP 连接公网地址时允许继续（默认拒绝；
+                       会向 agent 传递 -allow-insecure-http，令牌可能被窃听，慎用）
   --gh-proxy <url>     GitHub 代理前缀，例如 https://gh-proxy.com/
   --insecure-proxy-checksum  使用 --gh-proxy 时允许经代理获取 .sha256 校验文件
                        （默认必须直连 github.com；确认代理可信时才使用）
@@ -309,6 +324,7 @@ while [ $# -gt 0 ]; do
 		--no-install-miaospeed) INSTALL_MIAOSPEED="no"; shift;;
 		--gh-proxy)     require_arg_count --gh-proxy $#; GH_PROXY="${2:-}"; shift 2;;
 		--insecure-proxy-checksum) INSECURE_PROXY_CHECKSUM="yes"; shift;;
+		--allow-insecure-http) ALLOW_INSECURE_HTTP="yes"; shift;;
 		*) die "未知参数：$1（用 --help 查看用法）";;
 	esac
 done
@@ -550,7 +566,8 @@ verify_sha256() {
 		rm -f "$verify_sum_file"
 		die "无法直连 GitHub 获取 SHA-256 校验文件（$(describe_direct_failure "${verify_raw_url}.sha256")）：${verify_raw_url}.sha256；使用 --gh-proxy 时默认禁止经代理获取校验文件（代理可同时替换二进制与校验文件）。请检查 github.com 连通性，或确认代理可信后加 --insecure-proxy-checksum 重试"
 	fi
-	verify_expected="$(awk 'NF >= 1 { print $1; exit }' "$verify_sum_file")"
+	# 校验值统一小写：上游可能发布大写哈希，sha256_of 输出为小写，直接比较会误判失败。
+	verify_expected="$(awk 'NF >= 1 { print $1; exit }' "$verify_sum_file" | tr 'A-F' 'a-f')"
 	verify_name="$(awk 'NF >= 2 { print $2; exit }' "$verify_sum_file")"
 	rm -f "$verify_sum_file"
 	case "$verify_name" in
@@ -660,7 +677,25 @@ existing_cmd=""
 if [ "$PLATFORM" = "systemd" ] && [ -f "$INIT_DIR/$SERVICE_NAME.service" ]; then
 	existing_cmd="$(grep -E '^ExecStart=' "$INIT_DIR/$SERVICE_NAME.service" | head -n1 | sed 's/^ExecStart=//' || true)"
 elif [ "$PLATFORM" = "openwrt" ] && [ -f "$INIT_DIR/$SERVICE_NAME" ]; then
-	existing_cmd="$(grep -A 10 'procd_set_param command' "$INIT_DIR/$SERVICE_NAME" | sed -e 's/\\$//' | tr '\n' ' ' || true)"
+	# 只取 procd command 这一条（含续行反斜杠），不把后面的 procd_set_param env/respawn
+	# 一起吞进来；否则它们会被当成 agent 参数继承下去。
+	existing_cmd="$(awk '
+		capture == 0 {
+			if ($0 ~ /procd_set_param[ \t]+command/) {
+				sub(/^.*procd_set_param[ \t]+command[ \t]+/, "")
+				capture = 1
+			} else {
+				next
+			}
+		}
+		{
+			n = length($0)
+			while (n > 0 && (substr($0, n, 1) == " " || substr($0, n, 1) == "\t")) n--
+			cont = (n > 0 && substr($0, n, 1) == "\\")
+			printf "%s ", substr($0, 1, n - (cont ? 1 : 0))
+			if (!cont) exit
+		}
+	' "$INIT_DIR/$SERVICE_NAME" 2>/dev/null || true)"
 fi
 
 # existing_prefix_from_cmd <existing_cmd>：从 ExecStart / procd command 的首个 token
@@ -722,6 +757,14 @@ if [ -n "$existing_cmd" ]; then
 			MIAOSPEED_BIN="$extracted_miao"
 		fi
 	fi
+	if [ "$TOKEN_FROM_ARG" = "no" ] && printf '%s' "$existing_cmd" | grep -q -- '-token '; then
+		# 明文令牌不会继承进新单元（也不写日志）：新的服务命令统一改用 -token-file。
+		warn "旧服务配置里使用了明文 -token 参数，已改用 -token-file；请确认 ${TOKEN_FILE} 已包含正确令牌"
+	fi
+	if [ "$ALLOW_INSECURE_HTTP" = "no" ] && printf '%s' "$existing_cmd" | grep -q -- '-allow-insecure-http'; then
+		ALLOW_INSECURE_HTTP="yes"
+		log "已从现有服务配置继承 -allow-insecure-http 设置"
+	fi
 	if [ "$AUTO_UPDATE_SET" = "no" ]; then
 		if printf '%s' "$existing_cmd" | grep -q -- '-auto-update'; then
 			AUTO_UPDATE="yes"
@@ -746,8 +789,372 @@ if [ -n "$existing_cmd" ]; then
 	fi
 fi
 
+# tokenize_cmd <命令行>：把旧单元的命令行按 shell 引号规则切成“一行一个 token”。
+# 只用 awk 实现，以便在 busybox ash 下运行；不支持反斜杠转义（本脚本生成的单元不会产生）。
+tokenize_cmd() {
+	printf '%s' "$1" | awk '
+		{
+			line = $0
+			n = length(line); i = 1; tok = ""; quote = ""
+			while (i <= n) {
+				c = substr(line, i, 1)
+				if (quote == "") {
+					if (c == "\"" || c == "\047") { quote = c }
+					else if (c == " " || c == "\t") { if (tok != "") { print tok; tok = "" } }
+					else { tok = tok c }
+				} else if (c == quote) { quote = "" }
+				else { tok = tok c }
+				i++
+			}
+			if (tok != "") print tok
+		}'
+}
+
+# 可继承的 agent 常驻参数（与 internal/config 的 flag 定义保持一致）。
+# 带取值的参数后必须跟一个值；其余为布尔开关。一次性 CLI 参数（-diag、-version、
+# -apply-update 等）不在其中：它们出现在服务命令里会让进程立即退出。
+AGENT_VALUE_FLAGS=" -bot -token -token-file -nexttrace -miaospeed -min-backoff -max-backoff -poll-timeout -result-timeout -update-interval -gh-proxy -log-level -log-file "
+AGENT_BOOL_FLAGS=" -allow-private-probes -allow-remote-downgrade "
+# 由本脚本重新生成的参数：跳过它们及其取值，避免旧值覆盖新值或重复追加。
+INSTALLER_REGENERATED_FLAGS=" -bot -token -token-file -nexttrace -miaospeed -auto-update -update-interval -gh-proxy -allow-insecure-http -allow-auto-install-deps "
+
+# collect_extra_agent_args <旧命令行>：提取旧单元里手工追加的 agent 参数
+# （-log-level、-min-backoff、-result-timeout、-allow-private-probes 等），
+# 输出为以空格开头的参数串（可直接拼进 ExecStart）。
+# 重跑安装时这些参数必须原样保留，否则升级会静默改掉行为。
+# 无法识别（不在上述白名单）或含不安全字符（空白、引号、%、$、反引号、换行等）、
+# 缺少取值的参数会让整批被丢弃并 warn：宁可回退默认参数，也不能写出半截参数
+# 导致服务起不来。
+# mask_collect_bad_token <token>：把被丢弃参数累积到 collect_bad 时脱敏。
+# -token / -token-file 及其取值一律掩码；调用方在“上一个参数缺取值”时
+# 会用 *** 代替以 '-' 开头的可疑取值，避免把令牌等秘密回显到终端/日志。
+mask_collect_bad_token() {
+	mcb_tok="$1"
+	if [ "${collect_redact_next:-no}" = "yes" ]; then
+		collect_bad="$collect_bad ***"
+		collect_redact_next="no"
+		return 0
+	fi
+	mcb_flag="${mcb_tok%%=*}"
+	case "$mcb_flag" in
+		-token|-token-file|--token|--token-file)
+			case "$mcb_tok" in
+				*=*) collect_bad="$collect_bad ${mcb_flag}=***";;
+				*) collect_bad="$collect_bad $mcb_flag"; collect_redact_next="yes";;
+			esac
+			return 0
+			;;
+	esac
+	collect_bad="$collect_bad $mcb_tok"
+}
+
+collect_extra_agent_args() {
+	collect_skip="no"
+	collect_first="yes"
+	collect_expect="no"
+	collect_tokens=""
+	collect_bad=""
+	collect_redact_next="no"
+	collect_skip_secret="no"
+	set -f # 关闭通配符展开：token 里的 * ? 不能被当成文件名。
+	# 只按换行切分（而不是默认空白）：带引号的值里若有空格，必须整体交给后面的
+	# 字符白名单校验并整批拒绝，否则会被拆成「半截值 + 多余参数」写进单元。
+	collect_old_ifs="$IFS"
+	IFS='
+'
+	for collect_tok in $(tokenize_cmd "$1"); do
+		if [ "$collect_first" = "yes" ]; then
+			collect_first="no" # 首个 token 是二进制路径，由本脚本重新生成。
+			continue
+		fi
+		if [ "$collect_skip" = "yes" ]; then
+			# 跳过上一个（由本脚本重新生成的）参数的取值；取值可能未加引号并含空格，
+			# 因此一直跳到下一个 '-' 开头的参数为止，避免把半截取值当成新参数。
+			case "$collect_tok" in
+				-*)
+					collect_skip="no"
+					# -token/-token-file 后面以 '-' 开头的值可能是令牌本身，不得回显。
+					if [ "$collect_skip_secret" = "yes" ]; then
+						collect_bad="$collect_bad ***"
+						collect_skip_secret="no"
+						continue
+					fi
+					;;
+				*)
+					collect_skip_secret="no"
+					continue
+					;;
+			esac
+		fi
+		case "$collect_tok" in
+			-*)
+				# 统一 "--flag" 为 "-flag"，并拆出 "-flag=value" 的内联取值。
+				collect_flag="${collect_tok%%=*}"
+				collect_inline="no"
+				case "$collect_tok" in
+					*=*) collect_inline="yes" ;;
+				esac
+				case "$collect_flag" in
+					--*) collect_flag="-${collect_flag#--}" ;;
+				esac
+				if [ "$collect_expect" = "yes" ]; then
+					# 上一个参数缺取值（例如 -log-file -log-level）：整批放弃。
+					# 该 token 可能是以 '-' 开头的秘密值，统一掩码，不回显原文。
+					collect_bad="$collect_bad ***"
+					continue
+				fi
+				case "$INSTALLER_REGENERATED_FLAGS" in
+					*" $collect_flag "*)
+						if [ "$collect_flag" = "-token" ] || [ "$collect_flag" = "-token-file" ]; then
+							collect_skip_secret="yes"
+						else
+							collect_skip_secret="no"
+						fi
+						[ "$collect_inline" = "yes" ] || collect_skip="yes"
+						continue
+						;;
+				esac
+				case "$AGENT_VALUE_FLAGS" in
+					*" $collect_flag "*)
+						case "$collect_tok" in
+							*[!A-Za-z0-9_./:@+=,-]*) mask_collect_bad_token "$collect_tok"; continue;;
+						esac
+						collect_tokens="$collect_tokens $collect_tok"
+						[ "$collect_inline" = "yes" ] || collect_expect="yes"
+						continue
+						;;
+				esac
+				case "$AGENT_BOOL_FLAGS" in
+					*" $collect_flag "*)
+						case "$collect_tok" in
+							*[!A-Za-z0-9_./:@+=,-]*) mask_collect_bad_token "$collect_tok"; continue;;
+						esac
+						collect_tokens="$collect_tokens $collect_tok"
+						continue
+						;;
+				esac
+				# 无法识别的参数：整批放弃并告警，避免拼写错误/一次性参数写进单元。
+				mask_collect_bad_token "$collect_tok"
+				;;
+			*)
+				if [ "$collect_expect" = "yes" ]; then
+					collect_expect="no"
+					case "$collect_tok" in
+						*[!A-Za-z0-9_./:@+=,-]*) mask_collect_bad_token "$collect_tok"; continue;;
+					esac
+					collect_tokens="$collect_tokens $collect_tok"
+					continue
+				fi
+				# 既不是参数、也不是已知参数的取值：整批放弃。
+				mask_collect_bad_token "$collect_tok"
+				;;
+		esac
+	done
+	IFS="$collect_old_ifs"
+	set +f
+	if [ "$collect_expect" = "yes" ]; then
+		collect_bad="$collect_bad <缺少取值>"
+	fi
+	if [ -n "$collect_bad" ]; then
+		warn "旧服务配置中存在无法识别或不安全的参数，已全部忽略（请重新执行安装命令显式指定）：${collect_bad}"
+		return 0
+	fi
+	# 直接原样输出（不加引号）：经过上面的字符白名单后不可能含空白、引号、$、%、；
+	# 等 shell/systemd 特殊字符，因此无需额外引号，单元文件也更易读。
+	for collect_tok in $collect_tokens; do
+		printf ' %s' "$collect_tok"
+	done
+	return 0
+}
+
+EXTRA_AGENT_ARGS=""
+if [ -n "$existing_cmd" ]; then
+	EXTRA_AGENT_ARGS="$(collect_extra_agent_args "$existing_cmd")"
+	if [ -n "$EXTRA_AGENT_ARGS" ]; then
+		log "已从现有服务配置继承附加参数:${EXTRA_AGENT_ARGS}"
+	fi
+fi
+
+# bot_host_from_url <url>：提取 URL 的 host（去掉 scheme、userinfo、端口与 IPv6 方括号）。
+# 全部用 shell 参数展开实现，避免 sed 正则把 IPv6 地址的末段误当成端口。
+bot_host_from_url() {
+	bot_raw="${1#*://}"
+	bot_raw="${bot_raw%%/*}"   # 去掉 path
+	bot_raw="${bot_raw%%\?*}"  # 去掉 query
+	bot_raw="${bot_raw%%#*}"   # 去掉 fragment
+	bot_raw="${bot_raw##*@}"   # 去掉 userinfo
+	case "$bot_raw" in
+		\[*)
+			# [IPv6] 或 [IPv6]:port
+			bot_raw="${bot_raw#\[}"
+			bot_raw="${bot_raw%%\]*}"
+			;;
+		*:*)
+			# host:port：只有末段全是数字时才当作端口剥掉
+			case "${bot_raw##*:}" in
+				''|*[!0-9]*) ;;
+				*) bot_raw="${bot_raw%:*}" ;;
+			esac
+			;;
+	esac
+	printf '%s' "$bot_raw" | tr 'A-Z' 'a-z'
+}
+
+# is_local_ipv4 <host>：按 agent 的 net.ParseIP 语义严格解析 IPv4（拒绝前导零/非四段），
+# 并只接受回环、私网与链路本地地址。
+is_local_ipv4() {
+	ilh_host="$1"
+	case "$ilh_host" in
+		*[!0-9.]*|.*|*.|*..*) return 1;;
+	esac
+	ilh_old_ifs="$IFS"
+	IFS=.
+	set -- $ilh_host
+	IFS="$ilh_old_ifs"
+	[ "$#" -eq 4 ] || return 1
+	for ilh_octet in "$@"; do
+		case "$ilh_octet" in
+			''|0?*) return 1;;
+		esac
+		[ "${#ilh_octet}" -le 3 ] || return 1
+		[ "$ilh_octet" -le 255 ] || return 1
+	done
+	case "$1" in
+		127|10) return 0;;
+		192) [ "$2" = "168" ] && return 0;;
+		169) [ "$2" = "254" ] && return 0;;
+		172) [ "$2" -ge 16 ] && [ "$2" -le 31 ] && return 0;;
+	esac
+	return 1
+}
+
+# is_local_ipv6 <host>：用 awk 严格展开 IPv6（支持 :: 压缩、IPv4 嵌入与 IPv4-mapped），
+# 仅接受 ::1、fc00::/7 与 fe80::/10，规则与 agent 的 net.IP.IsLoopback/IsPrivate/
+# IsLinkLocalUnicast 保持一致。
+is_local_ipv6() {
+	case "$1" in
+		*:*) ;;
+		*) return 1;;
+	esac
+	case "$1" in
+		*[!0-9A-Fa-f:.]*) return 1;;
+	esac
+	awk -v ip="$1" '
+		function hexval(s,   i, v, c) {
+			if (s == "" || length(s) > 4) return -1
+			v = 0
+			for (i = 1; i <= length(s); i++) {
+				c = tolower(substr(s, i, 1))
+				if (c >= "0" && c <= "9") v = v * 16 + (index("0123456789", c) - 1)
+				else if (c >= "a" && c <= "f") v = v * 16 + (index("abcdef", c) + 9)
+				else return -1
+			}
+			return v
+		}
+		function parse_side(s, A,   n, parts, i, v) {
+			PN = 0
+			if (s == "") return 0
+			n = split(s, parts, ":")
+			for (i = 1; i <= n; i++) {
+				if (parts[i] == "") return -1
+				v = hexval(parts[i])
+				if (v < 0) return -1
+				A[++PN] = v
+			}
+			return PN
+		}
+		function v4_local(a, b, c, d) {
+			if (a == 127 || a == 10) return 1
+			if (a == 192 && b == 168) return 1
+			if (a == 169 && b == 254) return 1
+			if (a == 172 && b >= 16 && b <= 31) return 1
+			return 0
+		}
+		BEGIN {
+			addr = ip
+			if (index(addr, ".")) {
+				pos = match(addr, /[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$/)
+				if (pos == 0) exit 1
+				v4 = substr(addr, pos)
+				addr = substr(addr, 1, pos - 1)
+				if (substr(addr, length(addr), 1) != ":") exit 1
+				n = split(v4, o, ".")
+				if (n != 4) exit 1
+				for (i = 1; i <= 4; i++) {
+					if (o[i] !~ /^[0-9]+$/ || o[i] + 0 > 255) exit 1
+					if (length(o[i]) > 1 && substr(o[i], 1, 1) == "0") exit 1
+				}
+				addr = addr sprintf("%x:%x", o[1] * 256 + o[2], o[3] * 256 + o[4])
+			}
+			dbl = index(addr, "::")
+			GN = 0
+			if (dbl > 0) {
+				if (index(substr(addr, dbl + 2), "::") > 0) exit 1
+				left = substr(addr, 1, dbl - 1)
+				right = substr(addr, dbl + 2)
+				lcount = parse_side(left, L)
+				if (lcount < 0) exit 1
+				rcount = parse_side(right, R)
+				if (rcount < 0) exit 1
+				if (lcount + rcount > 7) exit 1
+				zeros = 8 - lcount - rcount
+				for (i = 1; i <= 8; i++) {
+					if (i <= lcount) G[i] = L[i]
+					else if (i <= lcount + zeros) G[i] = 0
+					else G[i] = R[i - lcount - zeros]
+				}
+			} else {
+				count = parse_side(addr, G)
+				if (count != 8) exit 1
+			}
+			if (G[1] == 0 && G[2] == 0 && G[3] == 0 && G[4] == 0 && G[5] == 0 && G[6] == 65535)
+				exit v4_local(int(G[7] / 256), G[7] % 256, int(G[8] / 256), G[8] % 256) ? 0 : 1
+			if (G[1] == 0 && G[2] == 0 && G[3] == 0 && G[4] == 0 && G[5] == 0 && G[6] == 0 && G[7] == 0 && G[8] == 1) exit 0
+			if (G[1] >= 64512 && G[1] <= 65023) exit 0
+			if (G[1] >= 65152 && G[1] <= 65215) exit 0
+			exit 1
+		}
+	' >/dev/null 2>&1
+}
+
+# is_local_bot_host <host>：判断明文 HTTP 目标是否为回环/内网地址（含 localhost）。
+# 必须与 agent 的 isLocalHTTPHost 逐条一致：仅 localhost/*.localhost 与字面回环/私网/
+# 链路本地 IP 算本地；*.lan/*.local、单标签主机名及字符串前缀（10.example.com、fdic.example.com）
+# 都不算，否则会误判为本地而不传 -allow-insecure-http，装完 agent 直接拒启。
+is_local_bot_host() {
+	case "$1" in
+		''|localhost|*.localhost) return 0;;
+	esac
+	is_local_ipv4 "$1" && return 0
+	is_local_ipv6 "$1" && return 0
+	return 1
+}
+
 [ -n "$BOT_URL" ] || die "缺少 --bot"
 validate_url_safe "$BOT_URL" "--bot"
+# agent 会拒绝这些形态（客户端直接在地址后拼接 /jobs、/results），
+# 安装阶段就拦住，避免装完才因 agent 退出而陷入重启循环。
+case "$BOT_URL" in
+	*'?'*) die "-bot 不允许包含查询参数（?）：agent 会直接在地址后拼接 /jobs 等路径";;
+	*'#'*) die "-bot 不允许包含 fragment（#）";;
+esac
+bot_authority="${BOT_URL#*://}"
+bot_authority="${bot_authority%%/*}"
+case "$bot_authority" in
+	*@*) die "-bot 不允许包含 userinfo（user:pass@），凭据请改用 --token / --token-file / --token-stdin";;
+esac
+case "$BOT_URL" in
+	http://*)
+		bot_host="$(bot_host_from_url "$BOT_URL")"
+		if [ -n "$bot_host" ] && ! is_local_bot_host "$bot_host"; then
+			if [ "$ALLOW_INSECURE_HTTP" = "yes" ]; then
+				warn "-bot 使用明文 HTTP 连接 ${bot_host}：令牌与任务内容可能被窃听，请仅在可信网络使用"
+			else
+				die "-bot 使用明文 HTTP 连接非回环/内网地址 ${bot_host}，agent 会拒绝启动（令牌与任务内容可能被窃听）。请改用 https://，或确需如此时显式加 --allow-insecure-http"
+			fi
+		fi
+		;;
+esac
 if [ -n "$GH_PROXY" ]; then
 	validate_url_safe "$GH_PROXY" "--gh-proxy"
 fi
@@ -801,6 +1208,10 @@ if [ "$TOKEN_FROM_ARG" = "yes" ]; then
 	warn "使用 --token 会把令牌暴露在进程 argv 与命令历史中，建议改用 --token-file、MNAGENT_TOKEN 或 --token-stdin"
 fi
 
+# 安装二进制前注册退出清理：die / Ctrl-C / 任意非零退出都会删除半成品文件。
+# 放在 stty 的 trap 清理之后注册，避免被 `trap - 0 1 2 15` 一并清掉。
+trap 'cleanup_partial_install' 0 1 2 15
+
 # ---------- 安装二进制 ----------
 
 build_from_source() {
@@ -817,7 +1228,20 @@ build_from_source() {
 	fi
 	download_stdout "$(apply_gh_proxy "$src_url")" | tar -xz -C "$tmp"
 	dir="$(ls -d "$tmp"/*/ | head -n1)"
-	( cd "$dir" && go build -trimpath -ldflags "-s -w -X main.version=${VERSION}" -o "$PREFIX/mnagent" ./cmd/mnagent )
+	# 先编译到同目录临时文件再原子 rename：编译失败/中断时不会把正在运行或已安装的
+	# mnagent 覆盖成半成品；临时文件落在 $PREFIX 内，rename 才能保证同文件系统原子替换。
+	build_out="$PREFIX/.mnagent.build.$$"
+	if ! ( cd "$dir" && go build -trimpath -ldflags "-s -w -X main.version=${VERSION}" -o "$build_out" ./cmd/mnagent ); then
+		rm -f "$build_out"
+		rm -rf "$tmp"
+		die "从源码编译 mnagent 失败（版本 ${VERSION}）"
+	fi
+	chmod 0755 "$build_out" 2>/dev/null || true
+	if ! mv -f "$build_out" "$PREFIX/mnagent"; then
+		rm -f "$build_out"
+		rm -rf "$tmp"
+		die "安装编译产物失败：$PREFIX 不可写"
+	fi
 	rm -rf "$tmp"
 }
 
@@ -1068,9 +1492,38 @@ fetch_github_asset_digest() {
 	fi
 	digest_json="$(download_stdout "$digest_api" 2>/dev/null || true)"
 	[ -n "$digest_json" ] || return 1
+	# 按 "name" 字段精确匹配资产后再取其 sha256 digest：
+	# 不能用子串匹配（arm 会命中 arm64，amd64 会命中 amd64-v3），也不能依赖
+	# 两个字段在同一行/同一段——GitHub 的资产对象里 uploader 子对象会插在中间。
+	# 必须把搜索范围限制在当前资产对象内（到下一个 "name" 之前），并显式匹配
+	# "digest": "sha256:<64hex>"：digest 为 null 时绝不能借用下一个资产的值。
 	digest_value="$(printf '%s' "$digest_json" \
-		| awk -v target="$digest_asset" 'BEGIN { RS = "}" } index($0, target) > 0 { print }' \
-		| grep -o 'sha256:[0-9a-fA-F]*' | head -n1)"
+		| tr '\n' ' ' \
+		| awk -v target="$digest_asset" '
+			function regex_escape(s,   out, i, c) {
+				out = ""
+				for (i = 1; i <= length(s); i++) {
+					c = substr(s, i, 1)
+					if (index("\\^$[]|()*+?{}.", c) > 0) out = out "\\"
+					out = out c
+				}
+				return out
+			}
+			{
+				json = $0
+				if (!match(json, "\"name\"[ \t]*:[ \t]*\"" regex_escape(target) "\"")) exit
+				rest = substr(json, RSTART + RLENGTH)
+				# 只允许在当前资产对象内查找（下一个资产以 "name" 开始）。
+				if (match(rest, "\"name\"[ \t]*:")) rest = substr(rest, 1, RSTART - 1)
+				if (!match(rest, "\"digest\"[ \t]*:[ \t]*\"sha256:[0-9a-fA-F]+\"")) exit
+				field = substr(rest, RSTART, RLENGTH)
+				hex = field
+				sub(/^.*sha256:/, "", hex)
+				sub(/"$/, "", hex)
+				# 不依赖 awk 的 {n} 区间表达式（busybox 兼容）。
+				if (length(hex) != 64) exit
+				print "sha256:" hex
+			}')"
 	[ -n "$digest_value" ] || return 1
 	printf '%s' "$digest_value"
 }
@@ -1301,11 +1754,18 @@ case "$MIAOSPEED_BIN" in
 esac
 MIAOSPEED_EXEC="$(safe_exec_or_bare "${MIAOSPEED_PATH:-$MIAOSPEED_BIN}" "$MIAOSPEED_BARE" "miaospeed 可执行路径")"
 
-# 自动更新参数：启用时追加到服务命令（systemd 与 procd 共用）。
+# 附加到服务命令的公共参数（systemd 与 procd 共用）：自动更新、GitHub 代理，
+# 以及公网明文 --bot 所需的 -allow-insecure-http。
 AUTO_UPDATE_ARGS=""
 if [ "$AUTO_UPDATE" = "yes" ]; then
 	AUTO_UPDATE_ARGS=" -auto-update -update-interval \"$UPDATE_INTERVAL\""
 fi
+if [ "$ALLOW_INSECURE_HTTP" = "yes" ]; then
+	AUTO_UPDATE_ARGS="$AUTO_UPDATE_ARGS -allow-insecure-http"
+fi
+# 安装时已自动安装过 miaospeed，运行时再允许一次自动补装以保持既有行为；
+# agent 的该开关默认关闭（远程任务不应单方面触发以 root 下载安装依赖）。
+AUTO_UPDATE_ARGS="$AUTO_UPDATE_ARGS -allow-auto-install-deps"
 if [ -n "$GH_PROXY" ]; then
 	AUTO_UPDATE_ARGS="$AUTO_UPDATE_ARGS -gh-proxy \"$GH_PROXY\""
 fi
@@ -1325,7 +1785,7 @@ Wants=network-online.target
 Type=simple
 User=$RUN_USER
 Group=$RUN_GROUP
-ExecStart="$PREFIX/mnagent" -bot "$BOT_URL" -token-file "$TOKEN_FILE" -nexttrace "$NEXTTRACE_EXEC" -miaospeed "$MIAOSPEED_EXEC"$AUTO_UPDATE_ARGS
+ExecStart="$PREFIX/mnagent" -bot "$BOT_URL" -token-file "$TOKEN_FILE" -nexttrace "$NEXTTRACE_EXEC" -miaospeed "$MIAOSPEED_EXEC"$AUTO_UPDATE_ARGS$EXTRA_AGENT_ARGS
 	# nexttrace 需要可写的主目录来存放配置与 IP 库；ProtectSystem=strict 下只有
 	# StateDirectory 指向的目录可写。
 	StateDirectory=mnagent
@@ -1377,7 +1837,10 @@ EOF
 	systemctl enable "$SERVICE_NAME" >/dev/null 2>&1 || true
 	# 用 restart 而不是 enable --now：后者对已经在运行的服务不做任何事，
 	# 升级时会出现“二进制换了、进程还是旧版本”。
-	systemctl restart "$SERVICE_NAME"
+	if ! systemctl restart "$SERVICE_NAME"; then
+		# 不要让 set -e 直接中断：此时二进制、单元都已就位，更需要把排错提示打出来。
+		warn "启动服务失败：请执行 journalctl -u $SERVICE_NAME -e 查看原因（常见原因：-bot 地址不可达或要求 https、令牌错误、缺少 -allow-insecure-http 等启动参数）"
+	fi
 	status="$(systemctl is-active "$SERVICE_NAME" 2>/dev/null || true)"
 	if [ -n "$status" ]; then
 		log "服务状态：${status}（日志：journalctl -u $SERVICE_NAME -e）"
@@ -1402,7 +1865,7 @@ USE_PROCD=1
 			-bot "$BOT_URL" \\
 			-token-file "$TOKEN_FILE" \\
 			-nexttrace "$NEXTTRACE_EXEC" \\
-			-miaospeed "$MIAOSPEED_EXEC"$AUTO_UPDATE_ARGS
+			-miaospeed "$MIAOSPEED_EXEC"$AUTO_UPDATE_ARGS$EXTRA_AGENT_ARGS
 		procd_set_param env PATH="/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
 		procd_set_param respawn
 		# 退出时 agent 最多用 60s 回传在途结果，停止超时必须大于它，
@@ -1457,8 +1920,8 @@ case "$PLATFORM" in
 	*)
 		warn "未检测到 systemd 或 OpenWrt(procd)：已安装二进制，请自行守护运行"
 		prepare_state_dir
-		printf '    "%s/mnagent" -bot "%s" -token-file "%s" -nexttrace "%s"%s\n' \
-			"$PREFIX" "$BOT_URL" "$TOKEN_FILE" "$NEXTTRACE_EXEC" "$AUTO_UPDATE_ARGS" >&2
+		printf '    "%s/mnagent" -bot "%s" -token-file "%s" -nexttrace "%s"%s%s\n' \
+			"$PREFIX" "$BOT_URL" "$TOKEN_FILE" "$NEXTTRACE_EXEC" "$AUTO_UPDATE_ARGS" "$EXTRA_AGENT_ARGS" >&2
 		if [ -n "$NEXTTRACE_PATH" ] && command -v setcap >/dev/null 2>&1; then
 			# 没有 systemd/procd 时只能靠二进制能力，手工前台运行也需要原始套接字权限。
 			setcap cap_net_raw,cap_net_admin+eip "$NEXTTRACE_PATH" \
@@ -1483,4 +1946,8 @@ cat <<EOF
 
 EOF
 
+if [ "${status:-}" != "active" ] && [ "$PLATFORM" = "systemd" ]; then
+	warn "服务当前未处于 active 状态（${status:-unknown}）：请执行 journalctl -u $SERVICE_NAME -e 查看原因；"
+	warn "修复后执行 systemctl restart $SERVICE_NAME，或在 Telegram 里发送 /host status 观察是否恢复在线。"
+fi
 log "安装完成（平台：${PLATFORM}，架构：${ARCH}）。请在 Telegram 里发送 /host list 确认该主机显示 🟢 在线"

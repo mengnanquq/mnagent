@@ -696,6 +696,8 @@ func TestWindowsInstallScript(t *testing.T) {
 		{"校验文件优先直连获取", "Download-ChecksumFile"},
 		{"收紧令牌文件 ACL", "icacls.exe"},
 		{"先重置令牌文件 ACL", `/reset`},
+		{"严格判定明文 HTTP 本地主机", "$v4Pattern"},
+		{"继承旧服务的 -log-file", "已从现有服务配置继承 -log-file"},
 	}
 
 	for _, c := range checks {
@@ -1288,5 +1290,277 @@ func TestInstallScriptInheritsUserAndValidatesGroup(t *testing.T) {
 	}
 	if !strings.Contains(string(data), "Group=mnagent") || strings.Contains(string(data), "bad group") {
 		t.Fatalf("非法组名不得写入单元：\n%s", data)
+	}
+}
+
+// TestInstallScriptPreservesExtraAgentArgs 验证重跑安装会保留旧单元里手工追加的
+// agent 参数（-log-level、-allow-private-probes、-result-timeout 等）；
+// 含不安全字符的参数整批丢弃并告警，绝不写进新的 ExecStart。
+func TestInstallScriptPreservesExtraAgentArgs(t *testing.T) {
+	f := newFakeInstall(t, nil)
+	scriptPath := filepath.Join(findRepoRoot(), "install.sh")
+	prefix := filepath.Join(f.tmp, "install")
+	execPath := filepath.Join(prefix, "mnagent")
+
+	writeUnit := func(extra string) {
+		unit := "[Service]\nUser=root\nGroup=root\nExecStart=\"" + execPath + "\" -bot \"https://bot.example/agent\" -token-file \"" + f.tokenFile + "\" " + extra + "\n"
+		if err := os.WriteFile(f.unitPath(), []byte(unit), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	// 1. 正常附加参数：原样保留
+	writeUnit(`-log-level "debug" -allow-private-probes -result-timeout "45s" -allow-remote-downgrade`)
+	out, err := runInstallScriptTimeout(t, scriptPath, f.args(), f.env(), "", 90*time.Second)
+	if err != nil {
+		t.Fatalf("重跑安装失败: %v\n%s", err, out)
+	}
+	generated, err := os.ReadFile(f.unitPath())
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, want := range []string{"-log-level debug", "-allow-private-probes", "-result-timeout 45s", "-allow-remote-downgrade"} {
+		if !strings.Contains(string(generated), want) {
+			t.Fatalf("旧单元参数 %q 未被保留：\n%s", want, generated)
+		}
+	}
+	if !strings.Contains(out, "已从现有服务配置继承附加参数") {
+		t.Fatalf("缺少继承附加参数的提示：\n%s", out)
+	}
+
+	// 2. 含空白的值（无法安全保留）：整批丢弃并告警，单元里不得出现半截参数
+	writeUnit(`-log-file "/tmp/a b.log" -log-level "debug"`)
+	out, err = runInstallScriptTimeout(t, scriptPath, f.args(), f.env(), "", 90*time.Second)
+	if err != nil {
+		t.Fatalf("含不安全参数时仍应能完成安装: %v\n%s", err, out)
+	}
+	if !strings.Contains(out, "无法识别或不安全的参数") {
+		t.Fatalf("不安全参数应告警：\n%s", out)
+	}
+	generated, err = os.ReadFile(f.unitPath())
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, bad := range []string{"b.log", "-log-level debug"} {
+		if strings.Contains(string(generated), bad) {
+			t.Fatalf("不安全的旧参数不得写入单元（%q）：\n%s", bad, generated)
+		}
+	}
+
+	// 2b. 无法识别的参数（拼写错误或一次性 CLI 参数）：同样整批丢弃并告警
+	writeUnit(`-unknown-flag 1 -log-level debug`)
+	out, err = runInstallScriptTimeout(t, scriptPath, f.args(), f.env(), "", 90*time.Second)
+	if err != nil {
+		t.Fatalf("含未知参数时仍应能完成安装: %v\n%s", err, out)
+	}
+	if !strings.Contains(out, "无法识别或不安全的参数") || !strings.Contains(out, "-unknown-flag") {
+		t.Fatalf("未知参数应被列出并告警：\n%s", out)
+	}
+	generated, err = os.ReadFile(f.unitPath())
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, bad := range []string{"-unknown-flag", "-log-level debug"} {
+		if strings.Contains(string(generated), bad) {
+			t.Fatalf("未知参数批次不得写入单元（%q）：\n%s", bad, generated)
+		}
+	}
+
+	// 3. 已存在的 -allow-auto-install-deps 不应重复追加
+	writeUnit(`-allow-auto-install-deps`)
+	if _, err := runInstallScriptTimeout(t, scriptPath, f.args(), f.env(), "", 90*time.Second); err != nil {
+		t.Fatalf("重跑安装失败: %v", err)
+	}
+	generated, err = os.ReadFile(f.unitPath())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if n := strings.Count(string(generated), "-allow-auto-install-deps"); n != 1 {
+		t.Fatalf("-allow-auto-install-deps 应只出现一次，实际 %d 次：\n%s", n, generated)
+	}
+}
+
+// TestInstallScriptPlainHTTPBotPolicy 验证安装脚本与 agent 的明文 HTTP 规则一致：
+// 公网 http 默认拒绝（否则装完 agent 会拒绝启动、陷入重启循环），
+// 显式 --allow-insecure-http 才继续并把开关传给 agent；回环/内网无需开关。
+func TestInstallScriptPlainHTTPBotPolicy(t *testing.T) {
+	f := newFakeInstall(t, nil)
+	scriptPath := filepath.Join(findRepoRoot(), "install.sh")
+	base := []string{"--token-file", f.tokenFile, "--binary", f.fakeAgent, "--prefix", filepath.Join(f.tmp, "install")}
+
+	out, err := runInstallScriptTimeout(t, scriptPath, append([]string{"--bot", "http://bot.example.org/agent"}, base...), f.env(), "", 30*time.Second)
+	if err == nil || !strings.Contains(out, "--allow-insecure-http") {
+		t.Fatalf("公网明文 HTTP 默认应被拒绝并提示开关，err=%v\n%s", err, out)
+	}
+
+	out, err = runInstallScriptTimeout(t, scriptPath, append([]string{"--bot", "http://bot.example.org/agent", "--allow-insecure-http"}, base...), f.env(), "", 90*time.Second)
+	if err != nil {
+		t.Fatalf("显式 --allow-insecure-http 后应安装成功: %v\n%s", err, out)
+	}
+	unit, err := os.ReadFile(f.unitPath())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(unit), "-allow-insecure-http") {
+		t.Fatalf("应把 -allow-insecure-http 传给 agent：\n%s", unit)
+	}
+
+	// 回环/内网明文 HTTP 始终允许，且不应传递 -allow-insecure-http。
+	// 每个用例用全新沙箱：上一次安装留下的单元会被继承逻辑（有意地）沿用开关。
+	// 判定必须与 agent 的 isLocalHTTPHost 一致：localhost/*.localhost 与字面回环/私网/
+	// 链路本地 IP；*.lan、单标签主机名和仅字符串前缀相似的域名都不算本地。
+	for _, bot := range []string{
+		"http://127.0.0.1:8080/agent",
+		"http://localhost/agent",
+		"http://192.168.1.10:8080/agent",
+		"http://[fd00::1]:8080/agent",
+	} {
+		lf := newFakeInstall(t, nil)
+		lbase := []string{"--token-file", lf.tokenFile, "--binary", lf.fakeAgent, "--prefix", filepath.Join(lf.tmp, "install")}
+		if _, err := runInstallScriptTimeout(t, scriptPath, append([]string{"--bot", bot}, lbase...), lf.env(), "", 90*time.Second); err != nil {
+			t.Fatalf("本地明文 HTTP 应允许（%s）: %v", bot, err)
+		}
+		unit, err := os.ReadFile(lf.unitPath())
+		if err != nil {
+			t.Fatal(err)
+		}
+		if strings.Contains(string(unit), "-allow-insecure-http") {
+			t.Fatalf("本地 %s 不应传递 -allow-insecure-http：\n%s", bot, unit)
+		}
+	}
+
+	// 非本地明文 HTTP 默认必须拒绝并提示开关，不能在装完后才被 agent 拒绝启动。
+	for _, bot := range []string{
+		"http://bot.lan/agent",
+		"http://fdic.example.com/agent",
+		"http://10.example.com/agent",
+		"http://intranet/agent",
+		// fec0::/10 是已废弃的 site-local，不属于 fe80::/10 链路本地，必须判为非本地。
+		"http://[fec0::1]:8080/agent",
+	} {
+		lf := newFakeInstall(t, nil)
+		lbase := []string{"--token-file", lf.tokenFile, "--binary", lf.fakeAgent, "--prefix", filepath.Join(lf.tmp, "install")}
+		out, err := runInstallScriptTimeout(t, scriptPath, append([]string{"--bot", bot}, lbase...), lf.env(), "", 30*time.Second)
+		if err == nil || !strings.Contains(out, "--allow-insecure-http") {
+			t.Fatalf("非本地明文 HTTP 应默认拒绝并提示开关（%s），err=%v\n%s", bot, err, out)
+		}
+	}
+
+	// userinfo / query / fragment 与 agent 的校验保持一致，安装阶段直接拒绝。
+	for _, bot := range []string{
+		"https://user:pass@bot.example.org/agent",
+		"https://bot.example.org/agent?token=abc",
+		"https://bot.example.org/agent#frag",
+	} {
+		out, err := runInstallScriptTimeout(t, scriptPath, append([]string{"--bot", bot}, base...), f.env(), "", 30*time.Second)
+		if err == nil {
+			t.Fatalf("-bot 含 userinfo/query/fragment 应被拒绝: %s\n%s", bot, out)
+		}
+	}
+}
+
+// TestInstallScriptReportsRestartFailure 验证 systemctl restart 失败时不再直接中断，
+// 而是打出排错提示与状态汇总（此时二进制与单元已就位，最需要给出可操作信息）。
+func TestInstallScriptReportsRestartFailure(t *testing.T) {
+	f := newFakeInstall(t, nil)
+	// 覆盖伪 systemctl：restart 失败、is-active 返回 inactive。
+	f.writeBin("systemctl", "#!/bin/sh\ncase \"$1\" in\n  is-active) echo inactive;;\n  restart) exit 1;;\nesac\nexit 0\n")
+	scriptPath := filepath.Join(findRepoRoot(), "install.sh")
+
+	out, err := runInstallScriptTimeout(t, scriptPath, f.args(), f.env(), "", 90*time.Second)
+	if err != nil {
+		t.Fatalf("systemctl restart 失败不应让安装脚本直接失败: %v\n%s", err, out)
+	}
+	for _, want := range []string{"启动服务失败", "journalctl -u mnagent", "服务当前未处于 active 状态"} {
+		if !strings.Contains(out, want) {
+			t.Fatalf("缺少排错提示 %q：\n%s", want, out)
+		}
+	}
+}
+
+// TestInstallScriptAssetDigestScopedToAsset 验证 GitHub API 的 digest 解析被限制在当前
+// 资产对象内：目标资产 digest 为 null 时不得借用相邻 -v3 资产的值。
+func TestInstallScriptAssetDigestScopedToAsset(t *testing.T) {
+	script := string(readInstallScript(t))
+	lines := strings.Split(script, "\n")
+	start, end := -1, -1
+	for i, line := range lines {
+		if line == "fetch_github_asset_digest() {" {
+			start = i
+			continue
+		}
+		if start >= 0 && line == "}" {
+			end = i
+			break
+		}
+	}
+	if start < 0 || end <= start {
+		t.Fatal("未能在 install.sh 中定位 fetch_github_asset_digest 函数")
+	}
+	fn := strings.Join(lines[start:end+1], "\n")
+
+	v3Digest := "sha256:" + strings.Repeat("a", 64)
+	fixture := `{"assets":[` +
+		`{"url":"https://example/amd64","name":"mnagent_linux_amd64","digest":null},` +
+		`{"url":"https://example/amd64-v3","name":"mnagent_linux_amd64-v3","digest":"` + v3Digest + `"}` +
+		`]}`
+	harness := `GH_PROXY=""
+INSECURE_PROXY_CHECKSUM=no
+apply_gh_proxy() { printf '%s' "$1"; }
+download_stdout() {
+	case "$1" in
+		*".sha256") return 1;;
+		*api.github.com*) printf '%s' "$DIGEST_FIXTURE"; return 0;;
+	esac
+	return 1
+}
+` + fn + `
+fetch_github_asset_digest "owner/repo" "$1" "latest"
+`
+	harnessPath := filepath.Join(t.TempDir(), "digest.sh")
+	if err := os.WriteFile(harnessPath, []byte(harness), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	run := func(asset string) (string, error) {
+		cmd := exec.Command("sh", harnessPath, asset)
+		cmd.Env = append(os.Environ(), "DIGEST_FIXTURE="+fixture)
+		out, err := cmd.CombinedOutput()
+		return strings.TrimSpace(string(out)), err
+	}
+
+	out, err := run("mnagent_linux_amd64")
+	if err == nil || out != "" {
+		t.Fatalf("目标资产 digest=null 时不得返回相邻资产摘要，out=%q err=%v", out, err)
+	}
+	out, err = run("mnagent_linux_amd64-v3")
+	if err != nil || out != v3Digest {
+		t.Fatalf("目标资产自身 digest 应正常返回 %q，实际 out=%q err=%v", v3Digest, out, err)
+	}
+}
+
+// TestInstallScriptMasksDiscardedTokenArgs 验证旧服务里被丢弃的 -token 相关参数
+// 及其以 '-' 开头的可疑取值不会原样回显到终端/日志。
+func TestInstallScriptMasksDiscardedTokenArgs(t *testing.T) {
+	f := newFakeInstall(t, nil)
+	scriptPath := filepath.Join(findRepoRoot(), "install.sh")
+	prefix := filepath.Join(f.tmp, "install")
+	execPath := filepath.Join(prefix, "mnagent")
+	const secret = "-super-secret-token-value"
+	unit := "[Service]\nUser=root\nGroup=root\nExecStart=\"" + execPath + "\" -bot \"https://bot.example/agent\" -token-file \"" + f.tokenFile + "\" -token " + secret + " -unknown-flag\n"
+	if err := os.WriteFile(f.unitPath(), []byte(unit), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	out, err := runInstallScriptTimeout(t, scriptPath, f.args(), f.env(), "", 90*time.Second)
+	if err != nil {
+		t.Fatalf("重跑安装失败: %v\n%s", err, out)
+	}
+	if strings.Contains(out, secret) {
+		t.Fatalf("被丢弃的 token 值不得回显：\n%s", out)
+	}
+	if !strings.Contains(out, "***") {
+		t.Fatalf("被丢弃的 token 值应显示为 ***：\n%s", out)
+	}
+	if !strings.Contains(out, "-unknown-flag") {
+		t.Fatalf("普通未知参数仍应列出：\n%s", out)
 	}
 }
