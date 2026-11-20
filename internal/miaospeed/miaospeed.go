@@ -279,30 +279,15 @@ func RunJob(ctx context.Context, binary, ghProxy string, job model.Job, log Logg
 	}
 
 	// 2. 分配随机本地端口与 Token
-	port, err := getFreeLocalPort()
-	if err != nil {
-		return "", nil, fmt.Errorf("申请本地端口失败: %w", err)
-	}
 	token := generateRandomHex(16)
 
 	// 3. 启动临时 miaospeed server 进程（开启 -ipv6 支持全场景 IPv6 节点直连与 AAAA 域名解析）
-	cmd := exec.CommandContext(taskCtx, binPath, "server",
-		"-bind", fmt.Sprintf("127.0.0.1:%d", port),
-		"-token", token,
-		"-ipv6",
-	)
-	process.SetupCmdProcessGroup(cmd)
-	cmd.WaitDelay = 3 * time.Second
-	serverOut := process.NewCappedBuffer(maxOutputBytes)
-	cmd.Stdout = serverOut
-	cmd.Stderr = serverOut
-
 	if log != nil {
-		log.Debug("启动 miaospeed 服务", "binary", binPath, "port", port, "timeout", dynamicTimeout, "nodes", len(nodes))
+		log.Debug("启动 miaospeed 服务", "binary", binPath, "timeout", dynamicTimeout, "nodes", len(nodes))
 	}
-
-	if err := cmd.Start(); err != nil {
-		return "", nil, fmt.Errorf("启动 miaospeed 失败: %w", err)
+	addr, cmd, serverOut, err := startMiaospeedServer(taskCtx, binPath, token, log, job.Target)
+	if err != nil {
+		return "", nil, err
 	}
 
 	// 确保退出时终止进程
@@ -310,11 +295,6 @@ func RunJob(ctx context.Context, binary, ghProxy string, job model.Job, log Logg
 		process.KillProcessGroup(cmd)
 		_ = cmd.Wait()
 	}()
-
-	addr := fmt.Sprintf("127.0.0.1:%d", port)
-	if err := waitForPortReady(taskCtx, addr, 4*time.Second); err != nil {
-		return "", nil, fmt.Errorf("等待 miaospeed 就绪超时: %w\n%s", err, serverOut.String())
-	}
 
 	// 4. 发起 WebSocket 请求并执行测速
 	wsURL := fmt.Sprintf("ws://%s/", addr)
@@ -744,6 +724,78 @@ func getFreeLocalPort() (int, error) {
 	}
 	defer l.Close()
 	return l.Addr().(*net.TCPAddr).Port, nil
+}
+
+// miaospeedServerPortAttempts 是监听套接字归属校验失败后的换端口重试次数。
+const miaospeedServerPortAttempts = 3
+
+// startMiaospeedServer 启动临时 miaospeed server 并等待端口就绪。
+// getFreeLocalPort 只是先探测后释放端口，子进程真正 bind 前存在被本机其他进程
+// 抢占的窗口；Linux 上还会校验监听套接字属于该子进程，不匹配则杀掉换端口重试。
+func startMiaospeedServer(ctx context.Context, binPath, token string, log Logger, targets ...string) (string, *exec.Cmd, *process.CappedBuffer, error) {
+	target := ""
+	if len(targets) > 0 {
+		target = targets[0]
+	}
+	var lastErr error
+	for attempt := 1; attempt <= miaospeedServerPortAttempts; attempt++ {
+		port, err := getFreeLocalPort()
+		if err != nil {
+			return "", nil, nil, fmt.Errorf("申请本地端口失败: %w", err)
+		}
+		addr := fmt.Sprintf("127.0.0.1:%d", port)
+		// miaospeed 上游（4.7.8/4.7.11 及 master）只提供 -token 命令行参数，
+		// 不支持环境变量或令牌文件，因此 token 只能经 argv 传给子进程。
+		// 每次任务使用随机 token 且不落盘；Linux 上启动后还会校验监听套接字
+		// 属于该子进程及其进程组（listener_linux.go），可阻止本机其他进程
+		// 抢占端口后冒充 miaospeed 读取请求。若上游以后支持环境变量/文件传
+		// token，应改用该方式以避免 argv 暴露。
+		cmd := exec.CommandContext(ctx, binPath, "server",
+			"-bind", addr,
+			"-token", token,
+			"-ipv6",
+		)
+		process.SetupCmdProcessGroup(cmd)
+		cmd.WaitDelay = 3 * time.Second
+		serverOut := process.NewCappedBuffer(maxOutputBytes)
+		cmd.Stdout = serverOut
+		cmd.Stderr = serverOut
+
+		if log != nil {
+			log.Debug("启动 miaospeed 服务", "binary", binPath, "port", port, "attempt", attempt)
+		}
+		if err := cmd.Start(); err != nil {
+			return "", nil, nil, fmt.Errorf("启动 miaospeed 失败: %w", err)
+		}
+		if err := waitForPortReady(ctx, addr, 4*time.Second); err != nil {
+			process.KillProcessGroup(cmd)
+			_ = cmd.Wait()
+			// 就绪超时通常意味着子进程启动失败，换端口也无济于事；只有“端口被抢占”
+			// （监听套接字归属不匹配）才换端口重试。
+			detail := redactMiaospeedStartupOutput(serverOut.String(), target)
+			if detail != "" {
+				return "", nil, nil, fmt.Errorf("等待 miaospeed 就绪超时: %w\n最近输出:\n%s", err, detail)
+			}
+			return "", nil, nil, fmt.Errorf("等待 miaospeed 就绪超时: %w", err)
+		}
+		if err := verifyMiaospeedListener(cmd.Process.Pid, port); err != nil {
+			process.KillProcessGroup(cmd)
+			_ = cmd.Wait()
+			lastErr = err
+			if log != nil {
+				log.Warn("miaospeed 监听套接字归属校验失败，换端口重试", "port", port, "attempt", attempt, "error", err)
+			}
+			if ctx.Err() != nil {
+				return "", nil, nil, fmt.Errorf("校验 miaospeed 监听端口失败: %w", lastErr)
+			}
+			continue
+		}
+		return addr, cmd, serverOut, nil
+	}
+	if lastErr == nil {
+		lastErr = errors.New("未知错误")
+	}
+	return "", nil, nil, fmt.Errorf("连续 %d 次无法确认 miaospeed 监听端口归属，已中止：%w", miaospeedServerPortAttempts, lastErr)
 }
 
 func waitForPortReady(ctx context.Context, addr string, timeout time.Duration) error {
