@@ -12,6 +12,7 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"math/rand/v2"
 	"net/http"
 	"os"
 	"os/exec"
@@ -22,6 +23,7 @@ import (
 	"strings"
 	"sync"
 	"time"
+	"unicode/utf8"
 
 	"github.com/mengnanquq/mnagent/internal/statedir"
 )
@@ -223,10 +225,11 @@ type Updater struct {
 	GHProxy        string
 	RestartFunc    func() error
 
-	LatestURLFunc   func() string
-	URLForFunc      func(version string) string
-	ChecksumURLFunc func(version string) string
-	APIURLFunc      func() string
+	LatestURLFunc      func() string
+	URLForFunc         func(version string) string
+	ChecksumURLFunc    func(version string) string
+	ChecksumAPIURLFunc func(version string) string
+	APIURLFunc         func() string
 
 	// verifyBinary 在替换前执行下载的临时文件，确认其可运行且版本匹配。
 	// 测试可注入空实现；生产环境使用 verifyDownloadedBinary。
@@ -484,53 +487,232 @@ func (u *Updater) directChecksumHint(err error) error {
 	if err == nil || !u.usesDirectChecksum() {
 		return err
 	}
-	return fmt.Errorf("为防止 GitHub 代理 %q 同时替换二进制与同源 .sha256，校验文件不经 gh-proxy 镜像获取（仍遵循系统 HTTPS_PROXY 环境变量），但请求失败：%w（已中止更新）", strings.TrimSpace(u.GHProxy), err)
+	return fmt.Errorf("校验文件不经 gh-proxy 镜像（HTTPS_PROXY 仍生效），但请求失败：%w（已中止更新）", err)
 }
 
 var sha256HexPattern = regexp.MustCompile(`^[0-9a-fA-F]{64}$`)
 
-// fetchChecksumBody 下载目标资产的 sha256 校验文件原始内容。
-func (u *Updater) fetchChecksumBody(ctx context.Context, version string) ([]byte, error) {
+// 校验值获取的重试参数：国内直连 github.com / api.github.com 时常出现连接重置
+// 或短时 5xx，重试与来源兜底必须足够健壮。每次请求使用独立短超时，退避受 ctx 控制。
+const checksumFetchAttempts = 3
+
+var (
+	checksumRetryBaseDelay = 200 * time.Millisecond
+	checksumRetryMaxDelay  = 2 * time.Second
+)
+
+// nonRetryableHTTPError 标记确定性的 4xx 响应（429 限流除外）：
+// 这类响应重试只会空耗更新预算，应立即放弃并回退到另一个来源。
+type nonRetryableHTTPError struct{ err error }
+
+func (e *nonRetryableHTTPError) Error() string { return e.err.Error() }
+func (e *nonRetryableHTTPError) Unwrap() error { return e.err }
+
+func markNonRetryableHTTPStatus(status int, err error) error {
+	if status >= 400 && status < 500 && status != http.StatusTooManyRequests {
+		return &nonRetryableHTTPError{err: err}
+	}
+	return err
+}
+
+func isNonRetryableHTTPError(err error) bool {
+	var target *nonRetryableHTTPError
+	return errors.As(err, &target)
+}
+
+// summaryErrorLimit 是单个来源错误在最终提示中的字节上限。
+// 保留首尾（HTTP 状态/关键字常在末尾），避免多层包装把关键原因挤出 clampText(300)。
+const summaryErrorLimit = 80
+
+func compactErrorText(err error, maxBytes int) string {
+	if err == nil {
+		return ""
+	}
+	text := err.Error()
+	if len(text) <= maxBytes {
+		return text
+	}
+	if maxBytes < 8 {
+		return text[:maxBytes]
+	}
+	// 多保留尾部：HTTP 状态码和“已中止更新”等关键结论通常在错误链末尾。
+	// 头部预算留 55/80 左右，确保“格式非法”“不经 gh-proxy”等关键短语不被截掉。
+	head := maxBytes - 23
+	if head < 4 {
+		head = maxBytes / 2
+	}
+	for head > 0 && !utf8.RuneStart(text[head]) {
+		head--
+	}
+	tail := len(text) - (maxBytes - head - 3)
+	for tail < len(text) && !utf8.RuneStart(text[tail]) {
+		tail++
+	}
+	return text[:head] + "…" + text[tail:]
+}
+
+func checksumSourceError(source string, attempts int, err error) string {
+	return fmt.Sprintf("%s失败（%d次：%s）", source, attempts, compactErrorText(err, summaryErrorLimit))
+}
+
+// retryChecksumSource 对单个直连来源做指数退避 + 抖动重试。
+// 错误里带上来源、尝试次数与压缩后的最后错误，方便线上定位；确定性 4xx
+// （429 除外）不再重试。
+func retryChecksumSource(ctx context.Context, source string, timeout time.Duration, fn func(context.Context) (string, error)) (string, error) {
+	var lastErr error
+	delay := checksumRetryBaseDelay
+	attempts := 0
+	for attempt := 1; attempt <= checksumFetchAttempts; attempt++ {
+		if err := ctx.Err(); err != nil {
+			if lastErr != nil {
+				return "", fmt.Errorf("%s；%s", checksumSourceError(source, attempts, lastErr), compactErrorText(err, summaryErrorLimit))
+			}
+			return "", fmt.Errorf("%s失败（0次，%s）", source, compactErrorText(err, summaryErrorLimit))
+		}
+		attemptCtx, cancel := context.WithTimeout(ctx, timeout)
+		sum, err := fn(attemptCtx)
+		cancel()
+		if err == nil && sum != "" {
+			return sum, nil
+		}
+		if err == nil {
+			err = errors.New("返回空校验值")
+		}
+		lastErr = err
+		attempts = attempt
+		if isNonRetryableHTTPError(err) || attempt == checksumFetchAttempts {
+			break
+		}
+		wait := delay + time.Duration(rand.Int64N(int64(delay)+1))
+		timer := time.NewTimer(wait)
+		select {
+		case <-ctx.Done():
+			timer.Stop()
+			return "", fmt.Errorf("%s；%s", checksumSourceError(source, attempts, lastErr), compactErrorText(ctx.Err(), summaryErrorLimit))
+		case <-timer.C:
+		}
+		delay = min(delay*2, checksumRetryMaxDelay)
+	}
+	return "", errors.New(checksumSourceError(source, attempts, lastErr))
+}
+
+func (u *Updater) checksumRequestTimeout() time.Duration {
+	if u.checksumTimeout > 0 {
+		return u.checksumTimeout
+	}
+	return DefaultChecksumTimeout
+}
+
+// fetchChecksumFile 直连下载目标资产的 "<资产>.sha256" 并解析出 SHA-256。
+func (u *Updater) fetchChecksumFile(ctx context.Context, version string) (string, error) {
 	targetURL := u.checksumURLFor(version)
-	// 校验文件很小，使用独立短超时；这里只绕过 gh-proxy 前缀，不修改 Transport，
-	// 默认 Transport 仍会遵循 HTTPS_PROXY/HTTP_PROXY 等宿主环境变量。
-	timeout := u.checksumTimeout
-	if timeout <= 0 {
-		timeout = DefaultChecksumTimeout
-	}
-	ctx, cancel := context.WithTimeout(ctx, timeout)
-	defer cancel()
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, targetURL, nil)
-	if err != nil {
-		return nil, err
-	}
-	req.Header.Set("User-Agent", "mnagent-updater")
+	return retryChecksumSource(ctx, "直连 .sha256", u.checksumRequestTimeout(), func(ctx context.Context) (string, error) {
+		req, err := http.NewRequestWithContext(ctx, http.MethodGet, targetURL, nil)
+		if err != nil {
+			return "", err
+		}
+		req.Header.Set("User-Agent", "mnagent-updater")
 
-	cli := u.DownloadClient
-	if cli == nil {
-		cli = &http.Client{Timeout: DefaultDownloadTimeout}
-	}
-	resp, err := cli.Do(req)
-	if err != nil {
-		return nil, u.directChecksumHint(err)
-	}
-	defer resp.Body.Close()
+		cli := u.DownloadClient
+		if cli == nil {
+			cli = &http.Client{Timeout: DefaultDownloadTimeout}
+		}
+		resp, err := cli.Do(req)
+		if err != nil {
+			return "", u.directChecksumHint(err)
+		}
+		defer resp.Body.Close()
 
-	if resp.StatusCode == http.StatusNotFound {
-		return nil, u.directChecksumHint(fmt.Errorf("该版本未发布校验文件 %s.sha256（HTTP 404）", u.AssetName()))
-	}
-	if resp.StatusCode != http.StatusOK {
-		return nil, u.directChecksumHint(fmt.Errorf("获取校验文件返回 HTTP %d", resp.StatusCode))
-	}
+		if resp.StatusCode == http.StatusNotFound {
+			return "", u.directChecksumHint(markNonRetryableHTTPStatus(resp.StatusCode, fmt.Errorf("该版本未发布校验文件 %s.sha256（HTTP 404）", u.AssetName())))
+		}
+		if resp.StatusCode != http.StatusOK {
+			return "", u.directChecksumHint(markNonRetryableHTTPStatus(resp.StatusCode, fmt.Errorf("获取校验文件返回 HTTP %d", resp.StatusCode)))
+		}
 
-	body, err := io.ReadAll(io.LimitReader(resp.Body, 1<<18)) // 256 KiB
-	if err != nil {
-		return nil, u.directChecksumHint(err)
+		body, err := io.ReadAll(io.LimitReader(resp.Body, 1<<18)) // 256 KiB
+		if err != nil {
+			return "", u.directChecksumHint(err)
+		}
+		if len(bytes.TrimSpace(body)) == 0 {
+			return "", u.directChecksumHint(fmt.Errorf("校验文件 %s.sha256 为空", u.AssetName()))
+		}
+		sum, err := u.parseChecksum(body)
+		if err != nil {
+			return "", u.directChecksumHint(err)
+		}
+		return sum, nil
+	})
+}
+
+// fetchChecksumFromAPI 通过直连 api.github.com 的 Release 附件 digest 字段获取校验值。
+// 这是 .sha256 获取失败时的兜底来源，同样不经过 gh-proxy。
+func (u *Updater) fetchChecksumFromAPI(ctx context.Context, version string) (string, error) {
+	targetURL := ""
+	if u.ChecksumAPIURLFunc != nil {
+		targetURL = u.ChecksumAPIURLFunc(version)
+	} else {
+		targetURL = "https://api.github.com/repos/" + u.Repo + "/releases/tags/" + version
 	}
-	if len(bytes.TrimSpace(body)) == 0 {
-		return nil, u.directChecksumHint(fmt.Errorf("校验文件 %s.sha256 为空", u.AssetName()))
+	return retryChecksumSource(ctx, "直连 GitHub API digest", u.checksumRequestTimeout(), func(ctx context.Context) (string, error) {
+		req, err := http.NewRequestWithContext(ctx, http.MethodGet, targetURL, nil)
+		if err != nil {
+			return "", err
+		}
+		req.Header.Set("User-Agent", "mnagent-updater")
+		req.Header.Set("Accept", "application/vnd.github+json")
+
+		cli := u.DownloadClient
+		if cli == nil {
+			cli = &http.Client{Timeout: DefaultDownloadTimeout}
+		}
+		resp, err := cli.Do(req)
+		if err != nil {
+			return "", err
+		}
+		defer resp.Body.Close()
+		if resp.StatusCode != http.StatusOK {
+			return "", markNonRetryableHTTPStatus(resp.StatusCode, fmt.Errorf("GitHub API 返回 HTTP %s", resp.Status))
+		}
+		var data struct {
+			Assets []struct {
+				Name   string `json:"name"`
+				Digest string `json:"digest"`
+			} `json:"assets"`
+		}
+		if err := json.NewDecoder(io.LimitReader(resp.Body, 4<<20)).Decode(&data); err != nil {
+			return "", fmt.Errorf("解析 Release JSON 失败：%w", err)
+		}
+		for _, asset := range data.Assets {
+			if asset.Name != u.AssetName() {
+				continue
+			}
+			digest := strings.ToLower(strings.TrimPrefix(strings.ToLower(asset.Digest), "sha256:"))
+			if !sha256HexPattern.MatchString(digest) {
+				return "", fmt.Errorf("Release %s 的附件 %s 未提供合法 SHA-256 digest", version, u.AssetName())
+			}
+			return digest, nil
+		}
+		return "", fmt.Errorf("Release %s 中不存在附件 %s", version, u.AssetName())
+	})
+}
+
+// fetchExpectedChecksum 依次尝试直连 .sha256 与直连 API digest；两个来源都失败时
+// 错误里列出尝试过的来源与次数。
+func (u *Updater) fetchExpectedChecksum(ctx context.Context, version string) (string, error) {
+	var attempted []string
+	sum, err := u.fetchChecksumFile(ctx, version)
+	if err == nil {
+		return sum, nil
 	}
-	return body, nil
+	attempted = append(attempted, err.Error())
+
+	sum, err = u.fetchChecksumFromAPI(ctx, version)
+	if err == nil {
+		return sum, nil
+	}
+	attempted = append(attempted, err.Error())
+	return "", fmt.Errorf("无法从任何直连来源获取 SHA-256 校验值：%s", strings.Join(attempted, "；"))
 }
 
 // warn 输出安全告警：优先使用注入的 logger，未注入时退化到 slog 默认 logger。
@@ -588,16 +770,12 @@ func (u *Updater) downloadAndReplace(ctx context.Context, version string) (strin
 		return "", fmt.Errorf("非法的目标版本号：%q", version)
 	}
 	// 必须拿到有效校验值：缺失、为空或格式非法都中止更新，避免校验被静默跳过。
-	checksumBody, err := u.fetchChecksumBody(ctx, version)
+	expectedHash, err := u.fetchExpectedChecksum(ctx, version)
 	if err != nil {
 		return "", fmt.Errorf("获取 SHA-256 校验值失败，已中止更新：%w", err)
 	}
 	if !u.usesDirectChecksum() {
 		u.warn("仅校验 SHA-256；校验文件与二进制同源，无法防御来源同时篡改两者的攻击")
-	}
-	expectedHash, err := u.parseChecksum(checksumBody)
-	if err != nil {
-		return "", fmt.Errorf("解析 SHA-256 校验值失败，已中止更新：%w", err)
 	}
 
 	downloadURL := u.urlForOrFallback(version)

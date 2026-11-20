@@ -1073,17 +1073,22 @@ func TestFetchAssetDigestPrefersUpstreamSha256(t *testing.T) {
 		t.Fatalf("不应触发 API 回退：api=%d sum=%d", apiHits.Load(), sumHits.Load())
 	}
 
-	// 配置 gh-proxy 时同源 .sha256 不可信，必须回退到 API。
+	// 配置 gh-proxy 时，同源 .sha256 仍从 githubBaseURL 直连获取（不经过代理），
+	// 因此可以优先采用它；API 只作为 .sha256 失败后的兜底。
 	dmProxy := newDependencyManager("https://gh-proxy.example/")
 	dmProxy.apiBaseURL = srv.URL
 	dmProxy.githubBaseURL = srv.URL
 	sumHits.Store(0)
+	apiHits.Store(0)
 	got, err = dmProxy.fetchAssetDigest(context.Background(), "nxtrace/NTrace-core", "v1.7.4", "nexttrace_linux_amd64")
-	if err != nil || got != apiSum {
-		t.Fatalf("配置 gh-proxy 时应回退到 API：got=%q err=%v", got, err)
+	if err != nil || got != sum {
+		t.Fatalf("配置 gh-proxy 时仍应直连同源 .sha256：got=%q err=%v", got, err)
 	}
-	if sumHits.Load() != 0 {
-		t.Fatal("配置 gh-proxy 时不应请求同源 .sha256")
+	if sumHits.Load() == 0 {
+		t.Fatal("配置 gh-proxy 时也应直连请求同源 .sha256")
+	}
+	if apiHits.Load() != 0 {
+		t.Fatal(".sha256 成功时不应回退 API")
 	}
 }
 
@@ -1115,6 +1120,123 @@ func TestFetchAssetDigestRejectsMismatchedSha256Name(t *testing.T) {
 	dm.githubBaseURL = srv.URL
 	if _, err := dm.fetchAssetDigest(context.Background(), "x/y", "v1.7.4", "nexttrace_linux_amd64"); err == nil {
 		t.Fatal("文件名不匹配时不应采用该 .sha256")
+	}
+}
+
+// TestFetchAssetDigestRetriesUpstreamSha256 验证同源 .sha256 前两次失败、第三次成功时
+// 会自动重试并采用该摘要，不再回退 API。
+func TestFetchAssetDigestRetriesUpstreamSha256(t *testing.T) {
+	origDelay := digestRetryBaseDelay
+	digestRetryBaseDelay = 5 * time.Millisecond
+	defer func() { digestRetryBaseDelay = origDelay }()
+
+	sum := strings.Repeat("a", 64)
+	var sumHits, apiHits atomic.Int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case strings.HasSuffix(r.URL.Path, ".sha256"):
+			if sumHits.Add(1) < 3 {
+				http.Error(w, "temporary", http.StatusServiceUnavailable)
+				return
+			}
+			fmt.Fprintf(w, "%s  nexttrace_linux_amd64\n", sum)
+		case strings.Contains(r.URL.Path, "/releases/tags/"):
+			apiHits.Add(1)
+			http.Error(w, "should not fallback", http.StatusInternalServerError)
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer srv.Close()
+
+	dm := newDependencyManager("")
+	dm.apiBaseURL = srv.URL
+	dm.githubBaseURL = srv.URL
+	got, err := dm.fetchAssetDigest(context.Background(), "nxtrace/NTrace-core", "v1.7.4", "nexttrace_linux_amd64")
+	if err != nil || got != sum {
+		t.Fatalf("重试后应返回 .sha256 摘要：got=%q err=%v", got, err)
+	}
+	if sumHits.Load() != digestFetchAttempts {
+		t.Fatalf(".sha256 应尝试 %d 次，实际 %d 次", digestFetchAttempts, sumHits.Load())
+	}
+	if apiHits.Load() != 0 {
+		t.Fatalf(".sha256 最终成功时不应调用 API，实际 %d 次", apiHits.Load())
+	}
+}
+
+// TestFetchAssetDigestFallsBackToAPIWithRetry 验证 .sha256 持续失败后回退 API，
+// API 前两次失败也会重试，最终成功取得 digest。
+func TestFetchAssetDigestFallsBackToAPIWithRetry(t *testing.T) {
+	origDelay := digestRetryBaseDelay
+	digestRetryBaseDelay = 5 * time.Millisecond
+	defer func() { digestRetryBaseDelay = origDelay }()
+
+	apiSum := strings.Repeat("b", 64)
+	var sumHits, apiHits atomic.Int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case strings.HasSuffix(r.URL.Path, ".sha256"):
+			sumHits.Add(1)
+			http.Error(w, "down", http.StatusBadGateway)
+		case strings.Contains(r.URL.Path, "/releases/tags/"):
+			if apiHits.Add(1) < 3 {
+				http.Error(w, "temporary", http.StatusServiceUnavailable)
+				return
+			}
+			fmt.Fprintf(w, `{"assets":[{"name":"nexttrace_linux_amd64","digest":"sha256:%s"}]}`, apiSum)
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer srv.Close()
+
+	dm := newDependencyManager("")
+	dm.apiBaseURL = srv.URL
+	dm.githubBaseURL = srv.URL
+	got, err := dm.fetchAssetDigest(context.Background(), "nxtrace/NTrace-core", "v1.7.4", "nexttrace_linux_amd64")
+	if err != nil || got != apiSum {
+		t.Fatalf("应回退到 API digest：got=%q err=%v", got, err)
+	}
+	if sumHits.Load() != digestFetchAttempts {
+		t.Fatalf(".sha256 应尝试 %d 次，实际 %d 次", digestFetchAttempts, sumHits.Load())
+	}
+	if apiHits.Load() != digestFetchAttempts {
+		t.Fatalf("API 应尝试 %d 次，实际 %d 次", digestFetchAttempts, apiHits.Load())
+	}
+}
+
+// TestFetchAssetDigestNoRetryOnDeterministic4xx 验证确定性 4xx 不重试，
+// 429 限流仍按原策略重试。
+func TestFetchAssetDigestNoRetryOnDeterministic4xx(t *testing.T) {
+	origDelay := digestRetryBaseDelay
+	digestRetryBaseDelay = time.Millisecond
+	defer func() { digestRetryBaseDelay = origDelay }()
+
+	for _, tc := range []struct {
+		status int
+		want   int32
+	}{
+		{http.StatusNotFound, 2},
+		{http.StatusForbidden, 2},
+		{http.StatusTooManyRequests, int32(digestFetchAttempts * 2)},
+	} {
+		t.Run(http.StatusText(tc.status), func(t *testing.T) {
+			var hits atomic.Int32
+			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				hits.Add(1)
+				w.WriteHeader(tc.status)
+			}))
+			defer srv.Close()
+			dm := newDependencyManager("")
+			dm.apiBaseURL = srv.URL
+			dm.githubBaseURL = srv.URL
+			if _, err := dm.fetchAssetDigest(context.Background(), "x/y", "v1.7.4", "nexttrace_linux_amd64"); err == nil {
+				t.Fatal("全部来源失败时应返回错误")
+			}
+			if got := hits.Load(); got != tc.want {
+				t.Fatalf("HTTP %d 请求次数 = %d，期望 %d", tc.status, got, tc.want)
+			}
+		})
 	}
 }
 

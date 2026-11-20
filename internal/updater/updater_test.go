@@ -177,6 +177,9 @@ func TestUpdaterApply(t *testing.T) {
 	u.ChecksumURLFunc = func(version string) string {
 		return base + "/releases/download/" + version + "/" + u.AssetName() + ".sha256"
 	}
+	u.ChecksumAPIURLFunc = func(version string) string {
+		return base + "/releases/tags/" + version
+	}
 
 	if err := u.Apply(context.Background(), "v0.1.8"); err != nil {
 		t.Fatal(err)
@@ -511,6 +514,9 @@ func TestUpdaterSHA256ChecksumVerification(t *testing.T) {
 	u.ChecksumURLFunc = func(version string) string {
 		return ts.URL + "/releases/download/" + version + "/" + u.AssetName() + ".sha256"
 	}
+	u.ChecksumAPIURLFunc = func(version string) string {
+		return ts.URL + "/releases/tags/" + version
+	}
 
 	// 1. 正确 Hash -> 正常替换
 	if err := u.Apply(context.Background(), "v0.1.1"); err != nil {
@@ -542,6 +548,7 @@ func TestUpdaterChecksumFetchFailureAborts(t *testing.T) {
 	u := New(Config{CurrentVersion: "v0.1.0", Repo: "owner/repo", Platform: "linux", Arch: "amd64", DownloadClient: ts.Client(), Executable: exe})
 	u.URLForFunc = func(version string) string { return ts.URL + "/d/" + version + "/" + u.AssetName() }
 	u.ChecksumURLFunc = func(version string) string { return ts.URL + "/d/" + version + "/" + u.AssetName() + ".sha256" }
+	u.ChecksumAPIURLFunc = func(version string) string { return ts.URL + "/api/releases/tags/" + version }
 
 	if err := u.Apply(context.Background(), "v0.1.1"); err == nil || !strings.Contains(err.Error(), "校验值") {
 		t.Fatalf("校验文件 502 时应中止更新，实际 err=%v", err)
@@ -561,6 +568,101 @@ func TestUpdaterChecksumFetchFailureAborts(t *testing.T) {
 		if !ValidReleaseTag(good) {
 			t.Fatalf("%q 应为合法版本号", good)
 		}
+	}
+}
+
+// TestUpdaterChecksumRetriesTransientFailure 验证直连 .sha256 前两次 503、第三次成功时
+// 会自动重试并继续安装，而不是因为一次网络抖动就中止更新。
+func TestUpdaterChecksumRetriesTransientFailure(t *testing.T) {
+	bin := []byte("#!/bin/sh\necho \"mnagent v0.1.1 (linux/amd64, go1.26.0)\"\n")
+	for len(bin) < 2048 {
+		bin = append(bin, '#', '\n')
+	}
+	checksum := fmt.Sprintf("%x  mnagent_linux_amd64\n", sha256.Sum256(bin))
+	var shaHits, apiHits atomic.Int32
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case strings.HasSuffix(r.URL.Path, ".sha256"):
+			if shaHits.Add(1) < 3 {
+				http.Error(w, "temporary", http.StatusServiceUnavailable)
+				return
+			}
+			_, _ = w.Write([]byte(checksum))
+		case strings.Contains(r.URL.Path, "/releases/tags/"):
+			apiHits.Add(1)
+			http.Error(w, "should not fallback", http.StatusInternalServerError)
+		default:
+			_, _ = w.Write(bin)
+		}
+	}))
+	defer ts.Close()
+
+	exe := filepath.Join(t.TempDir(), "mnagent")
+	if err := os.WriteFile(exe, []byte("old-bin"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	u := New(Config{CurrentVersion: "v0.1.0", Repo: "owner/repo", Platform: "linux", Arch: "amd64", DownloadClient: ts.Client(), Executable: exe})
+	u.URLForFunc = func(version string) string { return ts.URL + "/d/" + version + "/" + u.AssetName() }
+	u.ChecksumURLFunc = func(version string) string { return ts.URL + "/d/" + version + "/" + u.AssetName() + ".sha256" }
+	u.ChecksumAPIURLFunc = func(version string) string { return ts.URL + "/releases/tags/" + version }
+	u.verifyBinary = func(context.Context, string, string) error { return nil }
+
+	if _, err := u.DownloadAndReplace(context.Background(), "v0.1.1"); err != nil {
+		t.Fatalf("前两次失败、第三次成功时应重试成功: %v", err)
+	}
+	if got := shaHits.Load(); got != 3 {
+		t.Fatalf(".sha256 应请求 3 次，实际 %d 次", got)
+	}
+	if got := apiHits.Load(); got != 0 {
+		t.Fatalf(".sha256 最终成功时不应调用 API 兜底，实际 %d 次", got)
+	}
+}
+
+// TestUpdaterChecksumFallsBackToAPIDigest 验证直连 .sha256 持续失败时，
+// 改为直连 api.github.com 的 asset digest；API 前两次失败也会重试。
+func TestUpdaterChecksumFallsBackToAPIDigest(t *testing.T) {
+	bin := []byte("#!/bin/sh\necho \"mnagent v0.1.1 (linux/amd64, go1.26.0)\"\n")
+	for len(bin) < 2048 {
+		bin = append(bin, '#', '\n')
+	}
+	digest := fmt.Sprintf("%x", sha256.Sum256(bin))
+	var shaHits, apiHits atomic.Int32
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case strings.HasSuffix(r.URL.Path, ".sha256"):
+			shaHits.Add(1)
+			http.Error(w, "down", http.StatusBadGateway)
+		case strings.Contains(r.URL.Path, "/releases/tags/"):
+			if apiHits.Add(1) < 3 {
+				http.Error(w, "temporary", http.StatusServiceUnavailable)
+				return
+			}
+			w.Header().Set("Content-Type", "application/json")
+			fmt.Fprintf(w, `{"assets":[{"name":"mnagent_linux_amd64","digest":"sha256:%s"}]}`, digest)
+		default:
+			_, _ = w.Write(bin)
+		}
+	}))
+	defer ts.Close()
+
+	exe := filepath.Join(t.TempDir(), "mnagent")
+	if err := os.WriteFile(exe, []byte("old-bin"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	u := New(Config{CurrentVersion: "v0.1.0", Repo: "owner/repo", Platform: "linux", Arch: "amd64", DownloadClient: ts.Client(), Executable: exe})
+	u.URLForFunc = func(version string) string { return ts.URL + "/d/" + version + "/" + u.AssetName() }
+	u.ChecksumURLFunc = func(version string) string { return ts.URL + "/d/" + version + "/" + u.AssetName() + ".sha256" }
+	u.ChecksumAPIURLFunc = func(version string) string { return ts.URL + "/releases/tags/" + version }
+	u.verifyBinary = func(context.Context, string, string) error { return nil }
+
+	if _, err := u.DownloadAndReplace(context.Background(), "v0.1.1"); err != nil {
+		t.Fatalf(".sha256 失败后应回退到 API digest: %v", err)
+	}
+	if got := shaHits.Load(); got != checksumFetchAttempts {
+		t.Fatalf(".sha256 应尝试 %d 次，实际 %d 次", checksumFetchAttempts, got)
+	}
+	if got := apiHits.Load(); got != checksumFetchAttempts {
+		t.Fatalf("API 应尝试 %d 次，实际 %d 次", checksumFetchAttempts, got)
 	}
 }
 
@@ -601,6 +703,7 @@ func TestUpdaterChecksumMissingOrInvalidAborts(t *testing.T) {
 			u := New(Config{CurrentVersion: "v0.1.0", Repo: "owner/repo", Platform: "linux", Arch: "amd64", DownloadClient: ts.Client(), Executable: exe})
 			u.URLForFunc = func(version string) string { return ts.URL + "/d/" + version + "/" + u.AssetName() }
 			u.ChecksumURLFunc = func(version string) string { return ts.URL + "/d/" + version + "/" + u.AssetName() + ".sha256" }
+			u.ChecksumAPIURLFunc = func(version string) string { return ts.URL + "/api/releases/tags/" + version }
 
 			err := u.Apply(context.Background(), "v0.1.1")
 			if err == nil || !strings.Contains(err.Error(), tc.wantErr) {
@@ -661,6 +764,7 @@ func TestDownloadAndReplaceRejectsBadBinary(t *testing.T) {
 	u := New(Config{CurrentVersion: "v0.1.0", Repo: "owner/repo", Platform: "linux", Arch: "amd64", DownloadClient: ts.Client(), Executable: exe})
 	u.URLForFunc = func(version string) string { return ts.URL + "/d/" + version + "/" + u.AssetName() }
 	u.ChecksumURLFunc = func(version string) string { return ts.URL + "/d/" + version + "/" + u.AssetName() + ".sha256" }
+	u.ChecksumAPIURLFunc = func(version string) string { return ts.URL + "/api/releases/tags/" + version }
 
 	err := u.Apply(context.Background(), "v0.1.1")
 	if err == nil || !strings.Contains(err.Error(), "自检失败") {
@@ -888,6 +992,7 @@ func TestUpdaterProxyDirectChecksumFailureFailsClosed(t *testing.T) {
 		GHProxy:        "https://gh-proxy.example/",
 		DownloadClient: newRewriteClient(direct, proxy),
 	})
+	u.ChecksumAPIURLFunc = func(version string) string { return direct.URL + "/api/releases/tags/" + version }
 	u.verifyBinary = func(context.Context, string, string) error { return nil }
 
 	_, err := u.DownloadAndReplace(context.Background(), "v0.1.8")
@@ -899,8 +1004,9 @@ func TestUpdaterProxyDirectChecksumFailureFailsClosed(t *testing.T) {
 			t.Fatalf("错误信息应包含 %q，实际：%v", want, err)
 		}
 	}
+	// 404 属于确定性 4xx，不再重试：只请求一次就回退到 API 来源。
 	if got := directChecksumHits.Load(); got != 1 {
-		t.Fatalf("应尝试直连获取校验文件 1 次，实际 %d 次", got)
+		t.Fatalf("确定性 404 应只尝试直连获取校验文件 1 次，实际 %d 次", got)
 	}
 	if got := proxyChecksumHits.Load(); got != 0 {
 		t.Fatalf("直连失败时不得回退到代理获取校验文件，实际代理请求 %d 次", got)
@@ -910,6 +1016,39 @@ func TestUpdaterProxyDirectChecksumFailureFailsClosed(t *testing.T) {
 	}
 	if got, _ := os.ReadFile(exe); string(got) != "old-bin" {
 		t.Fatalf("拒绝更新时不得替换二进制: %q", string(got))
+	}
+}
+
+// TestChecksumNoRetryOnDeterministic4xx 验证确定性 4xx 不重试，429 仍重试。
+func TestChecksumNoRetryOnDeterministic4xx(t *testing.T) {
+	origDelay := checksumRetryBaseDelay
+	checksumRetryBaseDelay = time.Millisecond
+	defer func() { checksumRetryBaseDelay = origDelay }()
+
+	for _, tc := range []struct {
+		status int
+		want   int32
+	}{
+		{http.StatusNotFound, 1},
+		{http.StatusForbidden, 1},
+		{http.StatusTooManyRequests, int32(checksumFetchAttempts)},
+	} {
+		t.Run(http.StatusText(tc.status), func(t *testing.T) {
+			var hits atomic.Int32
+			ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				hits.Add(1)
+				w.WriteHeader(tc.status)
+			}))
+			defer ts.Close()
+			u := New(Config{CurrentVersion: "v0.1.0", Repo: "owner/repo", Platform: "linux", Arch: "amd64"})
+			u.ChecksumURLFunc = func(version string) string { return ts.URL + "/" + u.AssetName() + ".sha256" }
+			if _, err := u.fetchChecksumFile(context.Background(), "v0.1.1"); err == nil {
+				t.Fatal("非 200 响应应返回错误")
+			}
+			if got := hits.Load(); got != tc.want {
+				t.Fatalf("HTTP %d 请求次数 = %d，期望 %d", tc.status, got, tc.want)
+			}
+		})
 	}
 }
 
@@ -934,6 +1073,9 @@ func TestUpdaterDirectChecksumTimeoutFailsClosed(t *testing.T) {
 	})
 	u.checksumTimeout = 50 * time.Millisecond
 	u.verifyBinary = func(context.Context, string, string) error { return nil }
+	origDelay, origMax := checksumRetryBaseDelay, checksumRetryMaxDelay
+	checksumRetryBaseDelay, checksumRetryMaxDelay = 10*time.Millisecond, 10*time.Millisecond
+	defer func() { checksumRetryBaseDelay, checksumRetryMaxDelay = origDelay, origMax }()
 
 	start := time.Now()
 	_, err := u.DownloadAndReplace(context.Background(), "v0.1.8")
@@ -949,8 +1091,18 @@ func TestUpdaterDirectChecksumTimeoutFailsClosed(t *testing.T) {
 	if elapsed >= time.Second {
 		t.Fatalf("校验文件请求应在短超时内失败，实际耗时 %v", elapsed)
 	}
-	if hosts := transport.requestedHosts(); len(hosts) != 1 || hosts[0] != "github.com" {
-		t.Fatalf("超时前应只向直连 github.com 发起 1 次请求，实际 hosts=%v", hosts)
+	hosts := transport.requestedHosts()
+	if len(hosts) != checksumFetchAttempts*2 {
+		t.Fatalf(".sha256 与 API 两个来源应各重试 %d 次，实际 hosts=%v", checksumFetchAttempts, hosts)
+	}
+	for i, host := range hosts {
+		want := "github.com"
+		if i >= checksumFetchAttempts {
+			want = "api.github.com"
+		}
+		if host != want {
+			t.Fatalf("第 %d 次请求应直连 %s，实际 hosts=%v", i+1, want, hosts)
+		}
 	}
 	if got, _ := os.ReadFile(exe); string(got) != "old-bin" {
 		t.Fatalf("超时失败时不得替换二进制: %q", string(got))
@@ -1019,6 +1171,7 @@ func TestUpdaterNoProxyWarnsSHA256Only(t *testing.T) {
 	})
 	u.URLForFunc = func(version string) string { return ts.URL + "/d/" + version + "/" + u.AssetName() }
 	u.ChecksumURLFunc = func(version string) string { return ts.URL + "/d/" + version + "/" + u.AssetName() + ".sha256" }
+	u.ChecksumAPIURLFunc = func(version string) string { return ts.URL + "/api/releases/tags/" + version }
 	u.verifyBinary = func(context.Context, string, string) error { return nil }
 
 	if _, err := u.DownloadAndReplace(context.Background(), "v0.1.8"); err != nil {
@@ -1063,6 +1216,7 @@ func TestDownloadAndReplaceRejectsOversizedBinary(t *testing.T) {
 	})
 	u.URLForFunc = func(version string) string { return ts.URL + "/d/" + version + "/" + u.AssetName() }
 	u.ChecksumURLFunc = func(version string) string { return ts.URL + "/d/" + version + "/" + u.AssetName() + ".sha256" }
+	u.ChecksumAPIURLFunc = func(version string) string { return ts.URL + "/api/releases/tags/" + version }
 	u.verifyBinary = func(context.Context, string, string) error { return nil }
 
 	if _, err := u.DownloadAndReplace(context.Background(), "v0.1.8"); err == nil || !strings.Contains(err.Error(), "上限") {
@@ -1198,6 +1352,7 @@ func TestUpdaterSerializesConcurrentReplacement(t *testing.T) {
 	})
 	u.URLForFunc = func(string) string { return ts.URL + "/releases/download/v0.1.8/" + u.AssetName() }
 	u.ChecksumURLFunc = func(string) string { return ts.URL + "/releases/download/v0.1.8/" + u.AssetName() + ".sha256" }
+	u.ChecksumAPIURLFunc = func(string) string { return ts.URL + "/releases/tags/v0.1.8" }
 	u.verifyBinary = func(context.Context, string, string) error { return nil }
 
 	start := make(chan struct{})
