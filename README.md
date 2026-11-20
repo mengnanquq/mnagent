@@ -6,7 +6,7 @@ Agent 通过 HTTPS **主动长轮询**接收服务端下发的网络探测与节
 
 - 🔒 **网络零暴露**：**无需公网 IP、无需端口映射、无需 SSH**，只要探针能正常出站访问服务端即可。
 - 🔑 **令牌即身份**：每台主机单令牌鉴权（`--token` 或动态读取 `--token-file`），在线轮换无需重启。
-- 🔄 **全自动运维**：自动探测、补全与静默升级外部依赖（`nexttrace` / `miaospeed`），支持后台自更新与服务端一键远程升级。
+- 🔄 **全自动运维**：自动探测、补全与静默升级外部依赖（`nexttrace` / `miaospeed`），支持后台自更新与服务端一键远程升级。依赖的远程任务自动补装默认关闭，一键安装脚本会显式加上 `-allow-auto-install-deps`。
 - 🛡️ **安全沙箱防线**：默认严格拦截回环、内网私有网段及公有云元数据地址（`169.254.169.254` 等），防御 SSRF；命令参数白名单隔离，不经 Shell 解释器执行。
 
 ---
@@ -112,7 +112,8 @@ mnagent -apply-update latest         # 立即升级到最新版本并平滑重�
 | **`-gh-proxy <url>`** | — | GitHub 代理加速前缀（支持环境变量 `GH_PROXY`） |
 | **`-result-timeout`** | `5m` | 单次结果回传（含大体积 `/results` 上传）的客户端超时 |
 | **`-allow-insecure-http`** | `false` | 允许 `-bot` 用明文 HTTP 连接公网地址（默认仅允许回环/内网；明文会暴露令牌） |
-| **`-allow-private-probes`** | `false` | 放行对内网私有网段与云元数据地址的探测（默认严格拦截） |
+| **`-allow-private-probes`** | `false` | 放行对内网私有网段与云元数据地址的探测（默认严格拦截）。只跳过“地址是否落在私网/保留段”这一步：节点测速的协议白名单、payload 结构与禁止字段、server 钉死等安全闸门照常执行 |
+| **`-allow-auto-install-deps`** | `false` | 允许测速任务在 `miaospeed` 缺失时自动下载安装（默认关闭：远程任务不应单方面触发以 root 下载执行新二进制；一键安装脚本会显式开启） |
 | **`-allow-remote-downgrade`** | `false` | 允许服务端远程指令把 Agent 降级到旧版本（默认只接受高于当前版本的目标；本地 `-apply-update` 不受限） |
 | **`-log-level`** | `info` | 日志级别：`debug` / `info` / `warn` / `error` |
 
@@ -121,6 +122,10 @@ mnagent -apply-update latest         # 立即升级到最新版本并平滑重�
 ## 📝 行为变更（v0.3.103）
 
 与升级相关、会影响已有部署的实际行为调整：
+
+- **`-allow-auto-install-deps` 默认关闭**：agent 不再仅因远程测速任务缺少 `miaospeed` 就自动下载安装（一键安装脚本仍会在服务参数里显式加上该开关）。若老节点只靠自更新升级到新版本、服务参数里没有这个开关，且 `miaospeed` 是首次用到时才懒安装的，请**重新执行一次安装命令**（`install.sh` / `install.ps1`），让服务参数补上 `-allow-auto-install-deps`，或在主机上手动安装 `miaospeed`。
+- **`-bot` 不再接受 userinfo / query / fragment**：`https://user:pass@host/agent`、`...?token=x`、`...#frag` 会在启动时被拒绝（安装脚本同样提前拦截），因为客户端会直接在地址后拼接 `/jobs`、`/results`，既会拼错路径也可能泄露凭据。凭据请用 `-token` / `-token-file`。
+- **明文 HTTP 默认只允许本地目标**：只有 `localhost`、`*.localhost` 以及字面回环/私网/链路本地 IP 可直接使用 `http://`；`*.lan`、`*.local`、单标签主机名和普通域名（包括 `10.example.com`、`fdic.example.com` 这类仅字符串前缀相似的域名）都视为非本地，必须显式加 `-allow-insecure-http`（安装脚本为 `--allow-insecure-http` / `-AllowInsecureHttp`），否则 agent 会拒绝启动。安装脚本与 agent 使用同一套严格判定，并把该开关传给 agent。
 
 - **超过 2MB 的任务结果不再缓存重发**：为避免低内存设备（16MB/32MB Flash 的 OpenWrt）被常驻缓存吃满，单条结果缓存上限为 **2MB**、所有缓存合计 **4MB**。超出上限的任务仍会标记为已完成，但服务端重复下发同一 `jobID` 时只会跳过重复执行并记录 `oversized` 告警，不会再重发缓存结果。
 - **miaospeed 单次响应上限 8MB**：单条 WebSocket JSON 响应超过 8MB 会直接报错并放弃，避免异常/恶意服务端把节点内存耗尽（正常 500 节点结果约 3MB）。同时累积缓冲的复用阈值降到 256KB，大缓冲交给 GC 回收。
