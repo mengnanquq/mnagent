@@ -1636,6 +1636,32 @@ func TestStartAutoUpdateNoReentry(t *testing.T) {
 	a.tasksWG.Wait()
 }
 
+// TestLoggableTargetRedactsHTTPAndUnvalidated 验证 http 目标只记录 scheme://host/path，
+// 且未通过参数校验的目标不会原样写入日志。
+func TestLoggableTargetRedactsHTTPAndUnvalidated(t *testing.T) {
+	httpJob := model.Job{Kind: "http", Target: "https://user:secret@example.com/api?token=log-secret#frag"}
+	got := loggableTarget(httpJob)
+	if strings.Contains(got, "secret") || strings.Contains(got, "user") || strings.Contains(got, "frag") {
+		t.Fatalf("http 目标日志未脱敏 userinfo/query/fragment: %s", got)
+	}
+	if got != "https://example.com/api" {
+		t.Fatalf("http 目标日志应保留 scheme://host/path，got=%q", got)
+	}
+
+	// 校验失败的目标（含空白/引号等）不得原样写进日志。
+	bad := model.Job{Kind: "trace", Target: "1.1.1.1\n--bad-flag"}
+	if got := loggableTarget(bad); strings.Contains(got, "--bad-flag") {
+		t.Fatalf("未通过校验的目标不应写入日志: %q", got)
+	}
+	if got := loggableTarget(model.Job{Kind: "trace", Target: "-oProxyCommand=x"}); strings.Contains(got, "ProxyCommand") {
+		t.Fatalf("以 - 开头的目标不应写入日志: %q", got)
+	}
+	// 合法目标保持原样，便于排障。
+	if got := loggableTarget(model.Job{Kind: "trace", Target: "example.com:443"}); got != "example.com:443" {
+		t.Fatalf("合法 trace 目标应保持原样，got=%q", got)
+	}
+}
+
 // TestRunnerMiaospeedRequiresExplicitAutoInstall 验证 Runner 默认不允许远程测速任务
 // 触发 miaospeed 的自动下载安装（必须显式 -allow-auto-install-deps）。
 func TestRunnerMiaospeedRequiresExplicitAutoInstall(t *testing.T) {

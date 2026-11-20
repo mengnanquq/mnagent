@@ -3,6 +3,8 @@ package runner
 import (
 	"context"
 	"math/rand/v2"
+	"net/url"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -28,13 +30,41 @@ func isUpgradeJob(job model.Job) bool {
 }
 
 // loggableTarget 返回可安全写入日志的任务目标。
-// miaospeed 的 Target 可能是含 token 的订阅 URL、节点 URI 或整段配置，
-// 直接打印会泄露凭据；其他探针目标受 targetPattern 限制，本身不含敏感信息。
+// miaospeed 的 Target 可能是含 token 的订阅 URL、节点 URI 或整段配置；
+// http 探针的 URL 可能带 userinfo（https://user:pass@host/）或 query 凭据，
+// 直接打印会泄露凭据，因此都必须先脱敏。
+// nexttrace 目标在 Runner.argv 里按 targetPattern 校验；这里对未通过同一校验的
+// 目标不写日志内容——不要在校验前就把任意字符串（可能含引号/空白/控制字符）写进日志。
 func loggableTarget(job model.Job) string {
-	if probe.ProbeKind(job) == "miaospeed" {
+	switch probe.ProbeKind(job) {
+	case "miaospeed":
 		return miaospeed.RedactTargetForLog(job.Target)
+	case probe.KindHTTP:
+		return redactHTTPTargetForLog(job.Target)
+	case probe.KindTrace:
+		// trace 目标由 Runner.argv 按 targetPattern 校验；校验不通过的字符串
+		// （可能含引号/空白/控制字符）不写进日志，避免在校验前落盘任意内容。
+		target := strings.TrimSpace(job.Target)
+		if target == "" || strings.HasPrefix(target, "-") || !targetPattern.MatchString(target) {
+			return "<目标未通过校验>"
+		}
+		return target
 	}
+	// 其余进程内探针（ping/tcping/dns）的目标由各自解析逻辑校验，保持原样便于排障。
 	return job.Target
+}
+
+// redactHTTPTargetForLog 只保留 scheme://host/path，去掉 userinfo 与 query：
+// http 探针目标可能形如 https://user:pass@host/api?token=xxx，日志与错误信息里
+// 只能出现不含凭据的部分。
+func redactHTTPTargetForLog(raw string) string {
+	raw = strings.TrimSpace(raw)
+	u, err := url.Parse(raw)
+	if err != nil || u.Host == "" || u.Scheme == "" {
+		return "<http 目标无法解析>"
+	}
+	clean := url.URL{Scheme: u.Scheme, Host: u.Host, Path: u.Path}
+	return clean.String()
 }
 
 // heavyWorker 串行处理重任务与远程更新，避免多重任务争抢带宽与端口，
