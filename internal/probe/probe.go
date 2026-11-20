@@ -1,10 +1,6 @@
 package probe
 
 import (
-	"github.com/mengnanquq/mnagent/internal/model"
-)
-
-import (
 	"bytes"
 	"context"
 	"crypto/rand"
@@ -26,6 +22,8 @@ import (
 	"golang.org/x/net/icmp"
 	"golang.org/x/net/ipv4"
 	"golang.org/x/net/ipv6"
+
+	"github.com/mengnanquq/mnagent/internal/model"
 )
 
 var Version = "dev"
@@ -147,7 +145,9 @@ func IsBlockedProbeIP(ip net.IP) bool {
 	}
 	ip16 := ip.To16()
 	if ip16 == nil {
-		return false
+		// fail-closed：不是合法 IPv4/IPv6 的地址（异常长度/畸形 IP）无法判定，
+		// 一律按拦截处理，绝不因为“判断不了”就放行。
+		return true
 	}
 	// IPv4 兼容地址 ::/96（::a.b.c.d）：Go 的 To4 不识别，但内核/部分库会把它当作 IPv4 使用。
 	// 只按内嵌 IPv4 判定，不能整段拦截：公网 IPv4 的兼容地址本身并不指向内网。
@@ -461,6 +461,9 @@ func TCPingProbe(ctx context.Context, job model.Job, allowPrivate bool) (Latency
 			}
 		}
 	}
+	// 只剩方括号没有端口的目标（如 [::1]）：先去掉方括号，否则 JoinHostPort
+	// 会把 "[::1]" 再包一层拼成 "[[::1]]:443"，连接必然失败。
+	host = strings.Trim(host, "[]")
 	if port == 0 {
 		port = 443
 	}
@@ -764,6 +767,10 @@ func newHTTPProbeTransport(dialer *net.Dialer, allowPrivate bool, timings *httpP
 		// 明确禁用环境代理：HTTP_PROXY/HTTPS_PROXY 会把请求交给代理，
 		// 代理自行解析目标并建立连接，从而完全绕过下面按解析 IP 做的 SSRF 校验。
 		Proxy: nil,
+		// 自定义 DialContext 会让 net/http 默认关闭 HTTP/2；这里显式打开，
+		// 避免探针结果里的协议/耗时与真实客户端（默认 h2）不一致。
+		// SNI 仍取自 URL 主机名，握手后按已校验的 IP 连接，SSRF 防护不受影响。
+		ForceAttemptHTTP2: true,
 		DialContext: func(ctx context.Context, network, addr string) (net.Conn, error) {
 			return dialHTTPProbeTarget(ctx, network, addr, dialer, allowPrivate, timings)
 		},
@@ -1016,6 +1023,9 @@ func DNSProbe(ctx context.Context, job model.Job, allowPrivate bool) (DNSReport,
 			}
 			add([]string{ip.String()})
 		}
+	// CNAME / MX / NS 只返回域名，不会去连接或解析这些名字（Go 的 LookupMX/LookupNS
+	// 不做二次解析），因此不存在借此探测内网的问题，不需要按 IsBlockedProbeIP 过滤；
+	// 真正会拿到 IP 的 A/AAAA/ALL 已在上面的分支逐条校验。
 	case "CNAME":
 		cname, err := resolver.LookupCNAME(queryCtx, host)
 		if err != nil {
@@ -1045,7 +1055,19 @@ func DNSProbe(ctx context.Context, job model.Job, allowPrivate bool) (DNSReport,
 		}
 		add(records)
 	case "PTR":
-		records, err := resolver.LookupAddr(queryCtx, host)
+		// PTR 是对地址的反向解析：输入必须是 IP（可带 IPv6 方括号）或 in-addr.arpa /
+		// ip6.arpa 反向域名。其它输入在不同平台上行为不一致（空结果或晦涩的 DNS 错误），
+		// 这里提前给出清晰的中文提示。
+		ptrHost := strings.Trim(host, "[]")
+		if net.ParseIP(ptrHost) == nil {
+			ip, ok := parseReverseDNSName(ptrHost)
+			if !ok {
+				return report, fmt.Errorf("PTR 反向解析需要 IP 地址（如 8.8.8.8、2001:4860:4860::8888）或 in-addr.arpa / ip6.arpa 反向域名，收到：%s", host)
+			}
+			// LookupAddr 只接受字面 IP；输入是反向域名时先还原成 IP。
+			ptrHost = ip.String()
+		}
+		records, err := resolver.LookupAddr(queryCtx, ptrHost)
 		if err != nil {
 			return report, err
 		}

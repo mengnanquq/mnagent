@@ -630,3 +630,62 @@ func TestProbeCanceledSentMatchesAttempts(t *testing.T) {
 		}
 	})
 }
+
+// TestIsBlockedProbeIPFailsClosedOnMalformedIP 验证畸形 IP（长度非法，To16 也失败）
+// 按拦截处理，绝不因为“判断不了”就放行。
+func TestIsBlockedProbeIPFailsClosedOnMalformedIP(t *testing.T) {
+	for _, ip := range []net.IP{nil, {1, 2, 3}, make(net.IP, 5), make(net.IP, 17)} {
+		if !IsBlockedProbeIP(ip) {
+			t.Fatalf("畸形/空 IP 应 fail-closed 拦截: %v", ip)
+		}
+	}
+}
+
+// TestTCPingProbeIPv6LiteralWithoutPort 验证 [::1] 这类“只有方括号没有端口”的目标
+// 不会拼成 [[::1]]:443。
+func TestTCPingProbeIPv6LiteralWithoutPort(t *testing.T) {
+	report, err := TCPingProbe(context.Background(), model.Job{
+		Kind:      KindTCPing,
+		Target:    "[::1]",
+		Count:     1,
+		TimeoutMS: 200,
+	}, true)
+	if err != nil {
+		t.Fatalf("TCPingProbe 不应因目标格式报错: %v", err)
+	}
+	if report.Target != "[::1]:443" {
+		t.Fatalf("目标应规范为 [::1]:443，实际 %q", report.Target)
+	}
+	if strings.Contains(report.Target, "[[") {
+		t.Fatalf("不得出现双层方括号: %q", report.Target)
+	}
+}
+
+// TestHTTPProbeTransportKeepsHTTP2 验证按 IP 拨号的 Transport 仍然尝试 HTTP/2
+// （自定义 DialContext 会让 net/http 默认关闭 h2）。
+func TestHTTPProbeTransportKeepsHTTP2(t *testing.T) {
+	tr := newHTTPProbeTransport(&net.Dialer{}, true, &httpPhaseTimings{})
+	defer tr.CloseIdleConnections()
+	if !tr.ForceAttemptHTTP2 {
+		t.Fatal("自定义 DialContext 时必须显式 ForceAttemptHTTP2，否则探针结果里的协议与真实客户端不一致")
+	}
+	if tr.DialContext == nil || tr.Proxy != nil {
+		t.Fatal("Transport 必须保留按 IP 校验的 DialContext 且禁用环境代理")
+	}
+}
+
+// TestDNSProbePTRRequiresIP 验证 PTR 查询对非 IP 输入给出清晰的中文错误。
+func TestDNSProbePTRRequiresIP(t *testing.T) {
+	_, err := DNSProbe(context.Background(), model.Job{Target: "example.com", Query: "PTR"}, true)
+	if err == nil || !strings.Contains(err.Error(), "PTR 反向解析需要 IP 地址") {
+		t.Fatalf("PTR 非 IP 输入应给出明确提示，实际: %v", err)
+	}
+	// IP（含 IPv6 方括号写法）与反向域名都应放行到真正查询阶段（此处只校验不返回格式错误）。
+	for _, target := range []string{"127.0.0.1", "[::1]", "1.0.0.127.in-addr.arpa"} {
+		report, err := DNSProbe(context.Background(), model.Job{Target: target, Query: "PTR"}, true)
+		if err != nil && strings.Contains(err.Error(), "PTR 反向解析需要 IP 地址") {
+			t.Fatalf("合法 PTR 输入被误判为格式错误: %s (%v)", target, err)
+		}
+		_ = report
+	}
+}
