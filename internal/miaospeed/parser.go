@@ -666,10 +666,35 @@ type singBoxOutbound struct {
 		ServiceName string            `json:"service_name"`
 	} `json:"transport"`
 
-	Obfs *struct {
+	Obfs *singBoxObfs `json:"obfs"`
+}
+
+// singBoxObfs 统一两种 obfs 写法：hysteria(1) 的 obfs 是字符串（obfs 密码，
+// 对应 mihomo HysteriaOption.Obfs），hysteria2 的 obfs 是 {type, password} 对象。
+// 按对象解析会让 hy/hysteria 节点的整个 outbound 解码失败（等于静默丢弃），
+// 因此用自定义 UnmarshalJSON 兼容两种形式。
+type singBoxObfs struct {
+	Type     string
+	Password string
+}
+
+func (o *singBoxObfs) UnmarshalJSON(data []byte) error {
+	var text string
+	if err := json.Unmarshal(data, &text); err == nil {
+		o.Type = ""
+		o.Password = text
+		return nil
+	}
+	var obj struct {
 		Type     string `json:"type"`
 		Password string `json:"password"`
-	} `json:"obfs"`
+	}
+	if err := json.Unmarshal(data, &obj); err != nil {
+		return err
+	}
+	o.Type = obj.Type
+	o.Password = obj.Password
+	return nil
 }
 
 // parseSingBoxJSON 从 Sing-box JSON 配置文件（或节点数组/单节点 JSON）中提取代理节点。
@@ -788,6 +813,51 @@ func convertSingBoxOutbound(ob singBoxOutbound) *MiaospeedNode {
 			sb.WriteString(fmt.Sprintf("network: %s\n", quoteYAML(netType)))
 		}
 		writeSingBoxTLSAndTransport(&sb, ob, "sni")
+	case "hysteria":
+		// sing-box 的 hy/hysteria 会被归一成 type: hysteria（mihomo 的 HysteriaOption），
+		// 字段对照与 hysteria:// URI 的生成逻辑（parseHysteria1URI）保持一致：
+		// protocol / auth-str / up / down / sni / alpn / skip-cert-verify / obfs。
+		// mihomo 的 HysteriaOption.Up/Down 是必填字段（proxy tag 无 omitempty，
+		// hysteria.go:109/111），Speed() 解出 0 会直接报错（hysteria.go:131-144），
+		// 因此节点 JSON 缺 up_mbps/down_mbps 时补一个可用的默认值，否则节点会在
+		// mihomo 创建代理时失败，等于仍被静默丢弃。
+		up := "100 mbps"
+		if ob.UpMbps > 0 {
+			up = fmt.Sprintf("%d mbps", ob.UpMbps)
+		}
+		down := "100 mbps"
+		if ob.DownMbps > 0 {
+			down = fmt.Sprintf("%d mbps", ob.DownMbps)
+		}
+		sb.WriteString(fmt.Sprintf("name: %s\ntype: hysteria\nserver: %s\nport: %d\nprotocol: %s\nup: %s\ndown: %s\n",
+			quoteYAML(name), quoteYAML(cleanServer), port, quoteYAML("udp"), quoteYAML(up), quoteYAML(down)))
+		if ob.AuthStr != "" {
+			sb.WriteString(fmt.Sprintf("auth-str: %s\n", quoteYAML(ob.AuthStr)))
+		}
+		if ob.Obfs != nil {
+			// hysteria(1) 的 obfs 是字符串形式，落在 Password（见 singBoxObfs）。
+			obfsValue := ob.Obfs.Type
+			if obfsValue == "" {
+				obfsValue = ob.Obfs.Password
+			}
+			if obfsValue != "" {
+				sb.WriteString(fmt.Sprintf("obfs: %s\n", quoteYAML(obfsValue)))
+			}
+		}
+		if ob.TLS != nil {
+			if ob.TLS.ServerName != "" {
+				sb.WriteString(fmt.Sprintf("sni: %s\n", quoteYAML(ob.TLS.ServerName)))
+			}
+			if ob.TLS.Insecure {
+				sb.WriteString("skip-cert-verify: true\n")
+			}
+			if len(ob.TLS.ALPN) > 0 {
+				sb.WriteString("alpn:\n")
+				for _, a := range ob.TLS.ALPN {
+					sb.WriteString(fmt.Sprintf("  - %s\n", quoteYAML(a)))
+				}
+			}
+		}
 	case "hysteria2":
 		sb.WriteString(fmt.Sprintf("name: %s\ntype: hysteria2\nserver: %s\nport: %d\npassword: %s\nudp: true\n",
 			quoteYAML(name), quoteYAML(cleanServer), port, quoteYAML(ob.Password)))

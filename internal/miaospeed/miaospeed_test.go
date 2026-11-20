@@ -12,6 +12,7 @@ import (
 	"crypto/sha256"
 	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net"
 	"net/http"
@@ -1058,6 +1059,74 @@ func TestParseHysteria1URI(t *testing.T) {
 	if !strings.Contains(p, `sni: "hy1.node.com"`) || !strings.Contains(p, "skip-cert-verify: true") {
 		t.Fatalf("Payload 缺少 TLS 配置: %s", p)
 	}
+}
+
+// TestSingBoxHysteriaOutboundConversion 覆盖 L6：sing-box 的 hy/hysteria 会先被归一成
+// pType="hysteria"，如果生成 payload 的 switch 里没有 case "hysteria"，节点会被静默丢弃。
+// 断言 payload 字段与 hysteria:// URI 的生成逻辑（parseHysteria1URI）一致，
+// 且生成的节点能通过节点安全闸门；同时回归 hysteria2 的 obfs 对象形式没有被改坏。
+func TestSingBoxHysteriaOutboundConversion(t *testing.T) {
+	content := `{"outbounds":[{"type":"hy","tag":"hy1","server":"public.example","server_port":8443,` +
+		`"auth_str":"sekret","up_mbps":50,"down_mbps":80,"obfs":"salamander",` +
+		`"tls":{"enabled":true,"server_name":"front.example","insecure":true,"alpn":["h3"]}}]}`
+	nodes := parseSingBoxJSON(content)
+	if len(nodes) != 1 {
+		t.Fatalf("sing-box hysteria 节点不应被丢弃，解析到 %d 个", len(nodes))
+	}
+	node := nodes[0]
+	if node.Protocol != "hysteria" || node.Server != "public.example:8443" || node.Name != "hy1" {
+		t.Fatalf("节点基础信息不符合预期：%+v", node)
+	}
+	for _, want := range []string{
+		"type: hysteria",
+		`protocol: "udp"`,
+		`up: "50 mbps"`,
+		`down: "80 mbps"`,
+		`auth-str: "sekret"`,
+		`obfs: "salamander"`,
+		`sni: "front.example"`,
+		"skip-cert-verify: true",
+		`  - "h3"`,
+	} {
+		if !strings.Contains(node.Payload, want) {
+			t.Fatalf("payload 缺少 %q：\n%s", want, node.Payload)
+		}
+	}
+
+	// type: hysteria 与 hy 走同一分支；缺 up_mbps/down_mbps 时也必须补出 mihomo
+	// HysteriaOption 必填的 up/down（否则节点在创建代理时就会失败）。
+	def := parseSingBoxJSON(`[{"type":"hysteria","server":"public.example","server_port":443,"auth_str":"a"}]`)
+	if len(def) != 1 {
+		t.Fatalf("type: hysteria 节点不应被丢弃，解析到 %d 个", len(def))
+	}
+	if !strings.Contains(def[0].Payload, `up: "100 mbps"`) || !strings.Contains(def[0].Payload, `down: "100 mbps"`) {
+		t.Fatalf("缺省 up/down 时应补默认值：\n%s", def[0].Payload)
+	}
+
+	// hysteria2 的 obfs 是 {type, password} 対象形式，自定义 UnmarshalJSON 后必须保持原行为。
+	hy2 := parseSingBoxJSON(`[{"type":"hysteria2","server":"public.example","server_port":443,` +
+		`"password":"p","obfs":{"type":"salamander","password":"x"}}]`)
+	if len(hy2) != 1 {
+		t.Fatalf("hysteria2 节点不应被丢弃，解析到 %d 个", len(hy2))
+	}
+	if !strings.Contains(hy2[0].Payload, `obfs: "salamander"`) || !strings.Contains(hy2[0].Payload, `obfs-password: "x"`) {
+		t.Fatalf("hysteria2 的 obfs 对象形式应保持原有映射：\n%s", hy2[0].Payload)
+	}
+
+	// 生成的节点必须能过闸门（协议在白名单、无地址类字段、server 可钉死）。
+	orig := lookupNodeIPs
+	defer func() { lookupNodeIPs = orig }()
+	lookupNodeIPs = func(_ context.Context, host string) ([]net.IP, error) {
+		if host == "public.example" {
+			return []net.IP{net.ParseIP("1.1.1.1")}, nil
+		}
+		return nil, errors.New("no such host")
+	}
+	kept, removed := filterBlockedNodes(context.Background(), nodes, nil)
+	if removed != 0 || len(kept) != 1 {
+		t.Fatalf("sing-box hysteria 节点应通过闸门，kept=%+v removed=%d", kept, removed)
+	}
+	assertPinnedServerOnly(t, kept[0].Payload, "1.1.1.1")
 }
 
 // TestParseSocks5URI 验证 SOCKS5 URI 解析。
