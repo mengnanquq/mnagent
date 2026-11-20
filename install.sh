@@ -39,6 +39,8 @@ VERSION="latest"
 MODE="auto"        # auto | release | source | binary
 BINARY_SRC=""
 BINARY_SHA256=""
+# --binary <URL> 拿不到同名 .sha256 时默认中止；只有显式 --insecure-skip-verify 才继续。
+INSECURE_SKIP_VERIFY="no"
 UNINSTALL="no"
 SERVICE_NAME="mnagent"
 AUTO_UPDATE="yes"   # 默认开启自动更新（可 --auto-update no 关闭）
@@ -75,6 +77,92 @@ validate_url_safe() {
 	fi
 }
 
+# validate_abs_path <值> <参数名>：将被写入 systemd/procd 单元的绝对路径只允许安全字符。
+# 这些值会原样进入 ExecStart / procd command，必须阻断空白、引号、换行、$、%、反斜杠等。
+validate_abs_path() {
+	path_value="$1"
+	path_label="$2"
+	case "$path_value" in
+		/*) ;;
+		*) die "${path_label} 必须是绝对路径：${path_value}";;
+	esac
+	path_leftover="$(printf '%s' "$path_value" | LC_ALL=C tr -d 'A-Za-z0-9_./@:+-')"
+	if [ -n "$path_leftover" ]; then
+		die "${path_label} 含不允许的字符（只允许 A-Za-z0-9_./@:+-，禁止空白、换行、引号、反斜杠、\$、% 等）：${path_value}"
+	fi
+}
+
+# validate_bin_ref <值> <参数名>：可执行文件参数允许绝对路径，或 PATH 中的裸文件名
+# （默认 nexttrace / miaospeed）。裸文件名不允许以 '-'、'.' 开头，避免被当成选项。
+validate_bin_ref() {
+	bin_value="$1"
+	bin_label="$2"
+	case "$bin_value" in
+		./*|../*|~*)
+			die "${bin_label} 必须是绝对路径（收到相对路径或 ~ 形式）：${bin_value}；请用完整绝对路径（例如 /usr/local/bin/${bin_value##*/}），或直接使用 PATH 中的裸名"
+			;;
+		*/*)
+			validate_abs_path "$bin_value" "$bin_label"
+			;;
+		*)
+			case "$bin_value" in
+				''|-*|.*) die "${bin_label} 取值非法：${bin_value}";;
+			esac
+			bin_leftover="$(printf '%s' "$bin_value" | LC_ALL=C tr -d 'A-Za-z0-9_.@:+-')"
+			if [ -n "$bin_leftover" ]; then
+				die "${bin_label} 含不允许的字符（只允许 A-Za-z0-9_.@:+-，禁止空白、换行、引号、\$ 等）：${bin_value}"
+			fi
+			;;
+	esac
+}
+
+# reject_newlines <值> <参数名>：grep 按行匹配，换行会绕过 ^...$ 校验，必须先显式拒绝。
+reject_newlines() {
+	case "$1" in
+		*'
+'*) die "${2} 不能包含换行字符";;
+	esac
+}
+
+# validate_duration <值> <参数名>：接受与 Go time.ParseDuration 兼容的 ASCII 子集，
+# 如 500ms、1.5h、1h30m、0。Go 额外支持的 µs/负数不在此列（配置里也用不到）。
+validate_duration() {
+	duration_value="$1"
+	duration_label="$2"
+	reject_newlines "$duration_value" "$duration_label"
+	[ "$duration_value" = "0" ] && return 0
+	printf '%s' "$duration_value" | grep -Eq '^([0-9]+(\.[0-9]+)?(ns|us|ms|s|m|h))+$' \
+		|| die "${duration_label} 取值非法：${duration_value}（只允许 Go duration 形式，如 500ms、1.5h、1h30m、0）"
+}
+
+# validate_user_name <值>：systemd/procd 的 User 与 useradd 参数只接受小写系统用户名（可带结尾的 $）。
+validate_user_name() {
+	user_value="$1"
+	reject_newlines "$user_value" "--user"
+	printf '%s' "$user_value" | grep -Eq '^[a-z_][a-z0-9_-]*[$]?$' \
+		|| die "--user 取值非法：${user_value}（只允许小写字母/数字/_/-，且必须以字母或 _ 开头）"
+}
+
+# validate_release_tag <值> <参数名>：latest 或 vX.Y.Z[-pre]；该值会拼入下载 URL 与编译 ldflags。
+validate_release_tag() {
+	tag_value="$1"
+	tag_label="$2"
+	if [ "$tag_value" = "latest" ]; then
+		return 0
+	fi
+	reject_newlines "$tag_value" "$tag_label"
+	printf '%s' "$tag_value" | grep -Eq '^v?[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.]+)?$' \
+		|| die "${tag_label} 取值非法：${tag_value}（只允许 latest 或 vX.Y.Z[-pre]）"
+}
+
+# validate_repo_ref <值>：GitHub owner/repo，会拼入下载 URL。
+validate_repo_ref() {
+	repo_value="$1"
+	reject_newlines "$repo_value" "MNAGENT_REPO"
+	printf '%s' "$repo_value" | grep -Eq '^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$' \
+		|| die "MNAGENT_REPO 取值非法：${repo_value}（应为 owner/repo）"
+}
+
 # strip_quotes <值>：兼容旧版单元中带引号的参数，升级时正确继承。
 strip_quotes() {
 	printf '%s' "$1" | sed -e 's/^"//' -e 's/"$//' -e "s/^'//" -e "s/'$//"
@@ -96,7 +184,10 @@ usage() {
   --version <tag>      安装的版本标签，默认 latest（取最新 Release）
   --binary <path|url>  直接使用已编译好的 mnagent（本地路径或下载地址）
   --sha256 <hex>       校验 --binary 指定文件的 SHA-256（URL 未提供时尝试同目录 <url>.sha256）
-  --from-source        从源码编译（Release 下载失败时不再自动回退，需显式指定本选项）
+  --insecure-skip-verify  --binary <url> 拿不到同名 .sha256 时仍继续安装
+                       （默认中止；仅在确认来源可信时使用）
+  --from-source        从源码编译（Release 下载失败时不再自动回退，需显式指定本选项；
+                       --version latest 时会编译 main 分支最新代码并打印警告）
   --user <name>        运行服务的用户（默认 root）
   --prefix <dir>       二进制安装目录（systemd 默认 /usr/local/bin，OpenWrt 默认 /usr/bin）
   --auto-update [yes|no] 是否启用自动更新（默认 yes）
@@ -161,49 +252,64 @@ if [ "$(id -u)" != "0" ]; then
 	die "需要 root 权限（管道安装请用 curl ... | sudo sh -s -- ...；若用 MNAGENT_TOKEN 传令牌，必须写成 sudo env MNAGENT_TOKEN=\"\$MNAGENT_TOKEN\" sh -s -- ...，否则 sudo 会清空该变量；OpenWrt 请以 root 登录）"
 fi
 
+# require_arg_count <选项名> <当前 $#>：确保带取值选项后面确实有取值。
+# 否则 `shift 2` 在最后一个参数时会越界报错（set -e 下直接退出），且错误信息不明确。
+require_arg_count() {
+	[ "$2" -ge 2 ] || die "参数 $1 缺少取值（用 --help 查看用法）"
+}
+
 while [ $# -gt 0 ]; do
 	case "$1" in
-		--bot)         BOT_URL="${2:-}"; shift 2;;
-		--token)       TOKEN="${2:-}"; TOKEN_FROM_ARG="yes"; shift 2;;
+		--bot)         require_arg_count --bot $#; BOT_URL="${2:-}"; shift 2;;
+		--token)       require_arg_count --token $#; TOKEN="${2:-}"; TOKEN_FROM_ARG="yes"; shift 2;;
 		--token-stdin) TOKEN_STDIN="yes"; shift;;
-		--token-file)  TOKEN_FILE="${2:-}"; shift 2;;
-			--nexttrace)   NEXTTRACE_BIN="${2:-}"; shift 2;;
-			--miaospeed)   MIAOSPEED_BIN="${2:-}"; shift 2;;
-			--miaospeed-version) MIAOSPEED_VERSION="${2:-}"; shift 2;;
-			--version)     VERSION="${2:-}"; shift 2;;
-			--binary)      BINARY_SRC="${2:-}"; MODE="binary"; shift 2;;
-			--sha256)      BINARY_SHA256="${2:-}"; shift 2;;
-			--from-source) MODE="source"; shift;;
-			--user)        RUN_USER="${2:-}"; shift 2;;
-			--prefix)      PREFIX="${2:-}"; shift 2;;
-			--uninstall)   UNINSTALL="yes"; shift;;
-			--auto-update)
-				case "${2:-}" in
-					yes|true|1) AUTO_UPDATE="yes"; shift 2;;
-					no|false|0) AUTO_UPDATE="no"; shift 2;;
-					"") AUTO_UPDATE="yes"; shift;;
-					-*) AUTO_UPDATE="yes"; shift;;
-					*) die "参数 --auto-update 的取值无效：${2}（只支持 yes 或 no）";;
-				esac
-				;;
-			--no-auto-update) AUTO_UPDATE="no"; shift;;
-			--update-interval) UPDATE_INTERVAL="${2:-}"; shift 2;;
-			--install-nexttrace)
-				case "${2:-}" in
-					no|false|0) INSTALL_NEXTTRACE="no"; shift 2;;
-					*) INSTALL_NEXTTRACE="yes"; [ -n "${2:-}" ] && [ "${2:-}" != "yes" ] && [ "${2:-}" != "true" ] || shift 2;;
-				esac
-				;;
-			--no-install-nexttrace) INSTALL_NEXTTRACE="no"; shift;;
-			--install-miaospeed)
-				case "${2:-}" in
-					no|false|0) INSTALL_MIAOSPEED="no"; shift 2;;
-					*) INSTALL_MIAOSPEED="yes"; [ -n "${2:-}" ] && [ "${2:-}" != "yes" ] && [ "${2:-}" != "true" ] || shift 2;;
-				esac
-				;;
-			--no-install-miaospeed) INSTALL_MIAOSPEED="no"; shift;;
-			--gh-proxy)     GH_PROXY="${2:-}"; shift 2;;
-				*) die "未知参数：$1（用 --help 查看用法）";;
+		--token-file)  require_arg_count --token-file $#; TOKEN_FILE="${2:-}"; shift 2;;
+		--nexttrace)   require_arg_count --nexttrace $#; NEXTTRACE_BIN="${2:-}"; shift 2;;
+		--miaospeed)   require_arg_count --miaospeed $#; MIAOSPEED_BIN="${2:-}"; shift 2;;
+		--miaospeed-version) require_arg_count --miaospeed-version $#; MIAOSPEED_VERSION="${2:-}"; shift 2;;
+		--version)     require_arg_count --version $#; VERSION="${2:-}"; shift 2;;
+		--binary)      require_arg_count --binary $#; BINARY_SRC="${2:-}"; MODE="binary"; shift 2;;
+		--sha256)      require_arg_count --sha256 $#; BINARY_SHA256="${2:-}"; shift 2;;
+		--insecure-skip-verify) INSECURE_SKIP_VERIFY="yes"; shift;;
+		--from-source) MODE="source"; shift;;
+		--user)        require_arg_count --user $#; RUN_USER="${2:-}"; RUN_USER_SET="yes"; shift 2;;
+		--prefix)      require_arg_count --prefix $#; PREFIX="${2:-}"; PREFIX_SET="yes"; shift 2;;
+		--uninstall)   UNINSTALL="yes"; shift;;
+		--auto-update)
+			AUTO_UPDATE_SET="yes"
+			case "${2:-}" in
+				yes|true|1) AUTO_UPDATE="yes"; shift 2;;
+				no|false|0) AUTO_UPDATE="no"; shift 2;;
+				"") AUTO_UPDATE="yes"; shift;;
+				-*) AUTO_UPDATE="yes"; shift;;
+				*) die "参数 --auto-update 的取值无效：${2}（只支持 yes 或 no）";;
+			esac
+			;;
+		--no-auto-update) AUTO_UPDATE="no"; AUTO_UPDATE_SET="yes"; shift;;
+		--update-interval) require_arg_count --update-interval $#; UPDATE_INTERVAL="${2:-}"; UPDATE_INTERVAL_SET="yes"; shift 2;;
+		--install-nexttrace)
+			case "${2:-}" in
+				yes|true|1) INSTALL_NEXTTRACE="yes"; shift 2;;
+				no|false|0) INSTALL_NEXTTRACE="no"; shift 2;;
+				"") INSTALL_NEXTTRACE="yes"; shift;;
+				-*) INSTALL_NEXTTRACE="yes"; shift;;
+				*) die "参数 --install-nexttrace 的取值无效：${2}（只支持 yes 或 no）";;
+			esac
+			;;
+		--no-install-nexttrace) INSTALL_NEXTTRACE="no"; shift;;
+		--install-miaospeed)
+			case "${2:-}" in
+				yes|true|1) INSTALL_MIAOSPEED="yes"; shift 2;;
+				no|false|0) INSTALL_MIAOSPEED="no"; shift 2;;
+				"") INSTALL_MIAOSPEED="yes"; shift;;
+				-*) INSTALL_MIAOSPEED="yes"; shift;;
+				*) die "参数 --install-miaospeed 的取值无效：${2}（只支持 yes 或 no）";;
+			esac
+			;;
+		--no-install-miaospeed) INSTALL_MIAOSPEED="no"; shift;;
+		--gh-proxy)     require_arg_count --gh-proxy $#; GH_PROXY="${2:-}"; shift 2;;
+		--insecure-proxy-checksum) INSECURE_PROXY_CHECKSUM="yes"; shift;;
+		*) die "未知参数：$1（用 --help 查看用法）";;
 	esac
 done
 
@@ -557,6 +663,31 @@ elif [ "$PLATFORM" = "openwrt" ] && [ -f "$INIT_DIR/$SERVICE_NAME" ]; then
 	existing_cmd="$(grep -A 10 'procd_set_param command' "$INIT_DIR/$SERVICE_NAME" | sed -e 's/\\$//' | tr '\n' ' ' || true)"
 fi
 
+# existing_prefix_from_cmd <existing_cmd>：从 ExecStart / procd command 的首个 token
+# 反推安装前缀（仅当首 token 是绝对路径时）。升级时用户没显式传 --prefix 即沿用旧位置。
+existing_prefix_from_cmd() {
+	prefix_cmd="$1"
+	prefix_first="$(printf '%s' "$prefix_cmd" | sed -e 's/^[[:space:]]*//' -e 's/.*procd_set_param command[[:space:]]*//' | awk '{print $1}')"
+	prefix_first="$(strip_quotes "$prefix_first")"
+	case "$prefix_first" in
+		/*/*) dirname "$prefix_first";;
+	esac
+}
+
+# 运行用户同样从现有 unit/init 脚本继承（仅当用户未显式 --user）。
+if [ "$RUN_USER_SET" = "no" ]; then
+	inherited_user=""
+	if [ "$PLATFORM" = "systemd" ] && [ -f "$INIT_DIR/$SERVICE_NAME.service" ]; then
+		inherited_user="$(grep -E '^User=' "$INIT_DIR/$SERVICE_NAME.service" | head -n1 | sed 's/^User=//' | tr -d ' \t\r' || true)"
+	elif [ "$PLATFORM" = "openwrt" ] && [ -f "$INIT_DIR/$SERVICE_NAME" ]; then
+		inherited_user="$(grep -E '^[[:space:]]*procd_set_param user ' "$INIT_DIR/$SERVICE_NAME" | head -n1 | awk '{print $3}' | tr -d '\r' || true)"
+	fi
+	if [ -n "$inherited_user" ]; then
+		RUN_USER="$inherited_user"
+		log "已从现有服务配置继承运行用户: $RUN_USER"
+	fi
+fi
+
 if [ -n "$existing_cmd" ]; then
 	if [ -z "$BOT_URL" ]; then
 		extracted_bot="$(strip_quotes "$(printf '%s' "$existing_cmd" | grep -o -- '-bot [^ ]*' | head -n1 | awk '{print $2}' || true)")"
@@ -591,12 +722,49 @@ if [ -n "$existing_cmd" ]; then
 			MIAOSPEED_BIN="$extracted_miao"
 		fi
 	fi
+	if [ "$AUTO_UPDATE_SET" = "no" ]; then
+		if printf '%s' "$existing_cmd" | grep -q -- '-auto-update'; then
+			AUTO_UPDATE="yes"
+		else
+			AUTO_UPDATE="no"
+		fi
+		log "已从现有服务配置继承自动更新设置: $AUTO_UPDATE"
+	fi
+	if [ "$UPDATE_INTERVAL_SET" = "no" ]; then
+		extracted_interval="$(strip_quotes "$(printf '%s' "$existing_cmd" | grep -o -- '-update-interval [^ ]*' | head -n1 | awk '{print $2}' || true)")"
+		if [ -n "$extracted_interval" ]; then
+			UPDATE_INTERVAL="$extracted_interval"
+			log "已从现有服务配置继承更新检查间隔: $UPDATE_INTERVAL"
+		fi
+	fi
+	if [ "$PREFIX_SET" = "no" ]; then
+		extracted_prefix="$(existing_prefix_from_cmd "$existing_cmd")"
+		if [ -n "$extracted_prefix" ]; then
+			PREFIX="$extracted_prefix"
+			log "已从现有服务配置继承安装前缀: $PREFIX"
+		fi
+	fi
 fi
 
 [ -n "$BOT_URL" ] || die "缺少 --bot"
 validate_url_safe "$BOT_URL" "--bot"
 if [ -n "$GH_PROXY" ]; then
 	validate_url_safe "$GH_PROXY" "--gh-proxy"
+fi
+
+# 统一白名单校验：以下值都会写入 systemd/procd 单元或下载/编译命令，
+# 必须在生成单元、创建用户、写文件之前从源头阻断换行/引号/空白等注入字符。
+validate_abs_path "$TOKEN_FILE" "--token-file"
+validate_abs_path "$PREFIX" "--prefix"
+validate_bin_ref "$NEXTTRACE_BIN" "--nexttrace"
+validate_bin_ref "$MIAOSPEED_BIN" "--miaospeed"
+validate_duration "$UPDATE_INTERVAL" "--update-interval"
+validate_user_name "$RUN_USER"
+validate_release_tag "$MIAOSPEED_VERSION" "--miaospeed-version"
+validate_release_tag "$VERSION" "--version"
+validate_repo_ref "$REPO"
+if [ -n "$INIT_DIR" ]; then
+	validate_abs_path "$INIT_DIR" "MNAGENT_INIT_DIR"
 fi
 
 # 令牌可由 --token-stdin 或 MNAGENT_TOKEN 提供，避免明文出现在 argv/ps/命令历史中。
@@ -642,6 +810,10 @@ build_from_source() {
 	src_url="https://github.com/$REPO/archive/refs/tags/${VERSION}.tar.gz"
 	if [ "$VERSION" = "latest" ]; then
 		src_url="https://github.com/$REPO/archive/refs/heads/main.tar.gz"
+		warn "================================================================"
+		warn "--from-source 在 --version latest 时编译 main 分支最新代码（可能包含未发布改动）！"
+		warn "生产环境请用 --version <已发布标签> 编译固定版本。"
+		warn "================================================================"
 	fi
 	download_stdout "$(apply_gh_proxy "$src_url")" | tar -xz -C "$tmp"
 	dir="$(ls -d "$tmp"/*/ | head -n1)"
@@ -669,6 +841,8 @@ case "$MODE" in
 		if [ -f "$BINARY_SRC" ]; then
 			if [ -n "$BINARY_SHA256" ]; then
 				verify_sha256_value "$BINARY_SRC" "$BINARY_SHA256" "mnagent"
+			else
+				warn "--binary 指向本地文件但未提供 --sha256：无法校验完整性，将继续安装；建议补充 --sha256 <hex> 校验来源"
 			fi
 			install_file "$BINARY_SRC" "$PREFIX/mnagent" 0755
 		else
@@ -691,10 +865,16 @@ case "$MODE" in
 				fi
 				verify_sha256_value "$tmp_bin" "$sum_expected" "mnagent"
 			else
-				warn "================================================================"
-				warn "未提供 --sha256，且无法获取 ${BINARY_SRC}.sha256，将跳过完整性校验继续安装！"
-				warn "你显式指定了二进制来源，请自行确认该地址可信（内网镜像/自建分发需自行负责）。"
-				warn "================================================================"
+				rm -f "${tmp_bin}.sha256"
+				if [ "$INSECURE_SKIP_VERIFY" = "yes" ]; then
+					warn "================================================================"
+					warn "已显式指定 --insecure-skip-verify：无法获取 ${BINARY_SRC}.sha256，将跳过完整性校验继续安装！"
+					warn "你已自行承担来源不可信的风险，请确认该地址可信（内网镜像/自建分发需自行负责）。"
+					warn "================================================================"
+				else
+					rm -f "$tmp_bin"
+					die "无法获取 ${BINARY_SRC}.sha256，已中止安装（默认拒绝未校验的 --binary 下载）。请改用 --sha256 <hex> 提供校验值，或确认来源可信后显式加 --insecure-skip-verify"
+				fi
 			fi
 			install_file "$tmp_bin" "$PREFIX/mnagent" 0755
 			rm -f "$tmp_bin"
@@ -735,7 +915,18 @@ if [ "$RUN_USER" != "root" ]; then
 else
 	log "以 root 运行"
 fi
+# 语法已由 validate_user_name 保证；这里确认用户真实存在（新创建的用户也应能解析）。
+id -u "$RUN_USER" >/dev/null 2>&1 || die "运行用户 $RUN_USER 不存在或无法解析"
 RUN_GROUP="$(id -gn "$RUN_USER" 2>/dev/null || echo "$RUN_USER")"
+# 主组名会被写入 systemd 的 Group=，也会作为 chown 的组名，必须与用户名同样做白名单
+# 校验（禁止空白/引号/换行/控制字符）。不合法时回退为用户名（同名校验会在 chown
+# 失败时降级为仅改属主），并明确告警，而不是把可疑值写进单元。
+case "$RUN_GROUP" in
+	''|-*|*[!A-Za-z0-9_.-]*)
+		warn "运行用户 ${RUN_USER} 的主组名（${RUN_GROUP}）不合法，回退为 ${RUN_USER}；如服务用户无法读取令牌，请确认该组存在并手动修正 Group="
+		RUN_GROUP="$RUN_USER"
+		;;
+esac
 
 # ---------- 令牌 ----------
 
@@ -796,6 +987,28 @@ find_binary() {
 		fi
 	done
 	return 1
+}
+
+# safe_exec_or_bare <解析后路径> <裸名> <标签>
+# 解析后的真实路径同样会写入服务单元：PATH 中可能包含带空白/引号/非 ASCII 的文件名，
+# 这类值不能写进 unit。此时不中止安装（二进制本身可用），而是告警并回退为裸名，
+# 由服务运行时的 PATH 查找；绝不把不安全值写进单元。
+safe_exec_or_bare() {
+	safe_exec_value="$1"
+	safe_exec_bare="$2"
+	safe_exec_label="$3"
+	case "$safe_exec_value" in
+		/*) ;;
+		*) printf '%s' "$safe_exec_bare"; return 0;;
+	esac
+	safe_exec_leftover="$(printf '%s' "$safe_exec_value" | LC_ALL=C tr -d 'A-Za-z0-9_./@:+-')"
+	if [ -n "$safe_exec_leftover" ]; then
+		warn "${safe_exec_label} 的解析路径含不能写入服务单元的字符：${safe_exec_value}"
+		warn "已回退为裸名 ${safe_exec_bare}（由服务 PATH 查找）。如需固定使用该二进制，请把它移动到无空格/特殊字符的路径，或改用绝对路径参数。"
+		printf '%s' "$safe_exec_bare"
+		return 0
+	fi
+	printf '%s' "$safe_exec_value"
 }
 
 map_nexttrace_arch() {
@@ -941,7 +1154,14 @@ if [ "$PLATFORM" = "openwrt" ] && [ -n "$NEXTTRACE_PATH" ] && [ -x "$NEXTTRACE_P
 fi
 
 [ -n "$NEXTTRACE_PATH" ] || warn "未找到 nexttrace（${NEXTTRACE_BIN}）：请安装后再试，否则追踪会失败"
-NEXTTRACE_EXEC="${NEXTTRACE_PATH:-$NEXTTRACE_BIN}"
+# 解析后的真实路径同样进入服务单元：PATH 中可能包含带空白/引号的可疑文件名。
+# 不合白名单时告警并回退为裸名（依赖运行时 PATH），而不是 die 或写入不安全值。
+NEXTTRACE_BARE="nexttrace"
+case "$NEXTTRACE_BIN" in
+	*/*) ;;
+	*) NEXTTRACE_BARE="$NEXTTRACE_BIN";;
+esac
+NEXTTRACE_EXEC="$(safe_exec_or_bare "${NEXTTRACE_PATH:-$NEXTTRACE_BIN}" "$NEXTTRACE_BARE" "nexttrace 可执行路径")"
 
 map_miaospeed_arch() {
 	case "$1" in
@@ -1074,7 +1294,12 @@ if [ "$PLATFORM" = "openwrt" ] && [ -n "$MIAOSPEED_PATH" ] && [ -x "$MIAOSPEED_P
 	fi
 fi
 
-MIAOSPEED_EXEC="${MIAOSPEED_PATH:-$MIAOSPEED_BIN}"
+MIAOSPEED_BARE="miaospeed"
+case "$MIAOSPEED_BIN" in
+	*/*) ;;
+	*) MIAOSPEED_BARE="$MIAOSPEED_BIN";;
+esac
+MIAOSPEED_EXEC="$(safe_exec_or_bare "${MIAOSPEED_PATH:-$MIAOSPEED_BIN}" "$MIAOSPEED_BARE" "miaospeed 可执行路径")"
 
 # 自动更新参数：启用时追加到服务命令（systemd 与 procd 共用）。
 AUTO_UPDATE_ARGS=""

@@ -2,12 +2,17 @@ package main
 
 import (
 	"bytes"
+	"context"
+	"fmt"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"regexp"
 	"strings"
 	"testing"
+	"time"
 )
 
 // riskyVarRef 匹配“$VAR 紧跟非 ASCII 字节”的写法。
@@ -134,6 +139,8 @@ func installEnv(fakeBin, initDir, defaultToken string, extra ...string) []string
 		"MNAGENT_GH_PROXY":   "",
 		"GH_PROXY":           "",
 		"MNAGENT_REPO":       "",
+		// 避免测试在平台为 none/openwrt 时碰真实的 /var/lib/mnagent。
+		"MNAGENT_STATE_DIR": filepath.Join(filepath.Dir(initDir), "state"),
 	}
 	for _, kv := range extra {
 		if k, v, ok := strings.Cut(kv, "="); ok {
@@ -158,13 +165,22 @@ func installEnv(fakeBin, initDir, defaultToken string, extra ...string) []string
 // 借 user namespace（unshare -r）模拟 root，脚本只会写临时目录，不会碰真实 /etc。
 func runInstallScript(t *testing.T, scriptPath string, args, env []string, stdin string) (string, error) {
 	t.Helper()
+	return runInstallScriptTimeout(t, scriptPath, args, env, stdin, 90*time.Second)
+}
+
+// runInstallScriptTimeout 与 runInstallScript 相同，但带硬超时：参数解析写错导致
+// 无限循环时测试会失败而不是挂住 CI（实测 `--install-miaospeed auto` 曾死循环）。
+func runInstallScriptTimeout(t *testing.T, scriptPath string, args, env []string, stdin string, timeout time.Duration) (string, error) {
+	t.Helper()
 	sh, err := exec.LookPath("sh")
 	if err != nil {
 		t.Skip("未找到 sh")
 	}
+	ctx, cancel := context.WithTimeout(context.Background(), timeout)
+	defer cancel()
 	var cmd *exec.Cmd
 	if os.Geteuid() == 0 {
-		cmd = exec.Command(sh, append([]string{scriptPath}, args...)...)
+		cmd = exec.CommandContext(ctx, sh, append([]string{scriptPath}, args...)...)
 	} else {
 		unshare, err := exec.LookPath("unshare")
 		if err != nil {
@@ -173,11 +189,14 @@ func runInstallScript(t *testing.T, scriptPath string, args, env []string, stdin
 		if err := exec.Command(unshare, "-r", "--", "true").Run(); err != nil {
 			t.Skipf("非 root 且 unshare -r 不可用（%v），跳过可执行安装脚本测试", err)
 		}
-		cmd = exec.Command(unshare, append([]string{"-r", "--", sh, scriptPath}, args...)...)
+		cmd = exec.CommandContext(ctx, unshare, append([]string{"-r", "--", sh, scriptPath}, args...)...)
 	}
 	cmd.Env = env
 	cmd.Stdin = strings.NewReader(stdin)
 	out, err := cmd.CombinedOutput()
+	if ctx.Err() == context.DeadlineExceeded {
+		return string(out), fmt.Errorf("安装脚本执行超时（%s），疑似参数解析死循环", timeout)
+	}
 	return string(out), err
 }
 
@@ -400,6 +419,45 @@ func TestServiceUnitStopTimeout(t *testing.T) {
 	if !strings.Contains(string(tpl), "TimeoutStopSec=80") {
 		t.Error("deploy/mnagent.service 缺少 TimeoutStopSec=80")
 	}
+	if !strings.Contains(string(tpl), "StateDirectoryMode=0700") {
+		t.Error("deploy/mnagent.service 缺少 StateDirectoryMode=0700")
+	}
+}
+
+// TestServiceUnitHardeningOptions 验证 deploy/mnagent.service 与 install.sh 内联生成的
+// systemd 单元都包含保守加固选项，避免模板与安装脚本漂移。
+func TestServiceUnitHardeningOptions(t *testing.T) {
+	options := []string{
+		"ProtectKernelModules=true",
+		"ProtectKernelLogs=true",
+		"ProtectClock=true",
+		"ProtectHostname=true",
+		"RestrictNamespaces=true",
+		"RestrictRealtime=true",
+		"PrivateDevices=true",
+		"RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6 AF_NETLINK AF_PACKET",
+	}
+	tpl, err := os.ReadFile(filepath.Join(findRepoRoot(), "deploy", "mnagent.service"))
+	if err != nil {
+		t.Fatalf("读取 deploy/mnagent.service 失败：%v", err)
+	}
+	script := string(readInstallScript(t))
+	for _, opt := range options {
+		if !strings.Contains(string(tpl), opt) {
+			t.Errorf("deploy/mnagent.service 缺少加固选项 %q", opt)
+		}
+		if !containsActiveLine(script, opt) {
+			t.Errorf("install.sh 生成的 systemd 单元缺少加固选项 %q", opt)
+		}
+	}
+	// SystemCallArchitectures=native 会拒绝 32 位用户态二进制在 64 位内核上的全部系统调用
+	// （如树莓派 32 位系统），因此模板与安装脚本都只保留解释性注释，不得真正启用。
+	if containsActiveLine(string(tpl), "SystemCallArchitectures=") {
+		t.Error("deploy/mnagent.service 不应启用 SystemCallArchitectures")
+	}
+	if containsActiveLine(script, "SystemCallArchitectures=") {
+		t.Error("install.sh 生成的 systemd 单元不应启用 SystemCallArchitectures")
+	}
 }
 
 // containsActiveLine 判断脚本的非注释行中是否包含 needle。
@@ -416,6 +474,72 @@ func containsActiveLine(script, needle string) bool {
 	return false
 }
 
+// TestInstallScriptBinaryURLRequiresChecksum 验证 --binary <URL> 拿不到同名 .sha256 时
+// 默认中止安装，只有显式 --insecure-skip-verify 才允许继续。
+func TestInstallScriptBinaryURLRequiresChecksum(t *testing.T) {
+	f := newFakeInstall(t, map[string]string{
+		"nexttrace": "#!/bin/sh\nexit 0\n",
+		"miaospeed": "#!/bin/sh\nexit 0\n",
+	})
+	body := "#!/bin/sh\necho 'mnagent v0.0.0'\n"
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/mnagent":
+			_, _ = w.Write([]byte(body))
+		case "/mnagent.sha256":
+			http.NotFound(w, r)
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer srv.Close()
+
+	scriptPath := filepath.Join(findRepoRoot(), "install.sh")
+	args := []string{
+		"--bot", "https://bot.example/agent",
+		"--token-file", f.tokenFile,
+		"--binary", srv.URL + "/mnagent",
+		"--prefix", filepath.Join(f.tmp, "install"),
+		"--no-install-nexttrace", "--no-install-miaospeed",
+	}
+	out, err := runInstallScript(t, scriptPath, args, f.env(), "")
+	if err == nil || !strings.Contains(out, "无法获取") || !strings.Contains(out, "--insecure-skip-verify") {
+		t.Fatalf("拿不到 .sha256 时应默认中止并提示显式选项，err=%v\n%s", err, out)
+	}
+	if _, statErr := os.Stat(filepath.Join(f.tmp, "install", "mnagent")); statErr == nil {
+		t.Fatal("默认中止时不应安装二进制")
+	}
+
+	out, err = runInstallScript(t, scriptPath, append(args, "--insecure-skip-verify"), f.env(), "")
+	if err != nil {
+		t.Fatalf("显式 --insecure-skip-verify 时应允许继续安装: %v\n%s", err, out)
+	}
+	if !strings.Contains(out, "insecure-skip-verify") {
+		t.Fatalf("跳过校验时应打印醒目警告，实际输出:\n%s", out)
+	}
+	if _, statErr := os.Stat(filepath.Join(f.tmp, "install", "mnagent")); statErr != nil {
+		t.Fatalf("显式跳过校验后应安装成功: %v", statErr)
+	}
+}
+
+// TestInstallScriptBinaryLocalWithoutChecksumWarns 验证 --binary 指向本地文件且
+// 未提供 --sha256 时只打印一次警告，不中止安装。
+func TestInstallScriptBinaryLocalWithoutChecksumWarns(t *testing.T) {
+	f := newFakeInstall(t, nil)
+	scriptPath := filepath.Join(findRepoRoot(), "install.sh")
+	out, err := runInstallScript(t, scriptPath, f.args(), f.env(), "")
+	if err != nil {
+		t.Fatalf("本地 --binary 无 --sha256 应继续安装: %v\n%s", err, out)
+	}
+	const warning = "--binary 指向本地文件但未提供 --sha256"
+	if got := strings.Count(out, warning); got != 1 {
+		t.Fatalf("本地 --binary 无 --sha256 应恰好警告一次，实际 %d 次：\n%s", got, out)
+	}
+	if _, statErr := os.Stat(filepath.Join(f.tmp, "install", "mnagent")); statErr != nil {
+		t.Fatalf("警告不应阻止安装: %v", statErr)
+	}
+}
+
 // TestInstallScriptKeepsKeySafeguards 防止把踩过坑的修复改回去：
 // 令牌目录权限、升级时重启、能力来源、安装后自检。
 func TestInstallScriptKeepsKeySafeguards(t *testing.T) {
@@ -430,9 +554,14 @@ func TestInstallScriptKeepsKeySafeguards(t *testing.T) {
 		{"为 nexttrace 准备可写主目录", "StateDirectory=mnagent"},
 		{"自动更新可写目录", "ReadWritePaths=$PREFIX"},
 		{"下载后强制校验 SHA-256", `verify_sha256 "$PREFIX/.mnagent.new"`},
-		{"校验文件为同名 .sha256", `sum_url="${url}.sha256"`},
+		{"校验文件为同名 .sha256", `verify_sha256 "$PREFIX/.mnagent.new" "$raw_url" "$asset"`},
+		{"使用代理时直连获取校验文件", `download_trusted_artifact "${verify_raw_url}.sha256"`},
+		{"显式允许经代理获取校验文件", "--insecure-proxy-checksum"},
 		{"--binary 支持显式哈希", `verify_sha256_value "$tmp_bin" "$BINARY_SHA256"`},
 		{"--binary 尝试同名 .sha256", `download "${BINARY_SRC}.sha256"`},
+		{"--binary 拿不到校验默认中止", `无法获取 ${BINARY_SRC}.sha256，已中止安装`},
+		{"显式跳过 --binary 校验选项", "--insecure-skip-verify"},
+		{"--from-source main 分支警告", "main 分支最新代码"},
 		{"Release 失败不自动源码编译", "download_release || die"},
 		{"SHA-256 工具首选 sha256sum", `sha256sum "$sha_file"`},
 		{"SHA-256 回退 shasum -a 256", "shasum -a 256"},
@@ -563,6 +692,10 @@ func TestWindowsInstallScript(t *testing.T) {
 		{"严格校验 -GhProxy URL", "Assert-UrlSafe $GhProxy"},
 		{"支持环境变量令牌", "$env:MNAGENT_TOKEN"},
 		{"参数定义 -Uninstall", "[switch]$Uninstall"},
+		{"参数定义 -InsecureProxyChecksum", "[switch]$InsecureProxyChecksum"},
+		{"校验文件优先直连获取", "Download-ChecksumFile"},
+		{"收紧令牌文件 ACL", "icacls.exe"},
+		{"先重置令牌文件 ACL", `/reset`},
 	}
 
 	for _, c := range checks {
@@ -606,5 +739,554 @@ func TestReleaseWorkflowRunsTestsOnlyInPrepare(t *testing.T) {
 	testIdx := strings.Index(workflow, testCmd)
 	if prepareIdx < 0 || buildIdx < 0 || testIdx < 0 || !(prepareIdx < testIdx && testIdx < buildIdx) {
 		t.Fatalf("go test 应位于 prepare 阶段（prepare=%d test=%d build=%d）", prepareIdx, testIdx, buildIdx)
+	}
+}
+
+// TestInstallScriptRejectsUnsafeUnitValues 验证所有会写入 systemd/procd 单元的参数
+// 都经过白名单校验，含换行/引号/空白/命令分隔符的取值必须在生成单元前被拒绝。
+func TestInstallScriptRejectsUnsafeUnitValues(t *testing.T) {
+	root := findRepoRoot()
+	scriptPath := filepath.Join(root, "install.sh")
+	tmp := t.TempDir()
+	fakeBin := filepath.Join(tmp, "bin")
+	if err := os.MkdirAll(fakeBin, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	fakeAgent := filepath.Join(tmp, "mnagent-fake")
+	if err := os.WriteFile(fakeAgent, []byte("#!/bin/sh\nexit 0\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	tokenFile := filepath.Join(tmp, "token")
+	if err := os.WriteFile(tokenFile, []byte("test-token\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	baseArgs := []string{
+		"--bot", "https://bot.example/agent",
+		"--token-file", tokenFile,
+		"--binary", fakeAgent,
+	}
+	cases := []struct {
+		name string
+		args []string
+		want string
+	}{
+		{"update-interval 命令注入", []string{"--update-interval", "6h; touch /tmp/pwn"}, "--update-interval 取值非法"},
+		{"update-interval 空值", []string{"--update-interval", ""}, "--update-interval 取值非法"},
+		{"prefix 相对路径", []string{"--prefix", "relative/bin"}, "--prefix 必须是绝对路径"},
+		{"prefix 含空白", []string{"--prefix", "/tmp/with space"}, "--prefix 含不允许的字符"},
+		{"token-file 换行注入", []string{"--token-file", tokenFile + "\nEnvironment=BAD=1"}, "--token-file 含不允许的字符"},
+		{"nexttrace 命令注入", []string{"--nexttrace", "/usr/bin/nexttrace;id"}, "--nexttrace 含不允许的字符"},
+		{"nexttrace 相对路径", []string{"--nexttrace", "./nexttrace"}, "--nexttrace 必须是绝对路径"},
+		{"miaospeed ~ 路径", []string{"--miaospeed", "~/bin/miaospeed"}, "--miaospeed 必须是绝对路径"},
+		{"miaospeed 引号注入", []string{"--miaospeed", "/usr/bin/miao\"speed"}, "--miaospeed 含不允许的字符"},
+		{"user 命令注入", []string{"--user", "root;id"}, "--user 取值非法"},
+		{"user 换行注入", []string{"--user", "root\nEnvironment=BAD=1"}, "--user 不能包含换行字符"},
+		{"update-interval 换行注入", []string{"--update-interval", "6h\nEnvironment=BAD=1"}, "--update-interval 不能包含换行字符"},
+		{"version 注入", []string{"--version", "v1.2.3;id"}, "--version 取值非法"},
+		{"miaospeed-version 注入", []string{"--miaospeed-version", "4.7.8\nEnvironment=BAD=1"}, "--miaospeed-version 不能包含换行字符"},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			env := installEnv(fakeBin, filepath.Join(tmp, "init"), filepath.Join(tmp, "default-token"), "MNAGENT_PLATFORM=none")
+			out, err := runInstallScript(t, scriptPath, append(append([]string{}, baseArgs...), tc.args...), env, "")
+			if err == nil {
+				t.Fatalf("不安全参数应被拒绝，输出：\n%s", out)
+			}
+			if !strings.Contains(out, tc.want) {
+				t.Fatalf("错误信息应包含 %q，实际输出：\n%s", tc.want, out)
+			}
+		})
+	}
+}
+
+// extractShellFunction 从 install.sh 文本中提取一个顶层 shell 函数（到行首的 } 为止）。
+func extractShellFunction(t *testing.T, script, name string) string {
+	t.Helper()
+	start := strings.Index(script, name+"() {")
+	if start < 0 {
+		t.Fatalf("install.sh 中未找到函数 %s", name)
+	}
+	end := strings.Index(script[start:], "\n}\n")
+	if end < 0 {
+		t.Fatalf("未找到函数 %s 的结束标记", name)
+	}
+	return script[start : start+end+len("\n}\n")]
+}
+
+// TestInstallScriptProxyChecksumPolicy 直接执行 install.sh 中提取的
+// download_trusted_artifact，验证“代理场景优先直连、直连失败默认拒绝、
+// 仅 --insecure-proxy-checksum 才回退代理”的策略。
+func TestInstallScriptProxyChecksumPolicy(t *testing.T) {
+	script := string(readInstallScript(t))
+	fn := extractShellFunction(t, script, "download_trusted_artifact")
+	harness := `#!/bin/sh
+set -eu
+log() { :; }
+warn() { printf 'WARN:%s\n' "$*" >&2; }
+download() {
+	case "$1" in
+		*raw-ok*)   printf 'raw' > "$2" ;;
+		*raw-fail*) return 1 ;;
+		*proxied*)  printf 'proxy' > "$2" ;;
+		*) return 1 ;;
+	esac
+}
+` + fn + `
+download_trusted_artifact "$1" "$2" "$3" " test"
+`
+	harnessPath := filepath.Join(t.TempDir(), "policy.sh")
+	if err := os.WriteFile(harnessPath, []byte(harness), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	sh, err := exec.LookPath("sh")
+	if err != nil {
+		t.Skip("未找到 sh")
+	}
+
+	run := func(t *testing.T, ghProxy, insecure, rawURL, proxiedURL string) (string, error) {
+		t.Helper()
+		dest := filepath.Join(t.TempDir(), "artifact")
+		cmd := exec.Command(sh, harnessPath, rawURL, proxiedURL, dest)
+		cmd.Env = append(os.Environ(), "GH_PROXY="+ghProxy, "INSECURE_PROXY_CHECKSUM="+insecure)
+		out, err := cmd.CombinedOutput()
+		content := ""
+		if data, readErr := os.ReadFile(dest); readErr == nil {
+			content = string(data)
+		}
+		return string(out) + "\x00" + content, err
+	}
+
+	// 无代理：直接使用原始 URL。
+	out, err := run(t, "", "no", "https://raw-ok/x", "https://proxied/x")
+	if err != nil {
+		t.Fatalf("无代理时直连下载应成功: %v\n%s", err, out)
+	}
+	if !strings.HasSuffix(out, "\x00raw") {
+		t.Fatalf("无代理时应写入原始内容，实际输出: %q", out)
+	}
+
+	// 有代理：直连成功时不走代理。
+	out, err = run(t, "https://proxy.example/", "no", "https://raw-ok/x", "https://proxied/x")
+	if err != nil {
+		t.Fatalf("有代理但直连成功时应成功: %v\n%s", err, out)
+	}
+	if !strings.HasSuffix(out, "\x00raw") {
+		t.Fatalf("直连成功时不得使用代理内容，实际输出: %q", out)
+	}
+
+	// 有代理 + 直连失败 + 未加 --insecure-proxy-checksum：必须失败且不落盘。
+	out, err = run(t, "https://proxy.example/", "no", "https://raw-fail/x", "https://proxied/x")
+	if err == nil {
+		t.Fatalf("直连失败且未显式允许代理时必须中止，实际输出: %q", out)
+	}
+	if !strings.HasSuffix(out, "\x00") {
+		t.Fatalf("直连失败时不得写入代理内容，实际输出: %q", out)
+	}
+
+	// 显式允许后才回退到代理。
+	out, err = run(t, "https://proxy.example/", "yes", "https://raw-fail/x", "https://proxied/x")
+	if err != nil {
+		t.Fatalf("显式允许后应回退代理并成功: %v\n%s", err, out)
+	}
+	if !strings.HasSuffix(out, "\x00proxy") {
+		t.Fatalf("显式允许后应写入代理内容，实际输出: %q", out)
+	}
+	if !strings.Contains(out, "WARN:") {
+		t.Fatalf("回退代理时应输出安全告警，实际输出: %q", out)
+	}
+}
+
+// fakeInstall 是一套运行安装脚本用的假环境：临时 init 目录、PATH、伪 systemctl
+// 与伪 mnagent 二进制，保证脚本不会碰真实的 /etc 或下载网络资源。
+type fakeInstall struct {
+	t         *testing.T
+	tmp       string
+	fakeBin   string
+	initDir   string
+	fakeAgent string
+	tokenFile string
+}
+
+func newFakeInstall(t *testing.T, extraBins map[string]string) *fakeInstall {
+	t.Helper()
+	tmp := t.TempDir()
+	f := &fakeInstall{
+		t:         t,
+		tmp:       tmp,
+		fakeBin:   filepath.Join(tmp, "bin"),
+		initDir:   filepath.Join(tmp, "systemd"),
+		fakeAgent: filepath.Join(tmp, "mnagent-fake"),
+		tokenFile: filepath.Join(tmp, "token"),
+	}
+	for _, dir := range []string{f.fakeBin, f.initDir} {
+		if err := os.MkdirAll(dir, 0o755); err != nil {
+			t.Fatal(err)
+		}
+	}
+	f.writeBin("systemctl", "#!/bin/sh\ncase \"$1\" in is-active) echo active;; esac\nexit 0\n")
+	// 默认提供伪 nexttrace/miaospeed：否则测试会真的联网下载依赖，既慢又不稳定。
+	if extraBins["nexttrace"] == "" {
+		f.writeBin("nexttrace", "#!/bin/sh\nexit 0\n")
+	}
+	if extraBins["miaospeed"] == "" {
+		f.writeBin("miaospeed", "#!/bin/sh\nexit 0\n")
+	}
+	if err := os.WriteFile(f.fakeAgent, []byte("#!/bin/sh\nexit 0\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(f.tokenFile, []byte("test-token\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	for name, body := range extraBins {
+		f.writeBin(name, body)
+	}
+	return f
+}
+
+func (f *fakeInstall) writeBin(name, body string) {
+	f.t.Helper()
+	if err := os.WriteFile(filepath.Join(f.fakeBin, name), []byte(body), 0o755); err != nil {
+		f.t.Fatal(err)
+	}
+}
+
+func (f *fakeInstall) env(extra ...string) []string {
+	return installEnv(f.fakeBin, f.initDir, filepath.Join(f.tmp, "default-token"), extra...)
+}
+
+func (f *fakeInstall) args(extra ...string) []string {
+	base := []string{
+		"--bot", "https://bot.example/agent",
+		"--token-file", f.tokenFile,
+		"--binary", f.fakeAgent,
+		"--prefix", filepath.Join(f.tmp, "install"),
+	}
+	return append(base, extra...)
+}
+
+func (f *fakeInstall) unitPath() string {
+	return filepath.Join(f.initDir, "mnagent.service")
+}
+
+// TestInstallScriptOptionalInstallFlags 覆盖 --install-nexttrace/--install-miaospeed
+// 的显式取值解析：非法值立即报错（不得死循环），作为最后一个参数时使用默认值。
+func TestInstallScriptOptionalInstallFlags(t *testing.T) {
+	f := newFakeInstall(t, map[string]string{
+		"miaospeed": "#!/bin/sh\nexit 0\n",
+		"nexttrace": "#!/bin/sh\nexit 0\n",
+	})
+	scriptPath := filepath.Join(findRepoRoot(), "install.sh")
+
+	start := time.Now()
+	out, err := runInstallScriptTimeout(t, scriptPath, f.args("--install-miaospeed", "auto"), f.env(), "", 20*time.Second)
+	if err == nil || !strings.Contains(out, "--install-miaospeed 的取值无效") {
+		t.Fatalf("非法取值应明确报错，err=%v\n%s", err, out)
+	}
+	if elapsed := time.Since(start); elapsed > 15*time.Second {
+		t.Fatalf("非法取值解析耗时 %s，疑似死循环", elapsed)
+	}
+	out, err = runInstallScriptTimeout(t, scriptPath, f.args("--install-nexttrace", "auto"), f.env(), "", 20*time.Second)
+	if err == nil || !strings.Contains(out, "--install-nexttrace 的取值无效") {
+		t.Fatalf("--install-nexttrace 非法取值应明确报错，err=%v\n%s", err, out)
+	}
+
+	// 作为最后一个参数：使用默认 yes，且不再有取值需要消费。
+	out, err = runInstallScriptTimeout(t, scriptPath, f.args("--no-install-nexttrace", "--install-miaospeed"), f.env(), "", 90*time.Second)
+	if err != nil {
+		t.Fatalf("--install-miaospeed 作为最后一个参数应使用默认值并安装成功: %v\n%s", err, out)
+	}
+	unit, err := os.ReadFile(f.unitPath())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(unit), `-miaospeed "`) {
+		t.Fatalf("默认 yes 应使用找到的 miaospeed，单元内容：\n%s", unit)
+	}
+
+	out, err = runInstallScriptTimeout(t, scriptPath, f.args("--no-install-miaospeed", "--install-nexttrace"), f.env(), "", 90*time.Second)
+	if err != nil {
+		t.Fatalf("--install-nexttrace 作为最后一个参数应使用默认值并安装成功: %v\n%s", err, out)
+	}
+	unit, err = os.ReadFile(f.unitPath())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(unit), `-nexttrace "`) {
+		t.Fatalf("默认 yes 应使用找到的 nexttrace，单元内容：\n%s", unit)
+	}
+
+	// 带取值的选项缺少取值时给出明确错误而不是 shift 越界。
+	out, err = runInstallScriptTimeout(t, scriptPath, []string{"--bot"}, f.env(), "", 20*time.Second)
+	if err == nil || !strings.Contains(out, "参数 --bot 缺少取值") {
+		t.Fatalf("--bot 缺少取值应明确报错，err=%v\n%s", err, out)
+	}
+}
+
+// TestInstallScriptValidateDuration 直接执行脚本中的 validate_duration，
+// 验证与 Go time.ParseDuration 兼容的取值被接受、其余被拒绝。
+func TestInstallScriptValidateDuration(t *testing.T) {
+	script := string(readInstallScript(t))
+	harness := "#!/bin/sh\nset -eu\n" +
+		"die() { printf 'DIE:%s\\n' \"$*\" >&2; exit 1; }\n" +
+		extractShellFunction(t, script, "reject_newlines") +
+		extractShellFunction(t, script, "validate_duration") +
+		"validate_duration \"$1\" test\n"
+	harnessPath := filepath.Join(t.TempDir(), "duration.sh")
+	if err := os.WriteFile(harnessPath, []byte(harness), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	sh, err := exec.LookPath("sh")
+	if err != nil {
+		t.Skip("未找到 sh")
+	}
+	run := func(value string) (string, error) {
+		out, err := exec.Command(sh, harnessPath, value).CombinedOutput()
+		return string(out), err
+	}
+	for _, value := range []string{"1.5h", "500ms", "1h30m", "0", "6h", "30m", "1s", "2h45m30s"} {
+		if out, err := run(value); err != nil {
+			t.Errorf("合法 duration %q 被拒绝: %v\n%s", value, err, out)
+		}
+	}
+	for _, value := range []string{"", "6h\"\n", "6h\ntouch /tmp/pwn", "6 h", "-1h", "1d", "0.5", "6H", "1h30"} {
+		out, err := run(value)
+		if err == nil {
+			t.Errorf("非法 duration %q 应被拒绝，输出：%s", value, out)
+		}
+	}
+}
+
+// TestInstallScriptInheritsExistingService 验证升级时从已有 unit 继承
+// -auto-update / -update-interval / User= / 安装前缀（由 ExecStart 首 token 反推），
+// 显式参数仍然优先。
+func TestInstallScriptInheritsExistingService(t *testing.T) {
+	f := newFakeInstall(t, nil)
+	legacyPrefix := filepath.Join(f.tmp, "legacy-bin")
+	if err := os.MkdirAll(legacyPrefix, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	legacyExec := filepath.Join(legacyPrefix, "mnagent")
+	unit := "[Service]\nUser=root\nGroup=root\nExecStart=\"" + legacyExec + "\" -bot \"https://bot.example/agent\" -token-file \"" + f.tokenFile + "\" -auto-update -update-interval \"3h\"\n"
+	if err := os.WriteFile(f.unitPath(), []byte(unit), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	scriptPath := filepath.Join(findRepoRoot(), "install.sh")
+
+	// 不传 --prefix/--auto-update/--update-interval/--user：全部继承旧单元。
+	out, err := runInstallScriptTimeout(t, scriptPath, []string{
+		"--bot", "https://bot.example/agent",
+		"--token-file", f.tokenFile,
+		"--binary", f.fakeAgent,
+	}, f.env(), "", 90*time.Second)
+	if err != nil {
+		t.Fatalf("升级继承失败: %v\n%s", err, out)
+	}
+	if _, err := os.Stat(filepath.Join(legacyPrefix, "mnagent")); err != nil {
+		t.Fatalf("应把新二进制安装到继承到的前缀 %s: %v", legacyPrefix, err)
+	}
+	data, err := os.ReadFile(f.unitPath())
+	if err != nil {
+		t.Fatal(err)
+	}
+	generated := string(data)
+	for _, want := range []string{
+		`ExecStart="` + legacyExec + `"`,
+		"-auto-update",
+		`-update-interval "3h"`,
+		"User=root",
+		"StateDirectoryMode=0700",
+	} {
+		if !strings.Contains(generated, want) {
+			t.Fatalf("继承后的单元缺少 %q：\n%s", want, generated)
+		}
+	}
+	for _, want := range []string{"已从现有服务配置继承安装前缀", "已从现有服务配置继承自动更新设置", "已从现有服务配置继承更新检查间隔"} {
+		if !strings.Contains(out, want) {
+			t.Fatalf("升级输出缺少继承提示 %q：\n%s", want, out)
+		}
+	}
+
+	// 显式参数优先：前缀与间隔都不应被旧单元覆盖。
+	explicitPrefix := filepath.Join(f.tmp, "explicit-bin")
+	out, err = runInstallScriptTimeout(t, scriptPath, []string{
+		"--bot", "https://bot.example/agent",
+		"--token-file", f.tokenFile,
+		"--binary", f.fakeAgent,
+		"--prefix", explicitPrefix,
+		"--auto-update", "yes",
+		"--update-interval", "1h",
+	}, f.env(), "", 90*time.Second)
+	if err != nil {
+		t.Fatalf("显式参数覆盖失败: %v\n%s", err, out)
+	}
+	data, err = os.ReadFile(f.unitPath())
+	if err != nil {
+		t.Fatal(err)
+	}
+	generated = string(data)
+	if !strings.Contains(generated, `ExecStart="`+explicitPrefix+`/mnagent"`) {
+		t.Fatalf("应使用显式 --prefix，实际单元：\n%s", generated)
+	}
+	if !strings.Contains(generated, `-update-interval "1h"`) {
+		t.Fatalf("应使用显式 --update-interval，实际单元：\n%s", generated)
+	}
+
+	// --no-auto-update 显式关闭后，即使旧单元启用了自动更新也不应从旧单元继承回来。
+	out, err = runInstallScriptTimeout(t, scriptPath, []string{
+		"--bot", "https://bot.example/agent",
+		"--token-file", f.tokenFile,
+		"--binary", f.fakeAgent,
+		"--prefix", explicitPrefix,
+		"--no-auto-update",
+	}, f.env(), "", 90*time.Second)
+	if err != nil {
+		t.Fatalf("--no-auto-update 覆盖失败: %v\n%s", err, out)
+	}
+	data, err = os.ReadFile(f.unitPath())
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, line := range strings.Split(string(data), "\n") {
+		if strings.HasPrefix(line, "ExecStart=") && strings.Contains(line, "-auto-update") {
+			t.Fatalf("--no-auto-update 不应被旧单元的 -auto-update 覆盖：%s", line)
+		}
+	}
+}
+
+// TestInstallScriptFallsBackToBareNameForUnsafeResolvedPath 验证 PATH 中解析出的
+// 可执行路径含空格时不会 die、也不会写进 unit，而是回退为裸名并告警。
+func TestInstallScriptFallsBackToBareNameForUnsafeResolvedPath(t *testing.T) {
+	f := newFakeInstall(t, nil)
+	spaceDir := filepath.Join(f.tmp, "bin dir")
+	if err := os.MkdirAll(spaceDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(spaceDir, "nexttrace"), []byte("#!/bin/sh\nexit 0\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	env := f.env("PATH=" + spaceDir + string(os.PathListSeparator) + f.fakeBin + string(os.PathListSeparator) + os.Getenv("PATH"))
+	scriptPath := filepath.Join(findRepoRoot(), "install.sh")
+
+	out, err := runInstallScriptTimeout(t, scriptPath, f.args("--no-install-miaospeed"), env, "", 90*time.Second)
+	if err != nil {
+		t.Fatalf("解析路径不安全时应回退裸名而不是中止安装: %v\n%s", err, out)
+	}
+	if !strings.Contains(out, "已回退为裸名 nexttrace") {
+		t.Fatalf("应输出回退告警：\n%s", out)
+	}
+	data, err := os.ReadFile(f.unitPath())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(data), `-nexttrace "nexttrace"`) {
+		t.Fatalf("单元应回退为裸名 nexttrace：\n%s", data)
+	}
+	if strings.Contains(string(data), "bin dir") {
+		t.Fatalf("不安全路径不得写入单元：\n%s", data)
+	}
+}
+
+// TestInstallersAndUpdaterHaveNoSigningResidue 守护：更新/安装链路已完全移除
+// Ed25519 签名机制，只保留 SHA-256 校验。
+func TestInstallersAndUpdaterHaveNoSigningResidue(t *testing.T) {
+	root := findRepoRoot()
+	files := []string{
+		"install.sh",
+		"install.ps1",
+		"internal/updater/updater.go",
+		filepath.Join(".github", "workflows", "release.yml"),
+	}
+	forbidden := []string{"signing-pubkey", "SigningPublicKey", "ed25519", ".sig"}
+	for _, name := range files {
+		raw, err := os.ReadFile(filepath.Join(root, name))
+		if err != nil {
+			t.Fatalf("读取 %s 失败：%v", name, err)
+		}
+		lower := strings.ToLower(string(raw))
+		for _, needle := range forbidden {
+			if strings.Contains(lower, strings.ToLower(needle)) {
+				t.Errorf("%s 仍包含已移除的签名相关内容 %q", name, needle)
+			}
+		}
+	}
+}
+
+// TestInstallScriptDownloadTimeoutsAndGroupValidation 静态守护：
+// 校验文件直连限时、主组名白名单、状态目录 0700。
+func TestInstallScriptDownloadTimeoutsAndGroupValidation(t *testing.T) {
+	script := string(readInstallScript(t))
+	for _, want := range []struct{ name, needle string }{
+		{"校验文件直连连接超时", "--connect-timeout 5 --max-time 30"},
+		{"直连失败探测也能超时", "--connect-timeout 5 --max-time 15"},
+		{"wget 限时与重试", "--timeout=30 --tries=2"},
+		{"小文件直连使用 fast 模式", `download "$trusted_raw" "$trusted_dest" fast`},
+		{"主组名白名单校验", `case "$RUN_GROUP" in`},
+		{"主组名不合法回退", `RUN_GROUP="$RUN_USER"`},
+		{"systemd 状态目录 0700", "StateDirectoryMode=0700"},
+		{"procd/非 systemd 收紧状态目录", "prepare_state_dir"},
+	} {
+		if !containsActiveLine(script, want.needle) {
+			t.Errorf("install.sh 缺少 %s（应包含 %q）", want.name, want.needle)
+		}
+	}
+}
+
+// TestInstallScriptInheritsUserAndValidatesGroup 覆盖两件事：
+//  1. 升级时从旧 unit 的 User= 继承运行用户（用户未显式 --user）；
+//  2. 主组名不符合白名单时回退为运行用户并告警，而不是写进 Group=。
+//
+// 用 PATH 中的假 id 模拟用户/组，避免在测试机上真实创建用户。
+func TestInstallScriptInheritsUserAndValidatesGroup(t *testing.T) {
+	f := newFakeInstall(t, map[string]string{
+		"id": "#!/bin/sh\ncase \"$1\" in -u) echo 0;; -gn) echo mnagent;; *) exit 1;; esac\n",
+	})
+	legacyPrefix := filepath.Join(f.tmp, "legacy-bin")
+	if err := os.MkdirAll(legacyPrefix, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	unit := "[Service]\nUser=mnagent\nGroup=mnagent\nExecStart=\"" + filepath.Join(legacyPrefix, "mnagent") + "\" -bot \"https://bot.example/agent\" -token-file \"" + f.tokenFile + "\"\n"
+	if err := os.WriteFile(f.unitPath(), []byte(unit), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	scriptPath := filepath.Join(findRepoRoot(), "install.sh")
+	args := []string{
+		"--bot", "https://bot.example/agent",
+		"--token-file", f.tokenFile,
+		"--binary", f.fakeAgent,
+	}
+	out, err := runInstallScriptTimeout(t, scriptPath, args, f.env(), "", 90*time.Second)
+	if err != nil {
+		t.Fatalf("继承 User= 失败: %v\n%s", err, out)
+	}
+	data, err := os.ReadFile(f.unitPath())
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, want := range []string{"User=mnagent", "Group=mnagent"} {
+		if !strings.Contains(string(data), want) {
+			t.Fatalf("单元缺少 %q：\n%s", want, data)
+		}
+	}
+	if !strings.Contains(out, "已从现有服务配置继承运行用户: mnagent") {
+		t.Fatalf("应提示继承运行用户：\n%s", out)
+	}
+
+	// 让 id -gn 返回非法组名：必须回退为运行用户并告警，且不写进 Group=。
+	f.writeBin("id", "#!/bin/sh\ncase \"$1\" in -u) echo 0;; -gn) echo 'bad group';; *) exit 1;; esac\n")
+	out, err = runInstallScriptTimeout(t, scriptPath, args, f.env(), "", 90*time.Second)
+	if err != nil {
+		t.Fatalf("非法组名应回退而不是中止安装: %v\n%s", err, out)
+	}
+	if !strings.Contains(out, "主组名（bad group）不合法，回退为 mnagent") {
+		t.Fatalf("应输出组名回退告警：\n%s", out)
+	}
+	data, err = os.ReadFile(f.unitPath())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(data), "Group=mnagent") || strings.Contains(string(data), "bad group") {
+		t.Fatalf("非法组名不得写入单元：\n%s", data)
 	}
 }

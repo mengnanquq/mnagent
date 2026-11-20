@@ -396,6 +396,27 @@ if (-not [string]::IsNullOrWhiteSpace($Token)) {
     Copy-Item -Path $TokenFile -Destination $tokenPath -Force
 }
 
+# 令牌文件必须收紧 ACL：移除继承（可能包含 Users/Everyone 等）、只授予 SYSTEM 与
+# Administrators 完全控制。服务由本脚本以 LocalSystem 创建，因此无需额外账户；
+# 若后续改为其他账户运行，需要一并授予该账户读权限。
+if (Test-Path $tokenPath) {
+    # 先 /reset 清除复制/继承可能带来的显式 ACE（Users、Everyone、Interactive 等），
+    # 再移除继承并只授予 SYSTEM 与 Administrators 完全控制。
+    # 用 SID 而不是本地化名称，避免非英文 Windows 上匹配不到 SYSTEM/Administrators：
+    # *S-1-5-18 = SYSTEM，*S-1-5-32-544 = BUILTIN\Administrators。
+    & icacls.exe "$tokenPath" /reset | Out-Null
+    if ($LASTEXITCODE -ne 0) {
+        throw "重置令牌文件 ACL 失败（icacls 退出码 $LASTEXITCODE）：$tokenPath"
+    }
+    & icacls.exe "$tokenPath" /inheritance:r /grant:r "*S-1-5-18:(F)" "*S-1-5-32-544:(F)" | Out-Null
+    if ($LASTEXITCODE -ne 0) {
+        throw "收紧令牌文件 ACL 失败（icacls 退出码 $LASTEXITCODE）：$tokenPath"
+    }
+    Write-Host "已收紧令牌文件权限（仅 SYSTEM 与 Administrators 可访问）。" -ForegroundColor Green
+} else {
+    Write-Warning "令牌文件 $tokenPath 不存在，无法收紧 ACL；服务启动后可能无法读取令牌。"
+}
+
 # 10. 下载 NextTrace（若启用）
 if ($enableNextTrace) {
     Write-Host "正在配置 nexttrace..." -ForegroundColor Cyan
