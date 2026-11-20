@@ -13,6 +13,8 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	"github.com/mengnanquq/mnagent/internal/probe"
 )
 
 // MiaospeedReport 包含测速任务的结构化结果。
@@ -749,14 +751,19 @@ func queryIPGeo(ctx context.Context, host string) (ip, geo string) {
 		ctx = context.Background()
 	}
 	parsedIP := net.ParseIP(cleanHost)
-	if parsedIP != nil && (parsedIP.IsLoopback() || parsedIP.IsPrivate() || parsedIP.IsUnspecified()) {
-		return cleanHost, "本地直连"
+	if label := geoBlockedLabel(parsedIP); label != "" {
+		return cleanHost, label
 	}
 	if cachedIP, cachedGeo, ok := defaultGeoCache.get(cleanHost); ok {
 		return cachedIP, cachedGeo
 	}
 
 	targetIP := resolveGeoLookupIP(ctx, cleanHost, parsedIP)
+	// 域名解析出的地址同样不能外发：私有/链路本地/云元数据地址既没有公开地理信息，
+	// 把内网拓扑发给第三方 GeoIP 服务也没有任何好处。
+	if label := geoBlockedLabel(net.ParseIP(targetIP)); label != "" {
+		return targetIP, label
+	}
 	if ctx.Err() != nil {
 		// 任务已取消：不再访问外部 GeoIP 服务，直接用解析结果兜底。
 		return targetIP, targetIP
@@ -775,6 +782,19 @@ func queryIPGeo(ctx context.Context, host string) (ip, geo string) {
 	}
 	defaultGeoCache.put(cleanHost, ip, geo)
 	return ip, geo
+}
+
+// geoBlockedLabel 判断 IP 是否属于不该发往外部 GeoIP 服务的地址：
+// 回环/私网/未指定返回“本地直连”，其余私有/保留/链路本地/云元数据地址返回
+// “内网/保留地址”，公网地址返回空串。判定复用探针的 IsBlockedProbeIP，保持一致。
+func geoBlockedLabel(ip net.IP) string {
+	if ip == nil || !probe.IsBlockedProbeIP(ip) {
+		return ""
+	}
+	if ip.IsLoopback() || ip.IsPrivate() || ip.IsUnspecified() {
+		return "本地直连"
+	}
+	return "内网/保留地址"
 }
 
 // resolveGeoLookupIP 把域名解析为 IP；已是 IP 时直接返回。

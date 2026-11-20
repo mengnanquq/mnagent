@@ -2399,3 +2399,52 @@ func TestSubscriptionClientIgnoresEnvProxy(t *testing.T) {
 		}
 	}
 }
+
+// TestGeoBlockedLabel 验证私有/链路本地/云元数据地址不会被发往外部 GeoIP 服务。
+func TestGeoBlockedLabel(t *testing.T) {
+	cases := []struct {
+		ip    string
+		label string
+	}{
+		{"127.0.0.1", "本地直连"},
+		{"10.0.0.1", "本地直连"},
+		{"::1", "本地直连"},
+		{"169.254.169.254", "内网/保留地址"}, // 云元数据
+		{"fd00::1", "本地直连"},            // IPv6 唯一本地（Go 视为私有地址）
+		{"100.64.0.1", "内网/保留地址"},      // CGNAT
+		{"1.1.1.1", ""},
+		{"2606:4700:4700::1111", ""},
+	}
+	for _, tc := range cases {
+		if got := geoBlockedLabel(net.ParseIP(tc.ip)); got != tc.label {
+			t.Errorf("geoBlockedLabel(%s) = %q，期望 %q", tc.ip, got, tc.label)
+		}
+	}
+}
+
+// TestQueryIPGeoSkipsBlockedAddresses 验证被拦截地址直接返回文案，不访问外部 GeoIP 服务。
+func TestQueryIPGeoSkipsBlockedAddresses(t *testing.T) {
+	resetDefaultGeoCacheForTest(t)
+	old := geoLookupFuncs
+	defer func() { geoLookupFuncs = old }()
+	called := false
+	geoLookupFuncs = []func(context.Context, string) (string, string, bool){
+		func(_ context.Context, targetIP string) (string, string, bool) {
+			called = true
+			return targetIP, "ShouldNotHappen", true
+		},
+	}
+	ip, geo := queryIPGeo(context.Background(), "169.254.169.254")
+	if called {
+		t.Fatal("云元数据地址不应查询外部 GeoIP 服务")
+	}
+	if ip != "169.254.169.254" || geo != "内网/保留地址" {
+		t.Fatalf("云元数据地址应返回拦截文案，实际 ip=%q geo=%q", ip, geo)
+	}
+	if _, geo := queryIPGeo(context.Background(), "192.168.1.10"); geo != "本地直连" {
+		t.Fatalf("私网地址应保持“本地直连”文案，实际 %q", geo)
+	}
+	if called {
+		t.Fatal("私网地址同样不应查询外部 GeoIP 服务")
+	}
+}
