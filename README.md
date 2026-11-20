@@ -6,7 +6,7 @@ Agent 通过 HTTPS **主动长轮询**接收服务端下发的网络探测与节
 
 - 🔒 **网络零暴露**：**无需公网 IP、无需端口映射、无需 SSH**，只要探针能正常出站访问服务端即可。
 - 🔑 **令牌即身份**：每台主机单令牌鉴权（`--token` 或动态读取 `--token-file`），在线轮换无需重启。
-- 🔄 **全自动运维**：自动探测、补全与静默升级外部依赖（`nexttrace` / `miaospeed`），支持后台自更新与服务端一键远程升级。依赖的远程任务自动补装默认关闭，一键安装脚本会显式加上 `-allow-auto-install-deps`。
+- 🔄 **全自动运维**：自动探测、补全与静默升级外部依赖（`nexttrace` / `miaospeed`）。依赖缺失时一律自动下载安装（含 `nexttrace`），并支持后台自更新与服务端一键远程升级。
 - 🛡️ **安全沙箱防线**：默认严格拦截回环、内网私有网段及公有云元数据地址（`169.254.169.254` 等），防御 SSRF；命令参数白名单隔离，不经 Shell 解释器执行。
 
 ---
@@ -52,7 +52,7 @@ Remove-Item Env:MNAGENT_TOKEN
 > **⚠️ gh-proxy 信任说明**：
 > - 使用 `--gh-proxy` 安装时，二进制仍可经代理下载，但 `.sha256` 校验文件默认**不经 gh-proxy 镜像获取（仍遵循系统 `HTTPS_PROXY` 环境变量）**；获取失败会中止安装并提示。只有在确认代理可信时，才可用 `--insecure-proxy-checksum`（Windows 为 `-InsecureProxyChecksum`）允许经代理获取校验文件。
 > - Agent 自动更新在配置了 `-gh-proxy` 时，`.sha256` 校验文件会**不经 gh-proxy 镜像获取（仍遵循系统 `HTTPS_PROXY` 环境变量）**（二进制仍走代理）；获取校验文件失败即拒绝更新（fail-closed），因为代理可同时替换二进制与同源 `.sha256`。这是默认的完整性校验方式。
-> - 依赖（nexttrace/miaospeed）的 SHA-256 摘要来自直连的 `api.github.com`，不经代理；安装脚本中的依赖 `.sha256` 附件同样优先直连获取。
+> - 依赖（nexttrace/miaospeed）的 SHA-256 摘要来自直连的 `github.com`（`<资产>.sha256`）或直连的 `api.github.com`（asset digest），不经代理；两个来源互为兜底。Agent 自身更新同样会先试直连 `.sha256`，失败后回退直连 API digest；每个来源至少重试 3 次（指数退避 + 抖动），失败信息会列出尝试过的来源与次数。
 > - 为避免离线/被墙时长时间挂起，安装脚本中校验文件的直连尝试限时 30 秒（`curl --connect-timeout 5 --max-time 30` / `wget --timeout=30 --tries=2`），失败提示会区分 404 与网络不可达。
 >
 > **订阅拉取不使用环境代理**：miaospeed 订阅与进程内探针的 HTTP 客户端均显式设置 `Proxy: nil`，不会读取 `HTTP_PROXY` / `HTTPS_PROXY`。这是为了避免代理自行解析目标地址、绕过按解析 IP 做的 SSRF 校验；如需经代理拉取订阅，请改用服务端中转或本地自定义方案，而不是设置环境代理。
@@ -113,17 +113,22 @@ mnagent -apply-update latest         # 立即升级到最新版本并平滑重�
 | **`-result-timeout`** | `5m` | 单次结果回传（含大体积 `/results` 上传）的客户端超时 |
 | **`-allow-insecure-http`** | `false` | 允许 `-bot` 用明文 HTTP 连接公网地址（默认仅允许回环/内网；明文会暴露令牌） |
 | **`-allow-private-probes`** | `false` | 放行对内网私有网段与云元数据地址的探测（默认严格拦截）。只跳过“地址是否落在私网/保留段”这一步：节点测速的协议白名单、payload 结构与禁止字段、server 钉死等安全闸门照常执行 |
-| **`-allow-auto-install-deps`** | `false` | 允许测速任务在 `miaospeed` 缺失时自动下载安装（默认关闭：远程任务不应单方面触发以 root 下载执行新二进制；一键安装脚本会显式开启） |
 | **`-allow-remote-downgrade`** | `false` | 允许服务端远程指令把 Agent 降级到旧版本（默认只接受高于当前版本的目标；本地 `-apply-update` 不受限） |
 | **`-log-level`** | `info` | 日志级别：`debug` / `info` / `warn` / `error` |
 
 ---
 
-## 📝 行为变更（v0.3.103）
+## 📝 行为变更（v0.4.1）
 
 与升级相关、会影响已有部署的实际行为调整：
 
-- **`-allow-auto-install-deps` 默认关闭**：agent 不再仅因远程测速任务缺少 `miaospeed` 就自动下载安装（一键安装脚本仍会在服务参数里显式加上该开关）。若老节点只靠自更新升级到新版本、服务参数里没有这个开关，且 `miaospeed` 是首次用到时才懒安装的，请**重新执行一次安装命令**（`install.sh` / `install.ps1`），让服务参数补上 `-allow-auto-install-deps`，或在主机上手动安装 `miaospeed`。
+- **依赖缺失时一律自动下载（v0.4.1）**：不再需要任何开关。`miaospeed` 或 `nexttrace` 缺失时，启动检查、定期检查、测速任务与路由追踪都会自动下载安装；同一依赖并发触发时只下载一次，安装失败后有 5 分钟冷却并返回明确错误。**`-allow-auto-install-deps` 已删除**：服务命令里仍带着它的节点启动时会报“未知参数”，请重新执行一次安装命令（`install.sh` / `install.ps1`）以生成新的服务参数。
+- **内联代理配置上限按内存收紧（v0.4.1）**：默认上限 12MB（与服务端 ≤12MB 内联下发契约一致），Linux 上按 `min(12MB, MemTotal/8)` 收紧、最低 2MB；解析时按候选节点上限截断，超出部分不保留 payload，避免低内存设备被超大配置撑爆。
+- **订阅下载上限按内存收紧（v0.4.1）**：默认上限 16MB，Linux 上按 `min(16MB, MemTotal/6)` 收紧、最低 2MB；响应带 Content-Length 时会在读取正文前拒绝，超过上限会明确报错并拒绝解析，不再静默截断成半截 YAML/JSON。
+- **轻任务队列容量 128（v0.4.1）**：轻任务并发仍为 8，排队上限由“无上限”改为 128；队列已满时立即回报失败但**不写去重缓存**，服务端重发同一任务时会真正重跑。
+- **超过 256KB 的结果改走 HTTP（v0.4.1）**：WS 写超时只有 15s，大结果继续走长连接容易拖断连接；超过 `256KB` 的结果直接走 HTTP `/results`（带独立超时与重试）。
+- **节点安全检查 DNS 总预算 30s（v0.4.1）**：域名解析阶段有独立 30s 总预算，到点后未完成解析的候选按 fail-closed 剔除；父任务被取消时单独记录“任务已取消”，不误报为 DNS 预算超时。
+- **armv7 发布别名已删除（v0.4.1）**：线上 ARM 节点均已升级到支持标准资产名的版本，`mnagent_linux_armv7` 别名不再发布；安装脚本仍统一把 `armv7l/armv6l` 等映射到 `mnagent_linux_arm`。
 - **`-bot` 不再接受 userinfo / query / fragment**：`https://user:pass@host/agent`、`...?token=x`、`...#frag` 会在启动时被拒绝（安装脚本同样提前拦截），因为客户端会直接在地址后拼接 `/jobs`、`/results`，既会拼错路径也可能泄露凭据。凭据请用 `-token` / `-token-file`。
 - **明文 HTTP 默认只允许本地目标**：只有 `localhost`、`*.localhost` 以及字面回环/私网/链路本地 IP 可直接使用 `http://`；`*.lan`、`*.local`、单标签主机名和普通域名（包括 `10.example.com`、`fdic.example.com` 这类仅字符串前缀相似的域名）都视为非本地，必须显式加 `-allow-insecure-http`（安装脚本为 `--allow-insecure-http` / `-AllowInsecureHttp`），否则 agent 会拒绝启动。安装脚本与 agent 使用同一套严格判定，并把该开关传给 agent。
 
@@ -131,7 +136,6 @@ mnagent -apply-update latest         # 立即升级到最新版本并平滑重�
 - **miaospeed 单次响应上限 8MB**：单条 WebSocket JSON 响应超过 8MB 会直接报错并放弃，避免异常/恶意服务端把节点内存耗尽（正常 500 节点结果约 3MB）。同时累积缓冲的复用阈值降到 256KB，大缓冲交给 GC 回收。
 - **WebSocket 任务缓冲由 64 改为 16**：WS 降级模式下待执行任务队列变短，队列满时立即回报明确的失败结果，而不是阻塞长连接读循环（否则连 ping/ack 都会被拖住），常驻内存更可控。
 - **状态目录属主校验**：`/var/lib/mnagent`（Windows 为 `%ProgramData%\mnagent`）必须属于 root/SYSTEM/Administrators 或当前用户，且不允许组/其他用户写入；否则会拒绝使用并输出 `WARN` 告警，Linux 上可执行 `sudo chown root:root /var/lib/mnagent` 修复，详见下文「常见问题排查」。
-- **发布新增 `mnagent_linux_armv7` 别名**：内容与 `mnagent_linux_arm` 完全相同（并带 `.sha256`），用于线上 v0.3.102 等旧版 ARM 节点（它们按旧资产名请求），使这些节点能自动升级。等所有 ARM 节点升级完成后，该别名会在 v0.3.104 或之后移除。
 - **服务停止超时放宽**：systemd 单元新增 `TimeoutStopSec=80`、OpenWrt procd 新增 `term_timeout 70`，确保退出时能在 60s 预算内回传在途结果，不被守护进程提前强杀（重新执行安装脚本即可更新已有单元）。
 - **缓存结果重发同样受 `-result-timeout` 约束**：重复下发任务的缓存结果上传不再使用固定的 6 分钟预算，而是跟随配置的单次回传超时。
 
