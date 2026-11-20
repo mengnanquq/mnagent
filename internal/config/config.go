@@ -65,6 +65,12 @@ type Config struct {
 
 	// AllowInsecureHTTP 允许 -bot 使用明文 HTTP 连接公网地址（默认仅允许回环/内网）。
 	AllowInsecureHTTP bool
+
+	// NoBotChecksum 禁用服务端代取 SHA-256（-no-bot-checksum）。
+	NoBotChecksum bool
+	// BotChecksumTrusted 表示当前 -bot 端点可用于服务端代取校验值：
+	// 未禁用、且端点为 https 或明文 HTTP 的回环/内网地址。
+	BotChecksumTrusted bool
 }
 
 // DefaultTokenFile 根据操作系统平台返回默认的令牌文件路径。
@@ -227,6 +233,7 @@ func ParseConfig(args []string, version string) (*Config, error) {
 		allowPrivate = fs.Bool("allow-private-probes", false, "允许探测/测速私网与链路本地地址（默认禁止，防范 SSRF/云元数据盗取）；只跳过地址段判定，节点协议白名单、payload 结构、禁止字段与 server 钉死等安全闸门仍照常执行")
 		allowDown    = fs.Bool("allow-remote-downgrade", false, "允许服务端远程下发降级到旧版本（默认只接受更高版本；本地 -apply-update 不受限）")
 		allowHTTP    = fs.Bool("allow-insecure-http", false, "允许 -bot 使用明文 HTTP 连接公网地址（默认仅允许回环/内网，明文传输令牌有被窃听风险）")
+		noBotSum     = fs.Bool("no-bot-checksum", false, "禁用服务端代取 SHA-256 校验值（只使用直连 github.com / api.github.com）")
 	)
 	if err := fs.Parse(args); err != nil {
 		return nil, err
@@ -261,14 +268,19 @@ func ParseConfig(args []string, version string) (*Config, error) {
 	// 与守护进程无关的参数直接失败。
 
 	var tokens *TokenSource
-	if !isUpdateCLI {
+	switch {
+	case !isUpdateCLI:
 		var err error
 		tokens, err = NewTokenSource(*tokenValue, *tokenFile)
 		if err != nil {
 			return nil, err
 		}
-	} else if *runDiag {
-		// 诊断模式下如果存在令牌文件，尝试读取以供诊断看板展示状态
+	case *runDiag, endpoint != "":
+		// 诊断模式展示令牌状态；更新类 CLI（-check-update/-apply-update/-probe-target/
+		// -diag-job）带 -bot 时也用与常驻模式完全一致的顺序（-token > MNAGENT_TOKEN >
+		// -token-file/默认路径）构造令牌源，让服务端代取校验值在 CLI 路径同样生效。
+		// 解析失败（没有令牌文件、内容为空等）一律忽略：CLI 不能因为缺少令牌直接
+		// 报错退出，只是退回只走直连校验来源（cfg.Tokens 保持 nil）。
 		tokens, _ = NewTokenSource(*tokenValue, *tokenFile)
 	}
 	var path string
@@ -325,6 +337,8 @@ func ParseConfig(args []string, version string) (*Config, error) {
 		AllowPrivateProbes:   *allowPrivate,
 		AllowRemoteDowngrade: *allowDown,
 		AllowInsecureHTTP:    *allowHTTP,
+		NoBotChecksum:        *noBotSum,
+		BotChecksumTrusted:   !*noBotSum && botEndpointTrusted(endpoint),
 	}, nil
 }
 
@@ -373,6 +387,28 @@ func isLocalHTTPHost(host string) bool {
 		return false
 	}
 	return ip.IsLoopback() || ip.IsPrivate() || ip.IsLinkLocalUnicast()
+}
+
+// botEndpointTrusted 判断 -bot 端点能否用于服务端代取 SHA-256 校验值。
+// https 视为可信；http 只有在回环/内网地址时才可信（公网明文地址即使显式
+// 加了 -allow-insecure-http 也不启用代取：中间人可同时伪造哈希与内容）。
+func botEndpointTrusted(raw string) bool {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return false
+	}
+	parsed, err := url.Parse(raw)
+	if err != nil || parsed.Hostname() == "" {
+		return false
+	}
+	switch strings.ToLower(parsed.Scheme) {
+	case "https":
+		return true
+	case "http":
+		return isLocalHTTPHost(parsed.Hostname())
+	default:
+		return false
+	}
 }
 
 // RedactEndpoint 返回适合写进诊断输出/日志的端点描述：

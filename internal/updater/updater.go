@@ -210,6 +210,9 @@ type Config struct {
 
 	// Logger 用于输出来源信任相关的安全告警；未设置时使用 slog 默认 logger。
 	Logger Logger
+
+	// BotDigest 是服务端代取校验值的客户端；为 nil 时只使用直连来源。
+	BotDigest *BotDigestClient
 }
 
 // Updater 负责检查并应用自身的新版本。
@@ -236,6 +239,9 @@ type Updater struct {
 	verifyBinary func(ctx context.Context, path, version string) error
 
 	logger Logger
+
+	// botDigest 是服务端代取校验值的客户端；nil 表示不启用（只走直连来源）。
+	botDigest *BotDigestClient
 
 	// checksumTimeout 仅用于测试缩短校验文件请求超时；0 表示 DefaultChecksumTimeout。
 	checksumTimeout time.Duration
@@ -299,6 +305,7 @@ func New(cfg Config) *Updater {
 		RestartFunc:    cfg.Restart,
 		verifyBinary:   verifyDownloadedBinary,
 		logger:         cfg.Logger,
+		botDigest:      cfg.BotDigest,
 	}
 }
 
@@ -499,6 +506,11 @@ const checksumFetchAttempts = 3
 var (
 	checksumRetryBaseDelay = 200 * time.Millisecond
 	checksumRetryMaxDelay  = 2 * time.Second
+	// checksumResolutionDeadline 是一次更新中获取校验值的整体预算：
+	// 服务端代取、交叉校验、直连 .sha256 与 API 兜底共用，避免弱网下
+	// 各来源的超时与重试叠加，把升级任务拖过服务端 120s 的预算。
+	// 变量而非常量，便于测试缩短。
+	checksumResolutionDeadline = 75 * time.Second
 )
 
 // nonRetryableHTTPError 标记确定性的 4xx 响应（429 限流除外）：
@@ -605,44 +617,50 @@ func (u *Updater) checksumRequestTimeout() time.Duration {
 
 // fetchChecksumFile 直连下载目标资产的 "<资产>.sha256" 并解析出 SHA-256。
 func (u *Updater) fetchChecksumFile(ctx context.Context, version string) (string, error) {
-	targetURL := u.checksumURLFor(version)
 	return retryChecksumSource(ctx, "直连 .sha256", u.checksumRequestTimeout(), func(ctx context.Context) (string, error) {
-		req, err := http.NewRequestWithContext(ctx, http.MethodGet, targetURL, nil)
-		if err != nil {
-			return "", err
-		}
-		req.Header.Set("User-Agent", "mnagent-updater")
-
-		cli := u.DownloadClient
-		if cli == nil {
-			cli = &http.Client{Timeout: DefaultDownloadTimeout}
-		}
-		resp, err := cli.Do(req)
-		if err != nil {
-			return "", u.directChecksumHint(err)
-		}
-		defer resp.Body.Close()
-
-		if resp.StatusCode == http.StatusNotFound {
-			return "", u.directChecksumHint(markNonRetryableHTTPStatus(resp.StatusCode, fmt.Errorf("该版本未发布校验文件 %s.sha256（HTTP 404）", u.AssetName())))
-		}
-		if resp.StatusCode != http.StatusOK {
-			return "", u.directChecksumHint(markNonRetryableHTTPStatus(resp.StatusCode, fmt.Errorf("获取校验文件返回 HTTP %d", resp.StatusCode)))
-		}
-
-		body, err := io.ReadAll(io.LimitReader(resp.Body, 1<<18)) // 256 KiB
-		if err != nil {
-			return "", u.directChecksumHint(err)
-		}
-		if len(bytes.TrimSpace(body)) == 0 {
-			return "", u.directChecksumHint(fmt.Errorf("校验文件 %s.sha256 为空", u.AssetName()))
-		}
-		sum, err := u.parseChecksum(body)
-		if err != nil {
-			return "", u.directChecksumHint(err)
-		}
-		return sum, nil
+		return u.fetchChecksumFileOnce(ctx, version)
 	})
+}
+
+// fetchChecksumFileOnce 只做一次直连 .sha256 请求（不重试），
+// 供重试链与服务端代取后的交叉校验共用。
+func (u *Updater) fetchChecksumFileOnce(ctx context.Context, version string) (string, error) {
+	targetURL := u.checksumURLFor(version)
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, targetURL, nil)
+	if err != nil {
+		return "", err
+	}
+	req.Header.Set("User-Agent", "mnagent-updater")
+
+	cli := u.DownloadClient
+	if cli == nil {
+		cli = &http.Client{Timeout: DefaultDownloadTimeout}
+	}
+	resp, err := cli.Do(req)
+	if err != nil {
+		return "", u.directChecksumHint(err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode == http.StatusNotFound {
+		return "", u.directChecksumHint(markNonRetryableHTTPStatus(resp.StatusCode, fmt.Errorf("该版本未发布校验文件 %s.sha256（HTTP 404）", u.AssetName())))
+	}
+	if resp.StatusCode != http.StatusOK {
+		return "", u.directChecksumHint(markNonRetryableHTTPStatus(resp.StatusCode, fmt.Errorf("获取校验文件返回 HTTP %d", resp.StatusCode)))
+	}
+
+	body, err := io.ReadAll(io.LimitReader(resp.Body, 1<<18)) // 256 KiB
+	if err != nil {
+		return "", u.directChecksumHint(err)
+	}
+	if len(bytes.TrimSpace(body)) == 0 {
+		return "", u.directChecksumHint(fmt.Errorf("校验文件 %s.sha256 为空", u.AssetName()))
+	}
+	sum, err := u.parseChecksum(body)
+	if err != nil {
+		return "", u.directChecksumHint(err)
+	}
+	return sum, nil
 }
 
 // fetchChecksumFromAPI 通过直连 api.github.com 的 Release 附件 digest 字段获取校验值。
@@ -697,10 +715,64 @@ func (u *Updater) fetchChecksumFromAPI(ctx context.Context, version string) (str
 	})
 }
 
-// fetchExpectedChecksum 依次尝试直连 .sha256 与直连 API digest；两个来源都失败时
-// 错误里列出尝试过的来源与次数。
+// fetchChecksumFromBot 通过服务端代取 SHA-256，并用一次直连 .sha256 做交叉校验。
+// 直连失败不阻断（服务端本就用于直连不可靠的场景），只有两侧都拿到值且不一致时
+// 才返回 errChecksumMismatch；这种情况下调用方必须中止，不能继续走兜底来源。
+func (u *Updater) fetchChecksumFromBot(ctx context.Context, version string) (string, error) {
+	if u.botDigest == nil {
+		return "", errors.New("未启用服务端代取")
+	}
+	sum, err := u.botDigest.Fetch(ctx, u.Repo, version, u.AssetName())
+	if err != nil {
+		return "", err
+	}
+	return u.crossCheckDirectChecksum(ctx, version, sum)
+}
+
+// crossCheckDirectChecksum 在服务端代取成功后，用 5s 窗口单次直连 .sha256 交叉校验：
+// 一致时返回服务端的值；直连失败、超时或格式非法时放行（仍用服务端的值）；
+// 两侧都有合法值但不一致时 fail-closed。
+func (u *Updater) crossCheckDirectChecksum(ctx context.Context, version, botSum string) (string, error) {
+	checkCtx, cancel := context.WithTimeout(ctx, crossCheckTimeout)
+	defer cancel()
+	directSum, err := u.fetchChecksumFileOnce(checkCtx, version)
+	if err != nil || directSum == "" {
+		u.info("交叉校验未完成（直连不可用），已采用服务端代取值", "version", version, "error", err)
+		return botSum, nil
+	}
+	if !strings.EqualFold(directSum, botSum) {
+		u.warn("服务端代取校验值与直连 .sha256 不一致，已中止更新", "version", version, "bot", botSum, "direct", directSum)
+		return "", fmt.Errorf("%w（服务端 %s / 直连 %s），已中止更新（疑似篡改或上游重新上传了资产）；若服务端刚更新/重传资产，可稍后重试；确认无误可临时用 -no-bot-checksum 重试",
+			errChecksumMismatch, botSum, directSum)
+	}
+	return botSum, nil
+}
+
+// fetchExpectedChecksum 依次尝试服务端代取（含交叉校验）、直连 .sha256 与直连 API digest；
+// 三个来源都失败时错误里列出尝试过的来源与次数。
+// 服务端代取除交叉校验不一致外都静默回退（只打 Debug 日志）；不一致必须立即中止。
 func (u *Updater) fetchExpectedChecksum(ctx context.Context, version string) (string, error) {
+	// 所有来源共用同一个整体预算：单个来源的超时与重试不能层层叠加。
+	// 预算耗尽后后续来源会立即返回，总耗时不会超过该 deadline（留少量调度开销）。
+	parentCtx := ctx
+	if checksumResolutionDeadline > 0 {
+		deadlineCtx, cancel := context.WithTimeout(ctx, checksumResolutionDeadline)
+		defer cancel()
+		ctx = deadlineCtx
+	}
 	var attempted []string
+	if u.botDigest != nil {
+		sum, err := u.fetchChecksumFromBot(ctx, version)
+		if err == nil {
+			return sum, nil
+		}
+		if errors.Is(err, errChecksumMismatch) {
+			return "", err
+		}
+		u.debug("服务端代取校验值失败，回退到直连来源", "version", version, "error", err)
+		attempted = append(attempted, fmt.Sprintf("服务端代取（1次：%s）", compactErrorText(err, summaryErrorLimit)))
+	}
+
 	sum, err := u.fetchChecksumFile(ctx, version)
 	if err == nil {
 		return sum, nil
@@ -712,7 +784,40 @@ func (u *Updater) fetchExpectedChecksum(ctx context.Context, version string) (st
 		return sum, nil
 	}
 	attempted = append(attempted, err.Error())
-	return "", fmt.Errorf("无法从任何直连来源获取 SHA-256 校验值：%s", strings.Join(attempted, "；"))
+	budgetHint := ""
+	if checksumResolutionDeadline > 0 && errors.Is(ctx.Err(), context.DeadlineExceeded) && parentCtx.Err() == nil {
+		budgetHint = fmt.Sprintf("；整体校验值获取预算（%s）已用尽，后续来源已跳过", formatBudgetDuration(checksumResolutionDeadline))
+	}
+	return "", fmt.Errorf("无法从任何可信来源获取 SHA-256 校验值%s：%s", budgetHint, strings.Join(attempted, "；"))
+}
+
+// formatBudgetDuration 把预算格式化成易读文本：整秒预算显示为 "75s"，
+// 其余保留 time.Duration 的默认格式（便于测试使用毫秒级预算）。
+func formatBudgetDuration(d time.Duration) string {
+	if d >= time.Second && d%time.Second == 0 {
+		return fmt.Sprintf("%ds", int64(d/time.Second))
+	}
+	return d.String()
+}
+
+// debug 输出调试日志：优先使用注入 logger 的 Debug 能力，
+// 未实现该能力（只注入 Warn）时退化到 slog 默认 logger。
+func (u *Updater) debug(msg string, args ...any) {
+	if l, ok := u.logger.(interface{ Debug(msg string, args ...any) }); ok {
+		l.Debug(msg, args...)
+		return
+	}
+	slog.Debug(msg, args...)
+}
+
+// info 输出普通信息：优先使用注入 logger 的 Info 能力，
+// 未实现该能力时退化到 slog 默认 logger。
+func (u *Updater) info(msg string, args ...any) {
+	if l, ok := u.logger.(interface{ Info(msg string, args ...any) }); ok {
+		l.Info(msg, args...)
+		return
+	}
+	slog.Info(msg, args...)
 }
 
 // warn 输出安全告警：优先使用注入的 logger，未注入时退化到 slog 默认 logger。
@@ -828,6 +933,12 @@ func (u *Updater) downloadAndReplace(ctx context.Context, version string) (strin
 		}
 	}
 
+	// 取消发生在下载/自检之后时，绝不能继续替换：远程取消升级后不应
+	// 悄悄换掉正在运行的二进制。
+	if err := ctx.Err(); err != nil {
+		return "", fmt.Errorf("更新已取消，未替换二进制：%w", err)
+	}
+
 	if err := ReplaceExecutable(tmpPath, u.Executable); err != nil {
 		return "", fmt.Errorf("替换当前二进制失败：%w", err)
 	}
@@ -849,6 +960,10 @@ func (u *Updater) Apply(ctx context.Context, version string) error {
 	defer u.applyMu.Unlock()
 	if _, err := u.downloadAndReplace(ctx, version); err != nil {
 		return err
+	}
+	// 替换完成后若任务已被取消，不再重启：避免取消后仍切换到新版本。
+	if err := ctx.Err(); err != nil {
+		return fmt.Errorf("更新已取消，未重启服务：%w", err)
 	}
 	if u.RestartFunc != nil {
 		if err := u.RestartFunc(); err != nil {

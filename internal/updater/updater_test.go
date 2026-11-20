@@ -786,10 +786,11 @@ func TestReplaceExecutableKeepsPrev(t *testing.T) {
 	}
 }
 
-// recordingLogger 记录 Updater 输出的安全告警。
+// recordingLogger 记录 Updater 输出的安全告警与普通信息。
 type recordingLogger struct {
 	mu       sync.Mutex
 	warnings []string
+	infos    []string
 }
 
 func (l *recordingLogger) Warn(msg string, args ...any) {
@@ -798,10 +799,22 @@ func (l *recordingLogger) Warn(msg string, args ...any) {
 	l.warnings = append(l.warnings, msg)
 }
 
+func (l *recordingLogger) Info(msg string, args ...any) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	l.infos = append(l.infos, msg)
+}
+
 func (l *recordingLogger) snapshot() []string {
 	l.mu.Lock()
 	defer l.mu.Unlock()
 	return append([]string(nil), l.warnings...)
+}
+
+func (l *recordingLogger) infoSnapshot() []string {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return append([]string(nil), l.infos...)
 }
 
 // hostRewriteTransport 把对真实 GitHub/代理域名的请求改写到本地 httptest 服务器，
