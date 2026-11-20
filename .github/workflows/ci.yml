@@ -23,8 +23,13 @@ jobs:
             echo "$diffs"
             exit 1
           fi
+      - name: Verify module checksums
+        run: go mod verify
       - name: Go Vet
         run: go vet ./...
+      - name: Run govulncheck
+        # 固定漏洞库与扫描器版本；发现可达漏洞时以非零码退出（阻塞 CI）。
+        run: go run golang.org/x/vuln/cmd/govulncheck@v1.10.0 ./...
       - name: Go Test with Race Detector
         run: go test -race -v ./...
       - name: Windows Cross-Compile Check
