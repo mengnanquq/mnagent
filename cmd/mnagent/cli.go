@@ -38,7 +38,7 @@ func handleDiagCLI(cfg *config.Config, log *slog.Logger) error {
 	fmt.Println("----------------------------------------------------------------")
 	ntPath, ntOk := dep.ResolveBinaryPath(cfg.Binary)
 	if ntOk {
-		out, _ := exec.Command(ntPath, "-V").CombinedOutput()
+		out := runDiagCommand(ntPath, "-V")
 		vStr := dep.StripANSI(strings.TrimSpace(string(out)))
 		if idx := strings.Index(vStr, "\n"); idx != -1 {
 			vStr = vStr[:idx]
@@ -54,7 +54,7 @@ func handleDiagCLI(cfg *config.Config, log *slog.Logger) error {
 	// 3. 依赖二进制检查：MiaoSpeed
 	miaoPath, miaoOk := dep.ResolveBinaryPath(cfg.MiaospeedBinary)
 	if miaoOk {
-		out, _ := exec.Command(miaoPath, "-v").CombinedOutput()
+		out := runDiagCommand(miaoPath, "-v")
 		vStr := dep.StripANSI(strings.TrimSpace(string(out)))
 		if idx := strings.Index(vStr, "\n"); idx != -1 {
 			vStr = vStr[:idx]
@@ -146,7 +146,8 @@ func handleDiagCLI(cfg *config.Config, log *slog.Logger) error {
 	// 8. 机器人端点连通性测试
 	if cfg.BotURL != "" {
 		fmt.Println("----------------------------------------------------------------")
-		fmt.Printf("  • 机器人连接: 正在测试出站握手 -> %s\n", cfg.BotURL)
+		// 诊断输出常被贴进工单/聊天记录：只打印 scheme://host，不泄露路径（路径里可能带凭据）。
+		fmt.Printf("  • 机器人连接: 正在测试出站握手 -> %s\n", config.RedactEndpoint(cfg.BotURL))
 		start := time.Now()
 		c := &http.Client{Timeout: 5 * time.Second}
 		resp, err := c.Get(cfg.BotURL + "/heartbeat")
@@ -155,11 +156,36 @@ func handleDiagCLI(cfg *config.Config, log *slog.Logger) error {
 			resp.Body.Close()
 			fmt.Printf("  • 连通结果:   🟢 握手成功 (耗时 %v, HTTP %s)\n", dur.Round(time.Millisecond), resp.Status)
 		} else {
-			fmt.Printf("  • 连通结果:   🔴 访问失败 (%v)\n", err)
+			fmt.Printf("  • 连通结果:   🔴 访问失败 (%s)\n", redactEndpointInError(cfg.BotURL, err))
 		}
 	}
 	fmt.Println("================================================================")
 	return nil
+}
+
+// runDiagCommand 带超时执行依赖的版本命令：-diag 是给人现场排障用的，
+// 不能让损坏/卡死的二进制把整个自检挂住（以前是无超时的 exec.Command）。
+func runDiagCommand(path string, args ...string) []byte {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	cmd := exec.CommandContext(ctx, path, args...)
+	// 子进程若派生了孙进程并占用输出管道，Wait 会一直等：超时后再多等 2 秒就放弃。
+	cmd.WaitDelay = 2 * time.Second
+	out, _ := cmd.CombinedOutput()
+	return out
+}
+
+// redactEndpointInError 把错误文本中的端点替换为脱敏形式（只保留 scheme://host）：
+// net/http 的错误会带上完整 URL（含路径），而 -diag 输出常被贴进工单与聊天记录。
+func redactEndpointInError(endpoint string, err error) string {
+	if err == nil {
+		return ""
+	}
+	msg := err.Error()
+	if endpoint != "" {
+		msg = strings.ReplaceAll(msg, endpoint, config.RedactEndpoint(endpoint))
+	}
+	return msg
 }
 
 // tokenDiagSummary 生成令牌诊断摘要：只暴露来源与长度，绝不打印令牌的任何片段。

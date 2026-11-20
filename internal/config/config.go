@@ -340,6 +340,18 @@ func validateBotEndpoint(raw string, allowInsecureHTTP bool) error {
 	if err != nil || (parsed.Scheme != "http" && parsed.Scheme != "https") || parsed.Host == "" || parsed.Hostname() == "" {
 		return fmt.Errorf("-bot 必须是完整的 http(s) 地址，收到 %q", raw)
 	}
+	// 客户端直接在 BotURL 后面拼接 "/jobs"、"/results" 等路径：
+	// 若地址带 userinfo、query 或 fragment，拼出来的 URL 会指向错误位置（例如
+	// https://h/agent?token=x/jobs），既会泄露凭据也会让请求全部失效。
+	if parsed.User != nil {
+		return errors.New("-bot 不允许包含 userinfo（user:pass@），凭据请改用 -token / -token-file")
+	}
+	if parsed.RawQuery != "" || parsed.ForceQuery {
+		return errors.New("-bot 不允许包含查询参数（?），客户端会直接在地址后拼接 /jobs 等路径")
+	}
+	if parsed.Fragment != "" {
+		return errors.New("-bot 不允许包含 fragment（#）")
+	}
 	if parsed.Scheme == "http" && !isLocalHTTPHost(parsed.Hostname()) {
 		if !allowInsecureHTTP {
 			return fmt.Errorf("-bot 使用明文 HTTP 连接非回环/内网地址 %q 会被拒绝（令牌与任务内容可能被窃听）；确需使用请显式加 -allow-insecure-http", parsed.Host)
@@ -360,4 +372,23 @@ func isLocalHTTPHost(host string) bool {
 		return false
 	}
 	return ip.IsLoopback() || ip.IsPrivate() || ip.IsLinkLocalUnicast()
+}
+
+// RedactEndpoint 返回适合写进诊断输出/日志的端点描述：
+// 只保留 scheme://host[:port]，去掉 userinfo、path、query 与 fragment。
+// -diag 的输出经常被贴进工单与聊天记录，端点路径里也可能带有凭据。
+func RedactEndpoint(raw string) string {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return ""
+	}
+	parsed, err := url.Parse(raw)
+	if err != nil || parsed.Host == "" {
+		return "***"
+	}
+	scheme := strings.ToLower(parsed.Scheme)
+	if scheme == "" {
+		scheme = "http"
+	}
+	return scheme + "://" + parsed.Host
 }

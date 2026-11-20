@@ -298,3 +298,44 @@ func TestParseConfigLogFile(t *testing.T) {
 		t.Fatalf("LogFile = %q", cfg.LogFile)
 	}
 }
+
+// TestParseConfigRejectsBotURLCredentials 验证 -bot 不允许带 userinfo、query 与 fragment：
+// 客户端直接在地址后拼 /jobs、/results，这些成分会让请求指错位置并泄露凭据。
+func TestParseConfigRejectsBotURLCredentials(t *testing.T) {
+	base := []string{"-token", "t", "-nexttrace", "/bin/echo"}
+	for _, endpoint := range []string{
+		"https://user:s3cr3t@bot.example.com/agent",
+		"https://s3cr3t-user@bot.example.com/agent",
+		"https://bot.example.com/agent?token=s3cr3t",
+		"https://bot.example.com/agent?",
+		"https://bot.example.com/agent#s3cr3t",
+	} {
+		_, err := ParseConfig(append([]string{"-bot", endpoint}, base...), "dev")
+		if err == nil {
+			t.Errorf("-bot 含 userinfo/query/fragment 应被拒绝: %q", endpoint)
+			continue
+		}
+		if strings.Contains(err.Error(), "s3cr3t") {
+			t.Errorf("错误信息不应回显凭据: %v", err)
+		}
+	}
+	// 正常地址（含端口与路径）仍然可用。
+	if _, err := ParseConfig(append([]string{"-bot", "https://bot.example.com:8443/agent/v1"}, base...), "dev"); err != nil {
+		t.Fatalf("合法 -bot 不应被拒绝: %v", err)
+	}
+}
+
+// TestRedactEndpoint 验证诊断输出只保留 scheme://host。
+func TestRedactEndpoint(t *testing.T) {
+	cases := map[string]string{
+		"https://bot.example.com/agent":             "https://bot.example.com",
+		"https://user:pass@bot.example.com/a?b=c#d": "https://bot.example.com",
+		"http://127.0.0.1:8080/agent":               "http://127.0.0.1:8080",
+		"":                                          "",
+	}
+	for in, want := range cases {
+		if got := RedactEndpoint(in); got != want {
+			t.Errorf("RedactEndpoint(%q) = %q，期望 %q", in, got, want)
+		}
+	}
+}
