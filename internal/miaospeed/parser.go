@@ -6,7 +6,6 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"github.com/mengnanquq/mnagent/internal/probe"
 	"io"
 	"net"
 	"net/http"
@@ -16,6 +15,9 @@ import (
 	"strings"
 	"time"
 	"unicode"
+	"unicode/utf8"
+
+	"github.com/mengnanquq/mnagent/internal/probe"
 )
 
 // MiaospeedNode 描述解析出的代理节点。
@@ -252,6 +254,10 @@ func fetchAndParseSubscription(ctx context.Context, subURL string, allowPrivate 
 var (
 	httpURLRegex  = regexp.MustCompile(`https?://[^\s"'<>\(\)]+`)
 	proxyURIRegex = regexp.MustCompile(`(?i)\b(?:vmess|vless|ss|ssr|trojan|hysteria2|hy2|hysteria|hy|tuic|anytls|clash)://[^\s"'<>\(\)]+`)
+
+	// targetURISchemeRegex 只匹配文本起始处的合法 URI scheme；多行配置或正文里
+	// 偶然出现的 :// 不应把整段内容当作单节点 URI 处理。
+	targetURISchemeRegex = regexp.MustCompile(`^([A-Za-z][A-Za-z0-9+.-]{0,31})://`)
 )
 
 // redactURL 对 HTTP/HTTPS 订阅 URL 进行脱敏，保留 scheme 与 host（含非默认端口），
@@ -281,6 +287,31 @@ func redactURL(rawURL string) string {
 		return fmt.Sprintf("%s://%s/", scheme, u.Host)
 	}
 	return fmt.Sprintf("%s://%s", scheme, u.Host)
+}
+
+// RedactTargetForLog 返回适合写入日志的 miaospeed 目标描述，避免泄露订阅令牌或节点凭据。
+// HTTP(S) 订阅只保留 scheme 与 host；其他代理 URI 只保留 scheme；非 URL 文本
+// （Clash YAML、Base64 订阅、多行节点等）只记录字节数与行数。
+func RedactTargetForLog(target string) string {
+	t := strings.TrimSpace(target)
+	if t == "" {
+		return ""
+	}
+	// 只有“整个目标就是一条 URI”时才按 URI 脱敏。Clash YAML 等多行配置里
+	// 可能包含 http:// 健康检查地址，若用 strings.Index 找第一个 ://，会把
+	// 它前面含 password/uuid 的配置原样带进日志。
+	if !strings.ContainsAny(t, "\r\n") {
+		if m := targetURISchemeRegex.FindStringSubmatch(t); m != nil {
+			scheme := m[1]
+			if strings.EqualFold(scheme, "http") || strings.EqualFold(scheme, "https") {
+				return redactURL(t)
+			}
+			// vmess/ss 等 URI 的主体本身就是凭据（甚至被当作 host 解析），不能复用 redactURL。
+			return scheme + "://***"
+		}
+	}
+	lines := strings.Count(t, "\n") + 1
+	return fmt.Sprintf("[已脱敏：%d 字节，%d 行]", len(t), lines)
 }
 
 func trimTrailingPunct(raw string) (cleaned string, trailing string) {
@@ -346,6 +377,36 @@ func redactProxyError(errText string, targets ...string) string {
 		return "***" + trailing
 	})
 	return result
+}
+
+// maxStartupOutputBytes 限制随错误回传的子进程输出长度，避免把整段启动日志
+// 写进错误/日志；只保留最后一段，通常就是导致启动失败的真正原因。
+const maxStartupOutputBytes = 512
+
+// redactMiaospeedStartupOutput 先脱敏再截断子进程输出，防止 miaospeed 启动失败时
+// 把配置中的订阅 URL、代理凭据或健康检查地址原样带进错误和日志。
+// 若输出直接包含任务目标配置中的任意一行（长度 ≥ 8），则无法可靠枚举并脱敏
+// 节点 server/password 等字段，整体省略输出。
+func redactMiaospeedStartupOutput(output string, targets ...string) string {
+	target := ""
+	if len(targets) > 0 {
+		target = targets[0]
+	}
+	for _, line := range strings.Split(target, "\n") {
+		line = strings.TrimSpace(line)
+		if len(line) >= 8 && strings.Contains(output, line) {
+			return "[输出包含任务配置，已省略]"
+		}
+	}
+	redacted := redactProxyError(output)
+	if len(redacted) <= maxStartupOutputBytes {
+		return redacted
+	}
+	tail := redacted[len(redacted)-maxStartupOutputBytes:]
+	for len(tail) > 0 && !utf8.RuneStart(tail[0]) {
+		tail = tail[1:]
+	}
+	return "…" + tail
 }
 
 // parseClashYAMLProxies 从原生 Clash/Meta 配置文件中提取 proxies 节点。

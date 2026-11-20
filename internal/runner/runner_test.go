@@ -326,6 +326,34 @@ func (l testLogger) Info(msg string, args ...any)  { l.t.Log(append([]any{msg}, 
 func (l testLogger) Warn(msg string, args ...any)  { l.t.Log(append([]any{"WARN " + msg}, args...)...) }
 func (l testLogger) Debug(msg string, args ...any) {}
 
+// TestLoggableTargetRedactsMiaospeed 验证 miaospeed 任务的日志目标不会泄露
+// 订阅 token、节点密码/UUID 或整段配置；普通探针目标保持原样便于排查。
+func TestLoggableTargetRedactsMiaospeed(t *testing.T) {
+	cases := []struct {
+		name string
+		job  model.Job
+		leak string
+	}{
+		{"订阅URL", model.Job{Kind: "miaospeed", Target: "https://example.com/sub?token=log-secret"}, "log-secret"},
+		{"节点URI", model.Job{Kind: "miaospeed", Target: "vless://uuid-secret@example.com:443#node"}, "uuid-secret"},
+		{"配置文本", model.Job{Kind: "miaospeed", Target: "proxies:\n  - name: private-node\n    password: pwd-secret"}, "pwd-secret"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got := loggableTarget(tc.job)
+			if strings.Contains(got, tc.leak) || strings.Contains(got, "private-node") {
+				t.Fatalf("日志目标泄露敏感内容: %s", got)
+			}
+		})
+	}
+
+	plain := model.Job{Kind: "tcping", Target: "1.1.1.1"}
+	if got := loggableTarget(plain); got != plain.Target {
+		t.Fatalf("非 miaospeed 目标应保持原样，got=%q", got)
+	}
+}
+
+// TestIsUpgradeJobNormalizesKind 验证 update/upgrade 判断不受空白与大小写影响。
 func TestIsUpgradeJobNormalizesKind(t *testing.T) {
 	cases := []struct {
 		kind string

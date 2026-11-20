@@ -1203,6 +1203,121 @@ func TestMiaospeedMultiNodeBatchPlanAndTotalNodes(t *testing.T) {
 }
 
 // TestSelectJobNodesUnlimited 验证节点数量默认无上限，仅在指定 Count 时截取。
+func TestRedactTargetForLog(t *testing.T) {
+	cases := []struct {
+		name   string
+		target string
+		want   string
+		leak   string
+	}{
+		{"订阅 URL", "https://example.com/sub?token=super-secret", "https://example.com/***", "super-secret"},
+		{"节点 URI", "trojan://password@example.com:443#node", "trojan://***", "password"},
+		{"vmess 配置", "vmess://eyJhZGQiOiJleGFtcGxlLmNvbSJ9", "vmess://***", "eyJhZGQi"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got := RedactTargetForLog(tc.target)
+			if got != tc.want {
+				t.Fatalf("RedactTargetForLog(%q) = %q，期望 %q", tc.target, got, tc.want)
+			}
+			if strings.Contains(got, tc.leak) {
+				t.Fatalf("脱敏结果仍包含敏感内容 %q: %s", tc.leak, got)
+			}
+		})
+	}
+
+	raw := "proxies:\n  - name: secret-node\n    server: 1.2.3.4\n"
+	got := RedactTargetForLog(raw)
+	if strings.Contains(got, "secret-node") || strings.Contains(got, "1.2.3.4") {
+		t.Fatalf("非 URL 文本应只记录长度/行数，实际: %s", got)
+	}
+	if !strings.Contains(got, "字节") || !strings.Contains(got, "3 行") {
+		t.Fatalf("非 URL 文本应包含字节数与行数，实际: %s", got)
+	}
+
+	multiLine := []struct {
+		name   string
+		target string
+		leaks  []string
+	}{
+		{
+			name: "含 http 健康检查的 Clash YAML",
+			target: "proxies:\n  - name: secret-node\n    type: trojan\n    password: yaml-password-secret\n" +
+				"    uuid: 11111111-2222-3333-4444-555555555555\n" +
+				"    health-check:\n      url: https://health.example.com/ping?token=health-token-secret\n",
+			leaks: []string{"yaml-password-secret", "11111111-2222", "health-token-secret", "secret-node"},
+		},
+		{
+			name:   "多行 URI 列表",
+			target: "trojan://uri-password-secret@example.com:443#one\nvmess://eyJhZGQiOiJ1cmktdm1lc3Mtc2VjcmV0In0=\n",
+			leaks:  []string{"uri-password-secret", "uri-vmess-secret"},
+		},
+		{
+			name:   "Base64 订阅文本",
+			target: base64.StdEncoding.EncodeToString([]byte("trojan://base64-password-secret@example.com:443")),
+			leaks:  []string{"base64-password-secret"},
+		},
+	}
+	for _, tc := range multiLine {
+		t.Run(tc.name, func(t *testing.T) {
+			got := RedactTargetForLog(tc.target)
+			if !strings.Contains(got, "字节") || !strings.Contains(got, "行") {
+				t.Fatalf("多行/非 URI 文本应只记录字节数与行数，实际: %q", got)
+			}
+			for _, leak := range tc.leaks {
+				if strings.Contains(got, leak) {
+					t.Fatalf("脱敏结果泄露了 %q: %s", leak, got)
+				}
+			}
+		})
+	}
+}
+
+// TestRedactMiaospeedStartupOutput 验证启动失败回传的子进程输出只保留尾部，
+// 且其中的订阅 URL、健康检查 URL 与代理 URI 凭据都被脱敏。
+func TestRedactMiaospeedStartupOutput(t *testing.T) {
+	prefix := strings.Repeat("启动日志", 400)
+	output := prefix + "\n" +
+		"health: https://user:pass@example.com/sub/health-token-secret?token=query-secret\n" +
+		"node: trojan://startup-password-secret@example.com:443#node\n"
+	got := redactMiaospeedStartupOutput(output, "")
+	if !strings.HasPrefix(got, "…") {
+		t.Fatalf("超长输出应截断并标注，实际前缀: %q", got[:min(len(got), 20)])
+	}
+	if len(got) > maxStartupOutputBytes+len("…") {
+		t.Fatalf("输出长度 = %d，应不超过约 %d 字节", len(got), maxStartupOutputBytes)
+	}
+	for _, leak := range []string{"health-token-secret", "query-secret", "startup-password-secret"} {
+		if strings.Contains(got, leak) {
+			t.Fatalf("启动输出脱敏后仍泄露 %q: %s", leak, got)
+		}
+	}
+	if !strings.Contains(got, "https://example.com/***") || !strings.Contains(got, "trojan://***") {
+		t.Fatalf("启动输出中的 URL/URI 应做脱敏替换，实际: %s", got)
+	}
+}
+
+// TestRedactMiaospeedStartupOutputOmitsTarget 验证输出包含任务配置原文时整体省略，
+// 避免无法枚举的节点 server/password 等字段泄露；短行不应误触发整体省略。
+func TestRedactMiaospeedStartupOutputOmitsTarget(t *testing.T) {
+	target := "proxies:\n  - name: secret-node\n    server: 203.0.113.10\n    password: target-password-secret\n"
+	output := "miaospeed starting\n    password: target-password-secret\nready\n"
+	if got := redactMiaospeedStartupOutput(output, target); got != "[输出包含任务配置，已省略]" {
+		t.Fatalf("输出包含任务配置行时应整体省略，实际: %q", got)
+	}
+
+	shortTarget := "a: 1\nb: 2\n"
+	shortOutput := "a: 1\nb: 2\nnormal log"
+	got := redactMiaospeedStartupOutput(shortOutput, shortTarget)
+	if strings.Contains(got, "已省略") {
+		t.Fatalf("长度不足 8 的目标行不应触发整体省略，实际: %q", got)
+	}
+	if got != shortOutput {
+		t.Fatalf("正常短输出不应被改变，实际: %q", got)
+	}
+}
+
+// TestSelectJobNodesUnlimited 验证小规模节点默认全量保留，仅在指定 Count 时截取。
 func TestSelectJobNodesUnlimited(t *testing.T) {
 	nodes := make([]MiaospeedNode, 150)
 	for i := range nodes {

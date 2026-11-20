@@ -7,6 +7,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/mengnanquq/mnagent/internal/miaospeed"
 	"github.com/mengnanquq/mnagent/internal/model"
 	"github.com/mengnanquq/mnagent/internal/probe"
 )
@@ -29,6 +30,13 @@ func isUpgradeJob(job model.Job) bool {
 // loggableTarget 返回可安全写入日志的任务目标。
 // miaospeed 的 Target 可能是含 token 的订阅 URL、节点 URI 或整段配置，
 // 直接打印会泄露凭据；其他探针目标受 targetPattern 限制，本身不含敏感信息。
+func loggableTarget(job model.Job) string {
+	if probe.ProbeKind(job) == "miaospeed" {
+		return miaospeed.RedactTargetForLog(job.Target)
+	}
+	return job.Target
+}
+
 // heavyWorker 串行处理重任务与远程更新，避免多重任务争抢带宽与端口，
 // 并与主长轮询完全解耦，使长轮询与轻任务始终保持秒级响应。
 func (a *Agent) heavyWorker(ctx context.Context) {
@@ -61,7 +69,7 @@ func (a *Agent) heavyWorker(ctx context.Context) {
 // execute 在任务上下文中执行一次任务并回传结果；回传不随任务取消而中断。
 func (a *Agent) execute(ctx context.Context, job model.Job) {
 	start := time.Now()
-	a.logger.Info("开始执行任务", "job", job.ID, "kind", probe.ProbeKind(job), "target", job.Target,
+	a.logger.Info("开始执行任务", "job", job.ID, "kind", probe.ProbeKind(job), "target", loggableTarget(job),
 		"hops", job.Hops, "port", job.Port, "protocol", job.Protocol, "count", job.Count)
 
 	taskCtx, taskCancel := context.WithCancel(ctx)
@@ -82,7 +90,7 @@ func (a *Agent) execute(ctx context.Context, job model.Job) {
 		a.logger.Warn("回传结果失败", "job", job.ID, "error", err)
 		return
 	}
-	entry := []any{"job", job.ID, "target", job.Target, "exit_code", exitCode,
+	entry := []any{"job", job.ID, "target", loggableTarget(job), "exit_code", exitCode,
 		"duration", time.Since(start).Round(time.Millisecond).String(), "bytes", len(output)}
 	if errText != "" {
 		a.logger.Warn("任务结束（有错误）", append(entry, "error", errText)...)
