@@ -12,6 +12,7 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
@@ -293,6 +294,95 @@ func TestUpdateMiaospeed(t *testing.T) {
 	}
 	if (fi.Mode() & 0111) == 0 {
 		t.Fatalf("目标文件未设置执行权限: %v", fi.Mode())
+	}
+}
+
+// TestUpdateMiaospeedRejectsOversizedArchive 验证归档下载超过体积上限时中止安装，
+// 不落盘目标文件，并清理临时下载文件。
+func TestUpdateMiaospeedRejectsOversizedArchive(t *testing.T) {
+	oldArchive, oldBinary := maxDependencyArchiveBytes, maxDependencyBinaryBytes
+	maxDependencyArchiveBytes = 1024
+	defer func() {
+		maxDependencyArchiveBytes = oldArchive
+		maxDependencyBinaryBytes = oldBinary
+	}()
+
+	body := bytes.Repeat([]byte("A"), int(maxDependencyArchiveBytes)+1)
+	sum := sha256.Sum256(body)
+	digest := hex.EncodeToString(sum[:])
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if strings.Contains(r.URL.Path, "/repos/AirportR/miaospeed/releases/tags/4.7.7") {
+			fmt.Fprintf(w, `{"assets":[{"name":"miaospeed-linux-amd64-4.7.7.tar.gz","digest":"sha256:%s"}]}`, digest)
+			return
+		}
+		if strings.Contains(r.URL.Path, ".tar.gz") {
+			_, _ = w.Write(body)
+			return
+		}
+		http.NotFound(w, r)
+	}))
+	defer srv.Close()
+
+	dm := newDependencyManager(srv.URL)
+	dm.apiBaseURL = srv.URL
+	dm.goos = "linux"
+	dm.goarch = "amd64"
+	targetPath := filepath.Join(t.TempDir(), "bin", "miaospeed")
+	if _, err := dm.UpdateMiaospeed(context.Background(), targetPath, "4.7.7", nil); err == nil || !strings.Contains(err.Error(), "上限") {
+		t.Fatalf("超过归档体积上限应中止安装，实际 err=%v", err)
+	}
+	if _, err := os.Stat(targetPath); err == nil {
+		t.Fatal("超限时不得写入目标文件")
+	}
+	if leftovers, _ := filepath.Glob(filepath.Join(filepath.Dir(targetPath), ".miaospeed-*")); len(leftovers) != 0 {
+		t.Fatalf("超限下载后应删除临时文件，仍残留: %v", leftovers)
+	}
+}
+
+// TestDownloadVerifiedRemovesTemporaryFileOnFailure 验证下载超限失败时函数会清理
+// 传入的临时路径；调用方的 defer 仍可无副作用地再次 Remove。
+func TestDownloadVerifiedRemovesTemporaryFileOnFailure(t *testing.T) {
+	old := maxDependencyBinaryBytes
+	maxDependencyBinaryBytes = 16
+	defer func() { maxDependencyBinaryBytes = old }()
+
+	body := bytes.Repeat([]byte("A"), int(maxDependencyBinaryBytes)+1)
+	sum := sha256.Sum256(body)
+	digest := hex.EncodeToString(sum[:])
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if strings.Contains(r.URL.Path, "/releases/tags/v1.0.0") {
+			fmt.Fprintf(w, `{"assets":[{"name":"asset","digest":"sha256:%s"}]}`, digest)
+			return
+		}
+		if strings.HasSuffix(r.URL.Path, "/asset") {
+			_, _ = w.Write(body)
+			return
+		}
+		http.NotFound(w, r)
+	}))
+	defer srv.Close()
+
+	dm := newDependencyManager(srv.URL)
+	dm.apiBaseURL = srv.URL
+	tmpPath := filepath.Join(t.TempDir(), ".asset-download-tmp")
+	if _, err := dm.downloadVerified(context.Background(), "owner/repo", "v1.0.0", "asset", srv.URL+"/asset", tmpPath, nil); err == nil || !strings.Contains(err.Error(), "上限") {
+		t.Fatalf("下载超限应报错，实际: %v", err)
+	}
+	if _, err := os.Stat(tmpPath); !os.IsNotExist(err) {
+		t.Fatalf("下载失败后函数应清理临时文件，实际 stat err=%v", err)
+	}
+}
+
+// TestDependencyDownloadLimit 验证归档与裸二进制使用不同的体积上限。
+func TestDependencyDownloadLimit(t *testing.T) {
+	archives := []string{"miaospeed-linux-amd64-4.7.7.tar.gz", "miaospeed-windows-amd64-4.7.7.zip", "asset.tgz"}
+	for _, name := range archives {
+		if got := dependencyDownloadLimit(name); got != maxDependencyArchiveBytes {
+			t.Fatalf("归档 %s 上限 = %d，期望 %d", name, got, maxDependencyArchiveBytes)
+		}
+	}
+	if got := dependencyDownloadLimit("nexttrace_linux_amd64"); got != maxDependencyBinaryBytes {
+		t.Fatalf("裸二进制上限 = %d，期望 %d", got, maxDependencyBinaryBytes)
 	}
 }
 
@@ -795,5 +885,161 @@ func TestUpdateNextTraceSelfCheckMismatchAborts(t *testing.T) {
 	}
 	if got, _ := os.ReadFile(target); string(got) != "old-binary" {
 		t.Fatalf("自检失败时不得替换依赖: %q", string(got))
+	}
+}
+
+// TestDetectLocalVersionTimeout 验证 detectLocalNextTrace/detectLocalMiaospeed
+// 在调用方 ctx 没有 deadline 时也会套用独立超时，不会永久阻塞主循环。
+func TestDetectLocalVersionTimeout(t *testing.T) {
+	old := selfCheckTimeout
+	selfCheckTimeout = 50 * time.Millisecond
+	defer func() { selfCheckTimeout = old }()
+
+	dm := newDependencyManager("")
+	dm.cmdRunner = func(ctx context.Context, _ string, _ ...string) ([]byte, error) {
+		<-ctx.Done()
+		return nil, ctx.Err()
+	}
+	path := filepath.Join(t.TempDir(), "bin")
+	if err := os.WriteFile(path, []byte("#!/bin/sh\n"), 0755); err != nil {
+		t.Fatal(err)
+	}
+
+	for name, detect := range map[string]func(context.Context, string) (bool, string, string, error){
+		"nexttrace": dm.detectLocalNextTrace,
+		"miaospeed": dm.detectLocalMiaospeed,
+	} {
+		start := time.Now()
+		if _, _, _, err := detect(context.Background(), path); err == nil {
+			t.Fatalf("%s: 卡死的版本探测应超时报错", name)
+		}
+		if elapsed := time.Since(start); elapsed > 2*time.Second {
+			t.Fatalf("%s: 版本探测超时未生效，耗时 %s", name, elapsed)
+		}
+	}
+}
+
+// TestDetectLocalVersionRealCommandTimeout 用真实子进程验证默认 cmdRunner 的
+// exec.CommandContext + WaitDelay 能终止卡住的依赖，而不是一直等待。
+func TestDetectLocalVersionRealCommandTimeout(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("Windows 缺少 /bin/sh")
+	}
+	old := selfCheckTimeout
+	selfCheckTimeout = 100 * time.Millisecond
+	oldWait := cmdWaitDelay
+	cmdWaitDelay = 100 * time.Millisecond
+	defer func() {
+		selfCheckTimeout = old
+		cmdWaitDelay = oldWait
+	}()
+
+	path := filepath.Join(t.TempDir(), "slow-nexttrace")
+	if err := os.WriteFile(path, []byte("#!/bin/sh\nsleep 2\n"), 0755); err != nil {
+		t.Fatal(err)
+	}
+	dm := newDependencyManager("")
+	start := time.Now()
+	if _, _, _, err := dm.detectLocalNextTrace(context.Background(), path); err == nil {
+		t.Fatal("卡死的 nexttrace 应超时报错")
+	}
+	if elapsed := time.Since(start); elapsed > 2*time.Second {
+		t.Fatalf("真实子进程超时未生效，耗时 %s", elapsed)
+	}
+}
+
+// TestDependencyUpdateLock 验证同名依赖串行化、不同依赖互不阻塞。
+func TestDependencyUpdateLock(t *testing.T) {
+	dm := newDependencyManager("")
+	unlock := dm.lockDependency("nexttrace")
+
+	acquired := make(chan struct{})
+	go func() {
+		unlock2 := dm.lockDependency("NextTrace") // 大小写不同也应视为同一依赖
+		close(acquired)
+		unlock2()
+	}()
+
+	select {
+	case <-acquired:
+		unlock()
+		t.Fatal("同名依赖的第二把锁不应在释放前获取成功")
+	case <-time.After(50 * time.Millisecond):
+	}
+
+	unlock()
+	select {
+	case <-acquired:
+	case <-time.After(time.Second):
+		t.Fatal("释放后第二把锁应在 1s 内获取成功")
+	}
+
+	// 不同依赖必须可以并行获取，避免 nexttrace 的更新拖住 miaospeed。
+	miaoUnlock := dm.lockDependency("miaospeed")
+	miaoUnlock()
+}
+
+// TestExtractTarGzSizeLimit 验证 tar.gz 解压超过上限时报错并清理临时文件。
+func TestExtractTarGzSizeLimit(t *testing.T) {
+	old := maxExtractBytes
+	maxExtractBytes = 16
+	defer func() { maxExtractBytes = old }()
+
+	var buf bytes.Buffer
+	gw := gzip.NewWriter(&buf)
+	tw := tar.NewWriter(gw)
+	content := bytes.Repeat([]byte("A"), 64)
+	if err := tw.WriteHeader(&tar.Header{Name: "miaospeed", Mode: 0755, Size: int64(len(content)), Typeflag: tar.TypeReg}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := tw.Write(content); err != nil {
+		t.Fatal(err)
+	}
+	_ = tw.Close()
+	_ = gw.Close()
+
+	dest := filepath.Join(t.TempDir(), "miaospeed")
+	err := ExtractTarGzFile(&buf, dest)
+	if err == nil || !errors.Is(err, errExtractTooLarge) {
+		t.Fatalf("超限 tar.gz 应返回体积上限错误，实际 err=%v", err)
+	}
+	if _, statErr := os.Stat(dest); !os.IsNotExist(statErr) {
+		t.Fatalf("超限后应删除临时文件，stat err=%v", statErr)
+	}
+}
+
+// TestExtractZipSizeLimit 验证 zip 解压超过上限时报错并清理临时文件。
+func TestExtractZipSizeLimit(t *testing.T) {
+	old := maxExtractBytes
+	maxExtractBytes = 16
+	defer func() { maxExtractBytes = old }()
+
+	zipPath := filepath.Join(t.TempDir(), "miaospeed.zip")
+	f, err := os.Create(zipPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	zw := zip.NewWriter(f)
+	w, err := zw.Create("miaospeed")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := w.Write(bytes.Repeat([]byte("A"), 64)); err != nil {
+		t.Fatal(err)
+	}
+	if err := zw.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if err := f.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	dest := filepath.Join(t.TempDir(), "miaospeed")
+	err = ExtractZipFile(zipPath, dest)
+	if err == nil || !errors.Is(err, errExtractTooLarge) {
+		t.Fatalf("超限 zip 应返回体积上限错误，实际 err=%v", err)
+	}
+	if _, statErr := os.Stat(dest); !os.IsNotExist(statErr) {
+		t.Fatalf("超限后应删除临时文件，stat err=%v", statErr)
 	}
 }

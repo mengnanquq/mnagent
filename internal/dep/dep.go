@@ -24,6 +24,7 @@ import (
 	"regexp"
 	"runtime"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/mengnanquq/mnagent/internal/statedir"
@@ -46,6 +47,35 @@ const (
 // selfCheckTimeout 是替换前执行依赖 -version/-V 自检的独立超时。
 // 依赖卡死或挂起时不能把整个更新流程一起拖住；测试会缩短该值。
 var selfCheckTimeout = 10 * time.Second
+
+// maxExtractBytes 限制从依赖归档中解压出的单个可执行文件大小（防 zip bomb 占满磁盘）。
+// 变量而非常量，便于测试缩短；生产环境为 256MB。
+var maxExtractBytes int64 = 256 << 20
+
+// 依赖下载体积上限：归档 64MB、裸二进制 128MB。
+// 变量而非常量，便于测试缩短；生产环境保持上述值。
+var (
+	maxDependencyArchiveBytes int64 = 64 << 20
+	maxDependencyBinaryBytes  int64 = 128 << 20
+)
+
+// dependencyDownloadLimit 按资产名选择下载体积上限：压缩包用归档上限，其余用二进制上限。
+func dependencyDownloadLimit(assetName string) int64 {
+	lower := strings.ToLower(assetName)
+	for _, ext := range []string{".zip", ".tar.gz", ".tgz", ".tar", ".gz"} {
+		if strings.HasSuffix(lower, ext) {
+			return maxDependencyArchiveBytes
+		}
+	}
+	return maxDependencyBinaryBytes
+}
+
+// cmdWaitDelay 是 exec.Cmd.WaitDelay：取消后子进程若仍持有输出管道，
+// 最多再等这么久就强制结束等待。变量便于测试缩短。
+var cmdWaitDelay = 3 * time.Second
+
+// errExtractTooLarge 表示解压内容超过 maxExtractBytes。
+var errExtractTooLarge = errors.New("解压内容超过体积上限")
 
 // binaryPresent 判断目标路径上是否已有文件（用于区分“升级”与“首次安装”）。
 func binaryPresent(path string) bool {
@@ -85,6 +115,14 @@ func (s DependencyStatus) Summary() string {
 	return fmt.Sprintf("%s: 已是最新版本（%s）", s.Name, s.CurrentVersion)
 }
 
+// depUpdateLocks 按依赖名串行化替换（进程级）：runner 的自动更新循环与远程 upgrade
+// 各自 newDependencyManager，互斥锁必须跨实例共享，才能避免两个流程同时下载/替换
+// 同一个依赖而互相覆盖，或让自检读到正在被替换的文件。
+var (
+	depUpdateLocksMu sync.Mutex
+	depUpdateLocks   = make(map[string]*sync.Mutex)
+)
+
 // DependencyManager 负责检测与更新外部依赖工具。
 type DependencyManager struct {
 	ghProxy       string
@@ -111,6 +149,9 @@ func NewDependencyManager(ghProxy string) *DependencyManager {
 		githubBaseURL: "https://github.com",
 		cmdRunner: func(ctx context.Context, name string, args ...string) ([]byte, error) {
 			cmd := exec.CommandContext(ctx, name, args...)
+			// 子进程被取消后若孙进程仍持有 stdout/stderr 管道，Wait 会无限等待；
+			// WaitDelay 在超时后强制结束等待，保证自检不会永久阻塞。
+			cmd.WaitDelay = cmdWaitDelay
 			return cmd.CombinedOutput()
 		},
 		goos:   runtime.GOOS,
@@ -169,17 +210,36 @@ func ResolveBinaryPath(bin string) (string, bool) {
 	return trimmed, false
 }
 
+// lockDependency 返回按依赖名串行化的解锁函数。
+func (dm *DependencyManager) lockDependency(name string) func() {
+	key := strings.ToLower(strings.TrimSpace(name))
+	depUpdateLocksMu.Lock()
+	mu := depUpdateLocks[key]
+	if mu == nil {
+		mu = &sync.Mutex{}
+		depUpdateLocks[key] = mu
+	}
+	depUpdateLocksMu.Unlock()
+	mu.Lock()
+	return mu.Unlock
+}
+
 // detectLocalNextTrace 探测本地已安装的 nexttrace 版本。
+// 内部再套一层独立超时：调用方（主循环 / heavyWorker）可能没有 deadline，
+// 绝不能因为依赖的 -V 卡死而永久阻塞。
 func (dm *DependencyManager) detectLocalNextTrace(ctx context.Context, binPath string) (installed bool, realPath string, ver string, err error) {
 	realPath, installed = ResolveBinaryPath(binPath)
 	if !installed {
 		return false, realPath, "", nil
 	}
 
-	out, cmdErr := dm.cmdRunner(ctx, realPath, "-V")
+	runCtx, cancel := context.WithTimeout(ctx, selfCheckTimeout)
+	defer cancel()
+
+	out, cmdErr := dm.cmdRunner(runCtx, realPath, "-V")
 	if cmdErr != nil {
 		// 备选尝试 --version
-		if out2, cmdErr2 := dm.cmdRunner(ctx, realPath, "--version"); cmdErr2 == nil {
+		if out2, cmdErr2 := dm.cmdRunner(runCtx, realPath, "--version"); cmdErr2 == nil {
 			out = out2
 			cmdErr = nil
 		}
@@ -206,15 +266,19 @@ func (dm *DependencyManager) detectLocalNextTrace(ctx context.Context, binPath s
 }
 
 // detectLocalMiaospeed 探测本地已安装的 miaospeed 版本。
+// 与 detectLocalNextTrace 一样内部套独立超时，避免无 deadline 的调用方被卡死。
 func (dm *DependencyManager) detectLocalMiaospeed(ctx context.Context, binPath string) (installed bool, realPath string, ver string, err error) {
 	realPath, installed = ResolveBinaryPath(binPath)
 	if !installed {
 		return false, realPath, "", nil
 	}
 
-	out, cmdErr := dm.cmdRunner(ctx, realPath, "-version")
+	runCtx, cancel := context.WithTimeout(ctx, selfCheckTimeout)
+	defer cancel()
+
+	out, cmdErr := dm.cmdRunner(runCtx, realPath, "-version")
 	if cmdErr != nil {
-		if out2, cmdErr2 := dm.cmdRunner(ctx, realPath, "version"); cmdErr2 == nil {
+		if out2, cmdErr2 := dm.cmdRunner(runCtx, realPath, "version"); cmdErr2 == nil {
 			out = out2
 			cmdErr = nil
 		}
@@ -534,8 +598,12 @@ func (dm *DependencyManager) fetchAssetDigest(ctx context.Context, repo, tag, as
 	return "", fmt.Errorf("Release %s 中不存在附件 %s", tag, assetName)
 }
 
-// downloadVerified 下载附件到 destPath，并强制校验上游 SHA-256 摘要；摘要拿不到或不一致即报错。
-func (dm *DependencyManager) downloadVerified(ctx context.Context, repo, tag, assetName, downloadURL, destPath string, log Logger) (int64, error) {
+// downloadVerified 下载附件到调用方专用的临时路径 tmpPath，并强制校验上游 SHA-256 摘要；
+// 摘要拿不到或不一致即报错。
+//
+// tmpPath 必须只是本次下载的临时文件（调用方应始终 defer os.Remove(tmpPath)）：
+// 函数在写入失败或体积超限时会主动删除半成品，其余路径（含校验失败）由调用方统一清理。
+func (dm *DependencyManager) downloadVerified(ctx context.Context, repo, tag, assetName, downloadURL, tmpPath string, log Logger) (int64, error) {
 	digest, digestErr := dm.fetchAssetDigest(ctx, repo, tag, assetName)
 	if digest == "" {
 		if digestErr == nil {
@@ -564,17 +632,23 @@ func (dm *DependencyManager) downloadVerified(ctx context.Context, repo, tag, as
 		return 0, fmt.Errorf("下载 %s HTTP 响应状态 %s", assetName, resp.Status)
 	}
 
-	f, err := os.OpenFile(destPath, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0755)
+	f, err := os.OpenFile(tmpPath, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0755)
 	if err != nil {
 		return 0, fmt.Errorf("创建临时文件失败：%w", err)
 	}
+	limit := dependencyDownloadLimit(assetName)
 	hasher := sha256.New()
-	written, err := io.Copy(io.MultiWriter(f, hasher), resp.Body)
+	written, err := io.Copy(io.MultiWriter(f, hasher), io.LimitReader(resp.Body, limit+1))
 	if closeErr := f.Close(); err == nil {
 		err = closeErr
 	}
 	if err != nil {
+		_ = os.Remove(tmpPath)
 		return 0, fmt.Errorf("写入 %s 失败：%w", assetName, err)
+	}
+	if written > limit {
+		_ = os.Remove(tmpPath)
+		return 0, fmt.Errorf("%s 下载体积超过上限（%d MB），已中止安装", assetName, limit>>20)
 	}
 	actual := hex.EncodeToString(hasher.Sum(nil))
 	if subtle.ConstantTimeCompare([]byte(actual), []byte(digest)) != 1 {
@@ -627,6 +701,7 @@ func (dm *DependencyManager) selfCheckDependency(ctx context.Context, name, path
 
 // UpdateNextTrace 下载并安装/更新 nexttrace 到目标路径。
 func (dm *DependencyManager) UpdateNextTrace(ctx context.Context, targetPath, version string, log Logger) (string, error) {
+	defer dm.lockDependency("nexttrace")()
 	destPath := ResolveInstallTarget(targetPath, "nexttrace")
 	assetName, err := NexttraceAsset(dm.goos, dm.goarch)
 	if err != nil {
@@ -691,6 +766,7 @@ func (dm *DependencyManager) UpdateNextTrace(ctx context.Context, targetPath, ve
 
 // UpdateMiaospeed 下载并安装/更新 miaospeed 到目标路径。
 func (dm *DependencyManager) UpdateMiaospeed(ctx context.Context, targetPath, version string, log Logger) (string, error) {
+	defer dm.lockDependency("miaospeed")()
 	destPath := ResolveInstallTarget(targetPath, "miaospeed")
 	tag := strings.TrimPrefix(version, "v")
 	if tag == "" || tag == "latest" {
@@ -798,10 +874,26 @@ func ExtractZipFile(zipPath, destFile string) error {
 				_ = rc.Close()
 				return err
 			}
-			_, cpErr := io.Copy(out, rc)
+			_, cpErr := io.Copy(out, io.LimitReader(rc, maxExtractBytes+1))
+			closeErr := out.Close()
 			_ = rc.Close()
-			_ = out.Close()
-			return cpErr
+			if cpErr != nil {
+				_ = os.Remove(destFile)
+				return cpErr
+			}
+			if closeErr != nil {
+				_ = os.Remove(destFile)
+				return closeErr
+			}
+			// 不能只信 zip 头里的 UncompressedSize64（可伪造/为 0），按实际解压字节数检查。
+			if fi, statErr := os.Stat(destFile); statErr != nil || fi.Size() > maxExtractBytes {
+				_ = os.Remove(destFile)
+				if statErr != nil {
+					return statErr
+				}
+				return fmt.Errorf("%w：%s 超过 %d 字节", errExtractTooLarge, name, maxExtractBytes)
+			}
+			return nil
 		}
 	}
 	return errors.New("zip 压缩包内未找到可执行文件")
@@ -838,9 +930,24 @@ func ExtractTarGzFile(r io.Reader, destFile string) error {
 			if err != nil {
 				return err
 			}
-			_, cpErr := io.Copy(f, tr)
-			_ = f.Close()
-			return cpErr
+			_, cpErr := io.Copy(f, io.LimitReader(tr, maxExtractBytes+1))
+			closeErr := f.Close()
+			if cpErr != nil {
+				_ = os.Remove(destFile)
+				return cpErr
+			}
+			if closeErr != nil {
+				_ = os.Remove(destFile)
+				return closeErr
+			}
+			if fi, statErr := os.Stat(destFile); statErr != nil || fi.Size() > maxExtractBytes {
+				_ = os.Remove(destFile)
+				if statErr != nil {
+					return statErr
+				}
+				return fmt.Errorf("%w：%s 超过 %d 字节", errExtractTooLarge, name, maxExtractBytes)
+			}
+			return nil
 		}
 	}
 	return errors.New("压缩包内未找到可执行文件")
