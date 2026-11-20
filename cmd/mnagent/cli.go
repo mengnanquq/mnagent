@@ -135,11 +135,7 @@ func handleDiagCLI(cfg *config.Config, log *slog.Logger) error {
 	fmt.Println("----------------------------------------------------------------")
 	if cfg.Tokens != nil {
 		if tok, err := cfg.Tokens.Get(); err == nil && tok != "" {
-			masked := tok
-			if len(masked) > 8 {
-				masked = masked[:4] + "...." + masked[len(masked)-4:]
-			}
-			fmt.Printf("  • 接入凭据:   🟢 已加载 (来自 %s: %s)\n", cfg.Tokens.From, masked)
+			fmt.Printf("  • 接入凭据:   🟢 %s\n", tokenDiagSummary(cfg.Tokens.From, tok))
 		} else {
 			fmt.Printf("  • 接入凭据:   🟡 令牌读取失败 (来源 %s: %v)\n", cfg.Tokens.From, err)
 		}
@@ -164,6 +160,15 @@ func handleDiagCLI(cfg *config.Config, log *slog.Logger) error {
 	}
 	fmt.Println("================================================================")
 	return nil
+}
+
+// tokenDiagSummary 生成令牌诊断摘要：只暴露来源与长度，绝不打印令牌的任何片段。
+// -diag 的输出常被贴进工单/聊天记录，即使首尾各 4 位也可能泄露过多信息。
+func tokenDiagSummary(from, token string) string {
+	if from == "" {
+		from = "未知"
+	}
+	return fmt.Sprintf("已加载 (来源 %s，长度 %d)", from, len(token))
 }
 
 // normalizeLocalProbeKind 归一化本地 -probe-kind，空值默认 ping。

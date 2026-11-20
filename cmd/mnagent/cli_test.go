@@ -2,11 +2,13 @@ package main
 
 import (
 	"context"
+	"fmt"
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"github.com/mengnanquq/mnagent/internal/config"
@@ -39,6 +41,18 @@ func TestHandleDiagCLI(t *testing.T) {
 	log := slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelDebug}))
 	if err := handleDiagCLI(cfg, log); err != nil {
 		t.Fatalf("handleDiagCLI 失败: %v", err)
+	}
+}
+
+// TestTokenDiagSummaryHidesSecret 守护 -diag 不输出令牌片段（首尾各 4 位也不允许）。
+func TestTokenDiagSummaryHidesSecret(t *testing.T) {
+	token := "abcd-SECRET-1234"
+	got := tokenDiagSummary("/etc/mnagent/token", token)
+	if strings.Contains(got, "abcd") || strings.Contains(got, "1234") || strings.Contains(got, token) {
+		t.Fatalf("诊断摘要泄露了令牌片段: %q", got)
+	}
+	if !strings.Contains(got, "/etc/mnagent/token") || !strings.Contains(got, fmt.Sprintf("长度 %d", len(token))) {
+		t.Fatalf("诊断摘要应包含来源与长度: %q", got)
 	}
 }
 
