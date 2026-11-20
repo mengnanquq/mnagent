@@ -1,10 +1,6 @@
 package dep
 
 import (
-	"github.com/mengnanquq/mnagent/internal/updater"
-)
-
-import (
 	"archive/tar"
 	"archive/zip"
 	"bytes"
@@ -23,6 +19,8 @@ import (
 	"sync/atomic"
 	"testing"
 	"time"
+
+	"github.com/mengnanquq/mnagent/internal/updater"
 )
 
 // mockDependencyVersion 让下载后的依赖自检返回指定版本（测试无需真实可执行二进制）。
@@ -1041,5 +1039,136 @@ func TestExtractZipSizeLimit(t *testing.T) {
 	}
 	if _, statErr := os.Stat(dest); !os.IsNotExist(statErr) {
 		t.Fatalf("超限后应删除临时文件，stat err=%v", statErr)
+	}
+}
+
+// TestFetchAssetDigestPrefersUpstreamSha256 验证优先使用同源 .sha256，
+// 且配置 gh-proxy 时不信任该文件（代理可同时替换二进制与校验文件），必须回退到 API。
+func TestFetchAssetDigestPrefersUpstreamSha256(t *testing.T) {
+	sum := strings.Repeat("a", 64)
+	apiSum := strings.Repeat("b", 64)
+	var apiHits, sumHits atomic.Int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case strings.HasSuffix(r.URL.Path, ".sha256"):
+			sumHits.Add(1)
+			fmt.Fprintf(w, "%s  nexttrace_linux_amd64\n", sum)
+		case strings.Contains(r.URL.Path, "/releases/tags/"):
+			apiHits.Add(1)
+			fmt.Fprintf(w, `{"assets":[{"name":"nexttrace_linux_amd64","digest":"sha256:%s"}]}`, apiSum)
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer srv.Close()
+
+	dm := newDependencyManager("")
+	dm.apiBaseURL = srv.URL
+	dm.githubBaseURL = srv.URL
+	got, err := dm.fetchAssetDigest(context.Background(), "nxtrace/NTrace-core", "v1.7.4", "nexttrace_linux_amd64")
+	if err != nil || got != sum {
+		t.Fatalf("应优先使用同源 .sha256：got=%q err=%v", got, err)
+	}
+	if apiHits.Load() != 0 || sumHits.Load() == 0 {
+		t.Fatalf("不应触发 API 回退：api=%d sum=%d", apiHits.Load(), sumHits.Load())
+	}
+
+	// 配置 gh-proxy 时同源 .sha256 不可信，必须回退到 API。
+	dmProxy := newDependencyManager("https://gh-proxy.example/")
+	dmProxy.apiBaseURL = srv.URL
+	dmProxy.githubBaseURL = srv.URL
+	sumHits.Store(0)
+	got, err = dmProxy.fetchAssetDigest(context.Background(), "nxtrace/NTrace-core", "v1.7.4", "nexttrace_linux_amd64")
+	if err != nil || got != apiSum {
+		t.Fatalf("配置 gh-proxy 时应回退到 API：got=%q err=%v", got, err)
+	}
+	if sumHits.Load() != 0 {
+		t.Fatal("配置 gh-proxy 时不应请求同源 .sha256")
+	}
+}
+
+// TestFetchAssetDigestErrorMentionsAPI 验证摘要获取失败时明确提示需要 api.github.com 连通性。
+func TestFetchAssetDigestErrorMentionsAPI(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { http.NotFound(w, r) }))
+	defer srv.Close()
+	dm := newDependencyManager("")
+	dm.apiBaseURL = srv.URL
+	dm.githubBaseURL = srv.URL
+	_, err := dm.fetchAssetDigest(context.Background(), "nxtrace/NTrace-core", "v1.7.4", "nexttrace_linux_amd64")
+	if err == nil || !strings.Contains(err.Error(), "api.github.com") {
+		t.Fatalf("错误信息应说明需要 api.github.com 连通性：%v", err)
+	}
+}
+
+// TestFetchAssetDigestRejectsMismatchedSha256Name 验证 .sha256 里文件名不匹配时不采用（避免错误配对）。
+func TestFetchAssetDigestRejectsMismatchedSha256Name(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if strings.HasSuffix(r.URL.Path, ".sha256") {
+			fmt.Fprintf(w, "%s  nexttrace_linux_arm64\n", strings.Repeat("c", 64))
+			return
+		}
+		http.NotFound(w, r)
+	}))
+	defer srv.Close()
+	dm := newDependencyManager("")
+	dm.apiBaseURL = srv.URL
+	dm.githubBaseURL = srv.URL
+	if _, err := dm.fetchAssetDigest(context.Background(), "x/y", "v1.7.4", "nexttrace_linux_amd64"); err == nil {
+		t.Fatal("文件名不匹配时不应采用该 .sha256")
+	}
+}
+
+// TestDownloadVerifiedRefusesExistingTempPath 验证临时文件用 O_EXCL 创建：
+// 预先放置的路径（可能是指向别处的软链接）会让下载直接失败，绝不会被覆盖。
+func TestDownloadVerifiedRefusesExistingTempPath(t *testing.T) {
+	content := bytes.Repeat([]byte("D"), 2048)
+	sum := sha256.Sum256(content)
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case strings.HasSuffix(r.URL.Path, ".sha256"):
+			http.NotFound(w, r)
+		case strings.Contains(r.URL.Path, "/releases/tags/"):
+			fmt.Fprintf(w, `{"assets":[{"name":"nexttrace_linux_amd64","digest":"sha256:%x"}]}`, sum)
+		case strings.Contains(r.URL.Path, "/dl"):
+			_, _ = w.Write(content)
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer srv.Close()
+
+	dm := newDependencyManager("")
+	dm.apiBaseURL = srv.URL
+	dm.githubBaseURL = srv.URL
+
+	tmp := filepath.Join(t.TempDir(), "pre-existing")
+	if err := os.WriteFile(tmp, []byte("attacker-content"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	_, err := dm.downloadVerified(context.Background(), "x/y", "v1.7.4", "nexttrace_linux_amd64", srv.URL+"/dl", tmp, nil)
+	if err == nil || !strings.Contains(err.Error(), "临时文件") {
+		t.Fatalf("已存在的临时路径必须被拒绝，实际 err=%v", err)
+	}
+	got, readErr := os.ReadFile(tmp)
+	if readErr != nil || string(got) != "attacker-content" {
+		t.Fatalf("已存在的临时文件不得被覆盖: %q err=%v", string(got), readErr)
+	}
+}
+
+// TestResolveInstallTargetLeavesNoProbeFile 验证可写性探测使用 os.CreateTemp 且清理干净。
+func TestResolveInstallTargetLeavesNoProbeFile(t *testing.T) {
+	dir := t.TempDir()
+	target := filepath.Join(dir, "nexttrace")
+	if got := ResolveInstallTarget(target, "nexttrace"); got != target {
+		t.Fatalf("可写目录应返回目标路径，实际 %q", got)
+	}
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, e := range entries {
+		if strings.HasPrefix(e.Name(), ".mnagent-write-test-") {
+			t.Fatalf("写入探测文件未清理：%s", e.Name())
+		}
 	}
 }

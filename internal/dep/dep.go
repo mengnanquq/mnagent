@@ -1,10 +1,6 @@
 package dep
 
 import (
-	"github.com/mengnanquq/mnagent/internal/updater"
-)
-
-import (
 	"archive/tar"
 	"archive/zip"
 	"compress/gzip"
@@ -28,6 +24,7 @@ import (
 	"time"
 
 	"github.com/mengnanquq/mnagent/internal/statedir"
+	"github.com/mengnanquq/mnagent/internal/updater"
 )
 
 var (
@@ -35,6 +32,8 @@ var (
 	NexttraceVerPattern = regexp.MustCompile(`(?i)NextTrace\s+v?(\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?)`)
 	MiaospeedVerPattern = regexp.MustCompile(`(?i)version:\s*v?(\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?)`)
 	GenericVerPattern   = regexp.MustCompile(`v?(\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?)`)
+	// sha256HexPattern 用于校验上游 .sha256 文件里的哈希格式。
+	sha256HexPattern = regexp.MustCompile(`^[0-9a-f]{64}$`)
 )
 
 // 查不到最新版本时只允许在“尚未安装”的场景安装这些固定版本；
@@ -532,11 +531,19 @@ func ResolveInstallTarget(configuredPath, defaultName string) string {
 	if err := os.MkdirAll(dir, 0755); err != nil {
 		return privateBinPath(defaultName, dest)
 	}
-	testFile := filepath.Join(dir, fmt.Sprintf(".test_write_%d_%d", os.Getpid(), time.Now().UnixNano()))
-	if err := os.WriteFile(testFile, []byte("ok"), 0600); err != nil {
+	// 用 os.CreateTemp 而不是可预测的文件名：可预测名 + O_TRUNC 会被本地攻击者
+	// 预先放置软链接，把写入重定向到任意文件。
+	testFile, err := os.CreateTemp(dir, ".mnagent-write-test-*")
+	if err != nil {
 		return privateBinPath(defaultName, dest)
 	}
-	_ = os.Remove(testFile)
+	testPath := testFile.Name()
+	_, writeErr := testFile.WriteString("ok")
+	_ = testFile.Close()
+	_ = os.Remove(testPath)
+	if writeErr != nil {
+		return privateBinPath(defaultName, dest)
+	}
 	return dest
 }
 
@@ -554,10 +561,15 @@ func privateBinPath(name, fallback string) string {
 	return filepath.Join(bin, name)
 }
 
-// fetchAssetDigest 通过 GitHub API（直连，不走 gh-proxy）获取指定 Release 附件的 SHA-256 摘要。
-// 拿不到有效摘要（API 不可达、限流、附件不存在或未提供 digest）一律返回错误：
-// 这些依赖以 root 运行，宁可拒绝安装也不能跳过完整性校验。
+// fetchAssetDigest 获取指定 Release 附件的 SHA-256 摘要，优先走同源 "<资产>.sha256"
+// 附件，再回退到 GitHub API 的 assets[].digest 字段。
+// 拿不到有效摘要（上游未发布 .sha256、API 不可达、限流、附件不存在或未提供 digest）
+// 一律返回错误：这些依赖以 root 运行，宁可拒绝安装也不能跳过完整性校验。
 func (dm *DependencyManager) fetchAssetDigest(ctx context.Context, repo, tag, assetName string) (string, error) {
+	if sum, ok := dm.fetchAssetDigestFile(ctx, repo, tag, assetName); ok {
+		return sum, nil
+	}
+
 	targetURL := fmt.Sprintf("%s/repos/%s/releases/tags/%s", strings.TrimRight(dm.apiBaseURL, "/"), repo, url.PathEscape(tag))
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, targetURL, nil)
 	if err != nil {
@@ -571,11 +583,11 @@ func (dm *DependencyManager) fetchAssetDigest(ctx context.Context, repo, tag, as
 	}
 	resp, err := client.Do(req)
 	if err != nil {
-		return "", err
+		return "", digestAPIHint(err)
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {
-		return "", fmt.Errorf("GitHub API 返回 HTTP %s", resp.Status)
+		return "", digestAPIHint(fmt.Errorf("GitHub API 返回 HTTP %s", resp.Status))
 	}
 	var data struct {
 		Assets []struct {
@@ -584,7 +596,7 @@ func (dm *DependencyManager) fetchAssetDigest(ctx context.Context, repo, tag, as
 		} `json:"assets"`
 	}
 	if err := json.NewDecoder(io.LimitReader(resp.Body, 4<<20)).Decode(&data); err != nil {
-		return "", fmt.Errorf("解析 Release JSON 失败：%w", err)
+		return "", digestAPIHint(fmt.Errorf("解析 Release JSON 失败：%w", err))
 	}
 	for _, a := range data.Assets {
 		if a.Name != assetName {
@@ -593,9 +605,63 @@ func (dm *DependencyManager) fetchAssetDigest(ctx context.Context, repo, tag, as
 		if d, ok := strings.CutPrefix(strings.ToLower(a.Digest), "sha256:"); ok && len(d) == 64 {
 			return d, nil
 		}
-		return "", fmt.Errorf("Release %s 的附件 %s 未提供 SHA-256 digest", tag, assetName)
+		return "", digestAPIHint(fmt.Errorf("Release %s 的附件 %s 未提供 SHA-256 digest", tag, assetName))
 	}
-	return "", fmt.Errorf("Release %s 中不存在附件 %s", tag, assetName)
+	return "", digestAPIHint(fmt.Errorf("Release %s 中不存在附件 %s", tag, assetName))
+}
+
+// digestAPIHint 给“拿不到摘要”的错误补上可操作说明：依赖校验必须能访问 api.github.com。
+// 上游（nexttrace / miaospeed）目前并不发布 <资产>.sha256，因此 API 是唯一来源。
+func digestAPIHint(err error) error {
+	return fmt.Errorf("%w；获取依赖的上游 SHA-256 需要 api.github.com 连通性（或手动预装依赖）", err)
+}
+
+// fetchAssetDigestFile 尝试读取 Release 附件的同源 "<资产>.sha256" 文件。
+// 只在未配置 gh-proxy 时尝试：经代理获取的校验文件与二进制可能被同一代理同时替换，
+// 这种“自证”没有安全意义；直连 github.com 时才信任（仍受 HTTPS 保护）。
+// 常量小文件、失败即静默回退到 API。
+func (dm *DependencyManager) fetchAssetDigestFile(ctx context.Context, repo, tag, assetName string) (string, bool) {
+	if strings.TrimSpace(dm.ghProxy) != "" {
+		return "", false
+	}
+	sumURL := fmt.Sprintf("%s/%s/releases/download/%s/%s.sha256", strings.TrimRight(dm.githubBaseURL, "/"), repo, tag, assetName)
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, sumURL, nil)
+	if err != nil {
+		return "", false
+	}
+	req.Header.Set("User-Agent", "mnagent")
+	client := dm.httpClient
+	if client == nil {
+		client = http.DefaultClient
+	}
+	resp, err := client.Do(req)
+	if err != nil {
+		return "", false
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return "", false
+	}
+	body, err := io.ReadAll(io.LimitReader(resp.Body, 64<<10))
+	if err != nil {
+		return "", false
+	}
+	fields := strings.Fields(string(body))
+	if len(fields) == 0 {
+		return "", false
+	}
+	sum := strings.ToLower(fields[0])
+	if !sha256HexPattern.MatchString(sum) {
+		return "", false
+	}
+	// 带文件名的格式（"<hash>  <file>"）必须指向同一个资产，避免错误配对。
+	if len(fields) > 1 {
+		name := strings.TrimPrefix(fields[1], "*")
+		if filepath.Base(name) != assetName {
+			return "", false
+		}
+	}
+	return sum, true
 }
 
 // downloadVerified 下载附件到调用方专用的临时路径 tmpPath，并强制校验上游 SHA-256 摘要；
@@ -632,7 +698,9 @@ func (dm *DependencyManager) downloadVerified(ctx context.Context, repo, tag, as
 		return 0, fmt.Errorf("下载 %s HTTP 响应状态 %s", assetName, resp.Status)
 	}
 
-	f, err := os.OpenFile(tmpPath, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0755)
+	// O_EXCL：临时路径名虽然带 UnixNano，仍可能在创建前被预先放置（软链接/旧残留）。
+	// 用独占创建拒绝这类已存在文件，避免把下载内容写进别处。
+	f, err := os.OpenFile(tmpPath, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0755)
 	if err != nil {
 		return 0, fmt.Errorf("创建临时文件失败：%w", err)
 	}
