@@ -44,8 +44,6 @@ var maxBinaryBytes int64 = 128 << 20
 // Version 是默认版本号（未指定时使用）。
 var Version = "dev"
 
-var releaseVersionPattern = regexp.MustCompile(`/releases/download/([^/]+)/`)
-
 // VersionInfo 保存语义化版本信息。
 type VersionInfo struct {
 	Major    int
@@ -558,15 +556,6 @@ func (u *Updater) parseChecksum(body []byte) (string, error) {
 		return "", err
 	}
 	return "", fmt.Errorf("校验文件 %s.sha256 中未找到当前资产的哈希", assetName)
-}
-
-// fetchExpectedChecksum 获取目标资产的 sha256 校验文件并提取 Hash。
-func (u *Updater) fetchExpectedChecksum(version string) (string, error) {
-	body, err := u.fetchChecksumBody(version)
-	if err != nil {
-		return "", err
-	}
-	return u.parseChecksum(body)
 }
 
 // DownloadAndReplace 下载并原子替换二进制文件，支持 SHA-256 完整性校验，返回目标版本号，但不触发重启。
