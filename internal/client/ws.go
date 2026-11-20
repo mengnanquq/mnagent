@@ -33,12 +33,14 @@ const (
 	wsJobsCapacity   = 16  // 普通待执行任务缓冲，与低内存设备的既有预算保持一致
 	wsCancelCapacity = 256 // 取消指令独立缓冲，不能被普通任务挤占
 
+	// wsMaxInlineResultBytes 是走 WebSocket 回传的结果体积上限。WS 写超时只有
+	// 15s，大结果（数百 KB 到数 MB）在慢速链路上很容易写超时并迫使整条长连接
+	// CloseNow；超过该阈值时直接走 HTTP /results（原本也就有独立超时与重试）。
+	wsMaxInlineResultBytes = 256 << 10
+
 	wsCancelOverflowCapacity = 1024 // 取消溢出列表硬上限，超限丢弃最旧条目
 	wsCancelDropLogEvery     = 100  // 溢出丢弃告警节流：首次及每丢 100 条打一次
 )
-
-// wsAckTimeout 是等待机器人确认结果的上限，超时改走 HTTP 重发（测试中会缩短）。
-var wsAckTimeout = 10 * time.Second
 
 var errNoWS = errors.New("websocket 未连接")
 
@@ -108,8 +110,7 @@ func (c *Client) wsLoop(ctx context.Context) {
 				backoff = min(backoff*2, wsMaxBackoff)
 				slog.Debug("WebSocket 连接失败，稍后重试", "status", status, "retry_in", wait, "error", err)
 			}
-			jitter := time.Duration(rand.Int64N(int64(wait/4) + 1))
-			if !sleepCtx(ctx, wait+jitter) {
+			if !sleepCtx(ctx, wait+wsJitter(wait)) {
 				return
 			}
 			continue
@@ -117,13 +118,31 @@ func (c *Client) wsLoop(ctx context.Context) {
 		slog.Debug("WebSocket 长连接已建立", "endpoint", c.baseURL+"/ws")
 		started := time.Now()
 		c.serveWS(ctx, conn)
-		if time.Since(started) > time.Minute {
-			backoff = time.Second
-		}
-		if !sleepCtx(ctx, backoff) {
+		backoff = wsNextBackoff(backoff, time.Since(started))
+		if !sleepCtx(ctx, backoff+wsJitter(backoff)) {
 			return
 		}
 	}
+}
+
+// wsNextBackoff 计算连接断开后的重连等待时间。
+// 握手成功但很快断开（存活 <10s）通常意味着服务端不稳定：按 backoff*2 增长，
+// 直到 wsMaxBackoff；存活 ≥10s 说明链路基本可用，直接按 1s 重连，
+// 避免一次网络抖动后长期停留在 30s 退避。
+func wsNextBackoff(current, uptime time.Duration) time.Duration {
+	if uptime >= 10*time.Second {
+		return time.Second
+	}
+	return min(current*2, wsMaxBackoff)
+}
+
+// wsJitter 返回 [0, d] 的抖动增量，配合 base 等待形成 [d, 2d] 的等待区间，
+// 打散多台探针的重连时刻（抖动幅度由原来的 25% 扩大到 100%）。
+func wsJitter(d time.Duration) time.Duration {
+	if d <= 0 {
+		return 0
+	}
+	return time.Duration(rand.Int64N(int64(d) + 1))
 }
 
 func (c *Client) dialWS(ctx context.Context) (*websocket.Conn, int, error) {
@@ -133,8 +152,8 @@ func (c *Client) dialWS(ctx context.Context) (*websocket.Conn, int, error) {
 	}
 	h := http.Header{}
 	h.Set("Authorization", "Bearer "+token)
-	h.Set("User-Agent", "mnagent/"+Version)
-	h.Set("X-Agent-Version", Version)
+	h.Set("User-Agent", "mnagent/"+c.version)
+	h.Set("X-Agent-Version", c.version)
 	dctx, cancel := context.WithTimeout(ctx, wsHandshakeTimeout)
 	defer cancel()
 	conn, resp, err := websocket.Dial(dctx, c.baseURL+"/ws", &websocket.DialOptions{
@@ -333,6 +352,8 @@ func (c *Client) wsSend(ctx context.Context, msg wsMessage) error {
 	wctx, cancel := context.WithTimeout(ctx, wsWriteTimeout)
 	defer cancel()
 	if err := conn.Write(wctx, websocket.MessageText, data); err != nil {
+		// 写超时/写失败后不能继续信任这条连接：可能只写入了半帧，后续读到的
+		// 数据帧边界会错位。关闭后由 wsLoop 重连，结果由调用方改走 HTTP 重发。
 		_ = conn.CloseNow()
 		return err
 	}
@@ -454,7 +475,11 @@ func (c *Client) sendResultWS(ctx context.Context, res model.Result) bool {
 	if c.wsSend(ctx, wsMessage{Type: "result", Result: &res}) != nil {
 		return false
 	}
-	timer := time.NewTimer(wsAckTimeout)
+	timeout := c.wsAckTimeout
+	if timeout <= 0 {
+		timeout = 10 * time.Second
+	}
+	timer := time.NewTimer(timeout)
 	defer timer.Stop()
 	select {
 	case <-ch:

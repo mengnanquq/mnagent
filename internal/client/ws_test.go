@@ -208,12 +208,6 @@ func TestClientWSFallbackToHTTP(t *testing.T) {
 // TestClientWSResultAck 验证：机器人确认的结果不走 HTTP；未确认的结果超时后改走 HTTP 重发；
 // 退出前未领取的推送任务会被回报为失败。
 func TestClientWSResultAck(t *testing.T) {
-	// 等待 ack 的超时是功能本身的一部分，不能去掉；但传 200ms 时一次调度抖动就会把
-	// “已确认”误判为“未确认”。这里放宽到 2s，ack 是进程内回包，正常远小于 1s。
-	old := wsAckTimeout
-	wsAckTimeout = 2 * time.Second
-	defer func() { wsAckTimeout = old }()
-
 	var httpResults atomic.Int32
 	wsResults := make(chan model.Result, 8)
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -260,6 +254,9 @@ func TestClientWSResultAck(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	cli := newWSClient(srv.URL)
+	// 等待 ack 的超时是功能本身的一部分，不能去掉；但传 200ms 时一次调度抖动就会把
+	// “已确认”误判为“未确认”。这里放宽到 2s，ack 是进程内回包，正常远小于 1s。
+	cli.wsAckTimeout = 2 * time.Second
 	cli.startWS(ctx)
 	waitFor(t, "建立长连接并收到 hello", func() bool { return cli.WSConnected() && cli.wsAck.Load() })
 	waitFor(t, "推送任务与取消分别进入缓冲", func() bool { return len(cli.wsJobs) == 1 && len(cli.wsCancel) == 1 })
@@ -878,5 +875,83 @@ func TestRemoveAckWaiterKeepsOthers(t *testing.T) {
 	c.ackMu.Unlock()
 	if ok {
 		t.Fatal("最后一个等待者注销后应删除键")
+	}
+}
+
+// TestWSNextBackoff 验证断线重连退避：连接存活不足 10s 时指数增长到上限，
+// 存活 ≥10s 说明链路基本可用，直接重置为 1s。纯函数测试，避免依赖真实时钟。
+func TestWSNextBackoff(t *testing.T) {
+	cases := []struct {
+		current time.Duration
+		uptime  time.Duration
+		want    time.Duration
+	}{
+		{time.Second, 5 * time.Second, 2 * time.Second},
+		{2 * time.Second, 9 * time.Second, 4 * time.Second},
+		{16 * time.Second, 9 * time.Second, wsMaxBackoff},
+		{wsMaxBackoff, 9 * time.Second, wsMaxBackoff},
+		{wsMaxBackoff, 10 * time.Second, time.Second},
+		{8 * time.Second, time.Minute, time.Second},
+	}
+	for _, tc := range cases {
+		if got := wsNextBackoff(tc.current, tc.uptime); got != tc.want {
+			t.Errorf("wsNextBackoff(%s, %s) = %s，期望 %s", tc.current, tc.uptime, got, tc.want)
+		}
+	}
+}
+
+// TestClientSendResultLargeBypassesWS 验证超过 256KB 的结果直接走 HTTP，
+// 避免 15s WS 写超时后 CloseNow 整条长连接、拖累进度与取消消息。
+func TestClientSendResultLargeBypassesWS(t *testing.T) {
+	var httpResults atomic.Int32
+	wsResults := make(chan struct{}, 1)
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/results" {
+			httpResults.Add(1)
+			w.WriteHeader(http.StatusNoContent)
+			return
+		}
+		if r.URL.Path != "/ws" {
+			w.WriteHeader(http.StatusNoContent)
+			return
+		}
+		conn, err := websocket.Accept(w, r, nil)
+		if err != nil {
+			return
+		}
+		defer conn.CloseNow()
+		ctx := r.Context()
+		_ = conn.Write(ctx, websocket.MessageText, []byte(`{"type":"hello"}`))
+		for {
+			_, data, err := conn.Read(ctx)
+			if err != nil {
+				return
+			}
+			var msg wsMessage
+			if json.Unmarshal(data, &msg) == nil && msg.Type == "result" {
+				select {
+				case wsResults <- struct{}{}:
+				default:
+				}
+			}
+		}
+	}))
+	defer srv.Close()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	cli := newWSClient(srv.URL)
+	cli.startWS(ctx)
+	waitFor(t, "WebSocket 长连接建立", func() bool { return cli.WSConnected() })
+
+	large := model.Result{ID: "large-result", Output: strings.Repeat("x", wsMaxInlineResultBytes+1)}
+	if err := cli.SendResult(ctx, large); err != nil {
+		t.Fatalf("大结果回传失败: %v", err)
+	}
+	waitFor(t, "大结果走 HTTP /results", func() bool { return httpResults.Load() > 0 })
+	select {
+	case <-wsResults:
+		t.Fatal("超过 256KB 的结果不应再走 WebSocket")
+	case <-time.After(200 * time.Millisecond):
 	}
 }

@@ -410,3 +410,15 @@ func TestRedactSnippetTruncatesAtRuneBoundary(t *testing.T) {
 		t.Fatalf("应截断到 510 字节（170 个 rune），实际 %d 字节", len(got))
 	}
 }
+
+// TestReadSnippetDrainsBody 验证读完错误片段后会继续排空响应体，
+// 使 net/http 可以复用连接（否则每次 /jobs、/results 重试都要重新握手）。
+func TestReadSnippetDrainsBody(t *testing.T) {
+	body := strings.NewReader(strings.Repeat("x", 1024))
+	if got := readSnippet(body); len(got) == 0 {
+		t.Fatal("readSnippet 应返回响应片段")
+	}
+	if body.Len() != 0 {
+		t.Fatalf("响应体应被排空以便连接复用，剩余 %d 字节", body.Len())
+	}
+}

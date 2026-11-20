@@ -44,6 +44,7 @@ const (
 type Client struct {
 	baseURL string
 	host    string
+	version string
 	tokens  *config.TokenSource
 	http    *http.Client
 	// results 使用独立客户端：/results 可能上传 16MB，慢速网络下不能沿用长轮询的短超时。
@@ -62,6 +63,9 @@ type Client struct {
 	wsCancel   chan *model.Job   // 取消指令独立队列，读循环永不为它阻塞
 	wsReject   chan model.Result // 队列满时的失败结果，由独立协程回传，避免阻塞读循环
 	wsAck      atomic.Bool       // 当前连接的机器人是否会确认结果（hello 声明）
+	// wsAckTimeout 是等待机器人确认结果的上限。放实例字段避免测试改全局变量时
+	// 与上一用例泄漏的 wsLoop/wsRejectLoop 发生数据竞争。
+	wsAckTimeout time.Duration
 
 	// wsRejectMu/wsRejectStop/wsRejectWG 用于退出时与失败回传协程同步：
 	// FailPending 先通知 wsRejectLoop 停止取新条目，再等待其在途 SendResult
@@ -111,8 +115,10 @@ func New(cfg *config.Config) *Client {
 		resultTotalTimeout = resultTimeout
 	}
 	return &Client{
-		baseURL: cfg.BotURL,
-		tokens:  cfg.Tokens,
+		baseURL:      cfg.BotURL,
+		version:      Version,
+		tokens:       cfg.Tokens,
+		wsAckTimeout: 10 * time.Second,
 		http: &http.Client{
 			Transport: transport,
 			Timeout:   cfg.PollTimeout,
@@ -217,13 +223,12 @@ func validateJob(job *model.Job) error {
 	return nil
 }
 
-func (c *Client) poll(ctx context.Context) (*model.Job, error) {
-	return c.Poll(ctx)
-}
-
 // SendResult 回传执行结果，失败时按退避重试。
 func (c *Client) SendResult(ctx context.Context, res model.Result) error {
-	if c.WSConnected() && c.sendResultWS(ctx, res) {
+	// 大结果不走 WebSocket：15s 写超时在慢速上行链路上很容易触发，随后只能
+	// CloseNow 整条长连接，并拖累同一连接上的进度/取消消息。直接走 HTTP 上传，
+	// 使用 /results 的独立超时与重试更稳妥。
+	if resultSizeApprox(res) <= wsMaxInlineResultBytes && c.WSConnected() && c.sendResultWS(ctx, res) {
 		return nil
 	}
 	payload, err := json.Marshal(res)
@@ -271,8 +276,11 @@ func (c *Client) SendResult(ctx context.Context, res model.Result) error {
 	return lastErr
 }
 
-func (c *Client) sendResult(ctx context.Context, res model.Result) error {
-	return c.SendResult(ctx, res)
+// resultSizeApprox 粗略估算结果的 JSON 体积，用于 WS/HTTP 分流。
+// 只统计主要字符串字段，避免为判断阈值而先完整 marshal 一份大结果
+// （真正的 payload 在 HTTP 分支才 marshal）。
+func resultSizeApprox(res model.Result) int {
+	return len(res.Output) + len(res.Data) + len(res.Error) + len(res.ID) + len(res.Kind)
 }
 
 // SendProgress 上报实时进度，返回机器人是否要求取消该任务（单次网络错误不阻塞主流程）。
@@ -299,10 +307,6 @@ func (c *Client) SendProgress(ctx context.Context, p model.Progress) (bool, erro
 	return false, nil
 }
 
-func (c *Client) sendProgress(ctx context.Context, p model.Progress) (bool, error) {
-	return c.SendProgress(ctx, p)
-}
-
 // Heartbeat 发送轻量保活心跳，更新服务端的 lastSeen 时间戳。
 // 长连接在线时无需心跳（连接本身即在线状态），直接返回。
 func (c *Client) Heartbeat(ctx context.Context) error {
@@ -321,10 +325,6 @@ func (c *Client) Heartbeat(ctx context.Context) error {
 		return model.ErrUnauthorized
 	}
 	return fmt.Errorf("心跳失败：%s %s", resp.Status, readSnippet(resp.Body))
-}
-
-func (c *Client) heartbeat(ctx context.Context) error {
-	return c.Heartbeat(ctx)
 }
 
 // do 发送一次带鉴权头的请求（长轮询等短请求共用默认客户端）。
@@ -348,8 +348,8 @@ func (c *Client) doWith(cli *http.Client, ctx context.Context, method, path stri
 		return nil, err
 	}
 	req.Header.Set("Authorization", "Bearer "+token)
-	req.Header.Set("User-Agent", "mnagent/"+Version)
-	req.Header.Set("X-Agent-Version", Version)
+	req.Header.Set("User-Agent", "mnagent/"+c.version)
+	req.Header.Set("X-Agent-Version", c.version)
 	if body != nil {
 		req.Header.Set("Content-Type", "application/json")
 	}
@@ -361,6 +361,9 @@ func (c *Client) doWith(cli *http.Client, ctx context.Context, method, path stri
 // 避免凭据被写进 journalctl / 上报给上游。
 func readSnippet(body io.Reader) string {
 	data, _ := io.ReadAll(io.LimitReader(body, 512))
+	// 错误响应通常很小，但读完片段后仍要排空剩余响应体（有上限），否则 HTTP
+	// 连接无法复用，/jobs、/results 每次重试都要重新握手。
+	_, _ = io.Copy(io.Discard, io.LimitReader(body, 64<<10))
 	return redactSnippet(strings.TrimSpace(string(data)))
 }
 
