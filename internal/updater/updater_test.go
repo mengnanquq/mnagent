@@ -42,6 +42,13 @@ func TestParseVersion(t *testing.T) {
 		{"v1.0.0", "v0.9.9", true},
 		{"v0.1.7", "v0.1.7-rc1", true}, // 正式版晚于预发布
 		{"v0.1.7-rc2", "v0.1.7-rc1", true},
+		{"v0.1.7-rc.10", "v0.1.7-rc.9", true}, // 数字段按数值而不是字符串比较
+		{"v0.1.7-rc.9", "v0.1.7-rc.10", false},
+		{"v0.1.7-rc.100000000000000000000", "v0.1.7-rc.99999999999999999999", true}, // 超长数字不得溢出
+		{"v0.1.7-alpha", "v0.1.7-alpha.1", false},
+		{"v0.1.7-alpha.1", "v0.1.7-alpha.beta", false},
+		{"v0.1.7-beta", "v0.1.7-rc", false},
+		{"v0.1.7-rc.1", "v0.1.7-rc.1.1", false},
 		{"v0.1.6", "v0.1.7", false},
 	}
 	for _, c := range cases {

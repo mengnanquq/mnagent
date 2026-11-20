@@ -111,7 +111,83 @@ func (v VersionInfo) NewerThan(other VersionInfo) bool {
 	if v.Pre != "" && other.Pre == "" {
 		return false
 	}
-	return v.Pre > other.Pre
+	return comparePrerelease(v.Pre, other.Pre) > 0
+}
+
+// comparePrerelease 按 semver 2.0 比较预发布段：
+// 以 . 拆分逐段比较；纯数字段按数值比较且低于字母段；前缀相同时段数少者小。
+// 返回 -1、0、1 表示 a 小于、等于、大于 b。
+func comparePrerelease(a, b string) int {
+	if a == b {
+		return 0
+	}
+	as := strings.Split(a, ".")
+	bs := strings.Split(b, ".")
+	for i := 0; i < len(as) && i < len(bs); i++ {
+		if as[i] == bs[i] {
+			continue
+		}
+		aNum := isNumericPrerelease(as[i])
+		bNum := isNumericPrerelease(bs[i])
+		switch {
+		case aNum && bNum:
+			return compareNumericPrerelease(as[i], bs[i])
+		case aNum:
+			return -1 // 数字段低于字母段
+		case bNum:
+			return 1
+		case as[i] < bs[i]:
+			return -1
+		default:
+			return 1
+		}
+	}
+	switch {
+	case len(as) < len(bs):
+		return -1
+	case len(as) > len(bs):
+		return 1
+	default:
+		return 0
+	}
+}
+
+// isNumericPrerelease 判断预发布段是否为纯数字。
+func isNumericPrerelease(s string) bool {
+	if s == "" {
+		return false
+	}
+	for i := 0; i < len(s); i++ {
+		if s[i] < '0' || s[i] > '9' {
+			return false
+		}
+	}
+	return true
+}
+
+// compareNumericPrerelease 按任意长度数值比较两个纯数字预发布段，
+// 避免 strconv.Atoi 在超长数字上溢出后退化为字符串比较。
+func compareNumericPrerelease(a, b string) int {
+	a = strings.TrimLeft(a, "0")
+	b = strings.TrimLeft(b, "0")
+	if len(a) != len(b) {
+		if len(a) < len(b) {
+			return -1
+		}
+		return 1
+	}
+	if a < b {
+		return -1
+	}
+	if a > b {
+		return 1
+	}
+	return 0
+}
+
+// Logger 是更新器用到的最小日志接口；未注入时退化为 slog 默认 logger。
+type Logger interface {
+	Warn(msg string, args ...any)
 }
 
 // Config 是构建 Updater 所需的参数。
