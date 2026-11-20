@@ -9,7 +9,6 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
-	"runtime"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -294,30 +293,23 @@ func TestDependencyCheckIgnoresUpgradePhaseBudget(t *testing.T) {
 		body += "# padding\n"
 	}
 	content := []byte(body)
-	digest := fmt.Sprintf("%x", sha256.Sum256(content))
-	asset, err := dep.NexttraceAsset(runtime.GOOS, runtime.GOARCH)
-	if err != nil {
-		t.Fatal(err)
-	}
 
-	var sumHits atomic.Int32
+	var slowHits atomic.Int32
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch {
-		case strings.HasSuffix(r.URL.Path, ".sha256"):
-			sumHits.Add(1)
-			// 摘要响应比升级路径的 80ms 预算更慢：非升级路径不应被它截断。
+		case strings.Contains(r.URL.Path, "releases/download"):
+			slowHits.Add(1)
+			// 下载响应比升级路径的 80ms 预算更慢：非升级路径不应被它截断。
 			select {
 			case <-time.After(250 * time.Millisecond):
 			case <-r.Context().Done():
 				return
 			}
-			fmt.Fprintf(w, "%s  %s\n", digest, asset)
+			_, _ = w.Write(content)
 		case strings.Contains(r.URL.Path, "/nxtrace/NTrace-core/releases/latest"):
 			_, _ = w.Write([]byte(`{"tag_name":"v1.7.4"}`))
 		case strings.Contains(r.URL.Path, "/AirportR/miaospeed/releases/latest"):
 			_, _ = w.Write([]byte(`{"tag_name":"4.7.7"}`))
-		case strings.Contains(r.URL.Path, "releases/download"):
-			_, _ = w.Write(content)
 		default:
 			http.NotFound(w, r)
 		}
@@ -348,11 +340,11 @@ func TestDependencyCheckIgnoresUpgradePhaseBudget(t *testing.T) {
 	a.checkAndUpdateDependencies(ctx)
 	elapsed := time.Since(start)
 
-	if sumHits.Load() == 0 {
-		t.Fatal("依赖检查应请求 .sha256 摘要")
+	if slowHits.Load() == 0 {
+		t.Fatal("依赖检查应真正发起下载请求")
 	}
 	if elapsed < 200*time.Millisecond {
-		t.Fatalf("依赖检查耗时 %s，未真正经过慢速摘要响应", elapsed)
+		t.Fatalf("依赖检查耗时 %s，未真正经过慢速下载响应", elapsed)
 	}
 	if _, err := os.Stat(nexttracePath); err != nil {
 		t.Fatalf("非升级路径不应受升级阶段 80ms 预算限制，nexttrace 应安装成功: %v", err)

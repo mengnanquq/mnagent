@@ -5,8 +5,6 @@ import (
 	"bytes"
 	"compress/gzip"
 	"context"
-	"crypto/sha256"
-	"encoding/hex"
 	"errors"
 	"fmt"
 	"net/http"
@@ -27,13 +25,8 @@ func TestUpdateDependencyDefaultBudgetTimesOutAndCoolsDown(t *testing.T) {
 	t.Cleanup(resetDependencyInstallState)
 
 	origBudget := dependencyUpdateBudget
-	origDelay := digestRetryBaseDelay
 	dependencyUpdateBudget = 150 * time.Millisecond
-	digestRetryBaseDelay = 5 * time.Millisecond
-	defer func() {
-		dependencyUpdateBudget = origBudget
-		digestRetryBaseDelay = origDelay
-	}()
+	defer func() { dependencyUpdateBudget = origBudget }()
 
 	var hits atomic.Int32
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -42,9 +35,8 @@ func TestUpdateDependencyDefaultBudgetTimesOutAndCoolsDown(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	dm := newDependencyManager("")
-	dm.apiBaseURL = srv.URL
-	dm.githubBaseURL = srv.URL
+	// 配置 gh-proxy 把下载指向本地测试服务，由它一直挂住到预算耗尽。
+	dm := newDependencyManager(srv.URL)
 	dm.goos = "linux"
 	dm.goarch = "amd64"
 	target := filepath.Join(t.TempDir(), "bin", "nexttrace")
@@ -61,7 +53,7 @@ func TestUpdateDependencyDefaultBudgetTimesOutAndCoolsDown(t *testing.T) {
 	}
 	firstHits := hits.Load()
 	if firstHits == 0 {
-		t.Fatal("预算内应至少发出一次摘要请求")
+		t.Fatal("预算内应至少发出一次下载请求")
 	}
 
 	// 第二次调用应命中冷却，而不是重新下载。
@@ -107,10 +99,10 @@ func TestUpdateDependencyWithinCallerCancelNotBudget(t *testing.T) {
 	}
 }
 
-// TestDownloadVerifiedSlowStreamNotAborted 验证归档下载不设整体 Timeout：
+// TestDownloadAssetSlowStreamNotAborted 验证归档下载不设整体 Timeout：
 // 只要持续有数据，即使总耗时超过响应头/空闲超时（生产上相当于超过旧的 20s
 // 整体超时）也不会失败。测试通过缩短空闲超时来模拟弱网慢速分块传输。
-func TestDownloadVerifiedSlowStreamNotAborted(t *testing.T) {
+func TestDownloadAssetSlowStreamNotAborted(t *testing.T) {
 	origIdle := dependencyDownloadIdleTimeout
 	origHeader := dependencyResponseHeaderTimeout
 	dependencyDownloadIdleTimeout = 250 * time.Millisecond
@@ -121,17 +113,11 @@ func TestDownloadVerifiedSlowStreamNotAborted(t *testing.T) {
 	}()
 
 	content := bytes.Repeat([]byte("slow-stream-"), 8<<10) // 96KB
-	sum := sha256.Sum256(content)
-	digest := hex.EncodeToString(sum[:])
 
 	chunks := 10
 	chunkSize := len(content) / chunks
 	var flushes atomic.Int32
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if strings.HasSuffix(r.URL.Path, ".sha256") {
-			fmt.Fprintf(w, "%s  nexttrace_linux_amd64\n", digest)
-			return
-		}
 		if r.URL.Path != "/dl" {
 			http.NotFound(w, r)
 			return
@@ -160,12 +146,10 @@ func TestDownloadVerifiedSlowStreamNotAborted(t *testing.T) {
 	defer srv.Close()
 
 	dm := newDependencyManager("")
-	dm.apiBaseURL = srv.URL
-	dm.githubBaseURL = srv.URL
 	dm.downloadClient = nil // 使用按当前（已缩短的）超时变量构建的下载客户端
 
 	tmpPath := filepath.Join(t.TempDir(), "download")
-	n, err := dm.downloadVerified(context.Background(), "nxtrace/NTrace-core", "v1.7.4", "nexttrace_linux_amd64", srv.URL+"/dl", tmpPath, nil)
+	n, err := dm.downloadAsset(context.Background(), "nexttrace_linux_amd64", srv.URL+"/dl", tmpPath)
 	if err != nil {
 		t.Fatalf("持续有数据的慢速下载不应失败: %v", err)
 	}
@@ -181,22 +165,16 @@ func TestDownloadVerifiedSlowStreamNotAborted(t *testing.T) {
 	}
 }
 
-// TestDownloadVerifiedIdleTimeout 验证连续无数据超过空闲读超时会中止下载，
+// TestDownloadAssetIdleTimeout 验证连续无数据超过空闲读超时会中止下载，
 // 而不是无限等待。
-func TestDownloadVerifiedIdleTimeout(t *testing.T) {
+func TestDownloadAssetIdleTimeout(t *testing.T) {
 	origIdle := dependencyDownloadIdleTimeout
 	dependencyDownloadIdleTimeout = 80 * time.Millisecond
 	defer func() { dependencyDownloadIdleTimeout = origIdle }()
 
 	content := []byte("idle-timeout-body")
-	sum := sha256.Sum256(content)
-	digest := hex.EncodeToString(sum[:])
 
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if strings.HasSuffix(r.URL.Path, ".sha256") {
-			fmt.Fprintf(w, "%s  nexttrace_linux_amd64\n", digest)
-			return
-		}
 		// 先发响应头发起传输，再长时间不写数据。
 		w.Header().Set("Content-Length", fmt.Sprint(len(content)))
 		w.WriteHeader(http.StatusOK)
@@ -211,12 +189,10 @@ func TestDownloadVerifiedIdleTimeout(t *testing.T) {
 	defer srv.Close()
 
 	dm := newDependencyManager("")
-	dm.apiBaseURL = srv.URL
-	dm.githubBaseURL = srv.URL
 	dm.downloadClient = nil
 
 	tmpPath := filepath.Join(t.TempDir(), "download")
-	_, err := dm.downloadVerified(context.Background(), "nxtrace/NTrace-core", "v1.7.4", "nexttrace_linux_amd64", srv.URL+"/dl", tmpPath, nil)
+	_, err := dm.downloadAsset(context.Background(), "nexttrace_linux_amd64", srv.URL+"/dl", tmpPath)
 	if err == nil {
 		t.Fatal("连续无数据超过空闲超时应中止下载")
 	}
@@ -233,13 +209,7 @@ func TestDownloadVerifiedIdleTimeout(t *testing.T) {
 func TestUpdateDependencyCancelBeforeReplace(t *testing.T) {
 	t.Run("nexttrace", func(t *testing.T) {
 		content := bytes.Repeat([]byte("N"), 150*1024)
-		sum := sha256.Sum256(content)
-		digest := hex.EncodeToString(sum[:])
 		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-			if strings.HasSuffix(r.URL.Path, ".sha256") {
-				fmt.Fprintf(w, "%s  nexttrace_linux_amd64\n", digest)
-				return
-			}
 			if strings.Contains(r.URL.Path, "releases/download") {
 				_, _ = w.Write(content)
 				return
@@ -295,14 +265,7 @@ func TestUpdateDependencyCancelBeforeReplace(t *testing.T) {
 		_ = tw.Close()
 		_ = gw.Close()
 
-		sum := sha256.Sum256(buf.Bytes())
-		digest := hex.EncodeToString(sum[:])
-		archiveName := "miaospeed-linux-amd64-4.7.7.tar.gz"
 		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-			if strings.HasSuffix(r.URL.Path, ".sha256") {
-				fmt.Fprintf(w, "%s  %s\n", digest, archiveName)
-				return
-			}
 			if strings.HasSuffix(r.URL.Path, ".tar.gz") {
 				_, _ = w.Write(buf.Bytes())
 				return

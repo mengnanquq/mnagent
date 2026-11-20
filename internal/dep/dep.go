@@ -5,17 +5,12 @@ import (
 	"archive/zip"
 	"compress/gzip"
 	"context"
-	"crypto/sha256"
-	"crypto/subtle"
-	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
-	"math/rand/v2"
 	"net"
 	"net/http"
-	"net/url"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -25,7 +20,6 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
-	"unicode/utf8"
 
 	"github.com/mengnanquq/mnagent/internal/statedir"
 	"github.com/mengnanquq/mnagent/internal/updater"
@@ -36,8 +30,6 @@ var (
 	NexttraceVerPattern = regexp.MustCompile(`(?i)NextTrace\s+v?(\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?)`)
 	MiaospeedVerPattern = regexp.MustCompile(`(?i)version:\s*v?(\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?)`)
 	GenericVerPattern   = regexp.MustCompile(`v?(\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?)`)
-	// sha256HexPattern 用于校验上游 .sha256 文件里的哈希格式。
-	sha256HexPattern = regexp.MustCompile(`^[0-9a-f]{64}$`)
 )
 
 // 查不到最新版本时只允许在“尚未安装”的场景安装这些固定版本；
@@ -52,7 +44,7 @@ const (
 var selfCheckTimeout = 10 * time.Second
 
 // dependencyUpdateBudget 是非升级路径（启动补齐、定期检查、运行时安装、CLI）
-// 中单个依赖安装/更新的宽松整体预算（含服务端代取、直连摘要、下载、解压与自检）。
+// 中单个依赖安装/更新的宽松整体预算（含下载、解压与自检）。
 // 弱网下 60MB 归档可能需要几分钟，过紧会把正常安装误杀；升级任务路径由
 // handleUpgradeJob 传入更紧凑的预算（见 UpdateDependencyWithin）。
 // 变量而非常量，便于测试缩短。
@@ -64,7 +56,7 @@ var dependencyUpdateBudget = 5 * time.Minute
 var errDependencyBudgetExceeded = errors.New("依赖安装整体预算已用尽")
 
 // 依赖归档下载的超时拆分：归档可能几十 MB，弱网下传输时间不可预估，
-// 不能像摘要/API 小请求那样用 http.Client.Timeout 一刀切（它包含读响应体的时间）。
+// 不能像版本查询等小请求那样用 http.Client.Timeout 一刀切（它包含读响应体的时间）。
 // 这里改为连接/TLS/响应头超时 + 连续无数据的空闲读超时，并以 ctx 作为总上限。
 // 变量而非常量，便于测试缩短。
 var (
@@ -155,9 +147,6 @@ type DependencyManager struct {
 	httpClient    *http.Client
 	apiBaseURL    string // 默认 "https://api.github.com"
 	githubBaseURL string // 默认 "https://github.com"
-	// botDigest 是服务端代取校验值的客户端；nil 表示不启用。
-	// 依赖不做交叉校验（上游未发布 .sha256），只把代取结果作为首选来源。
-	botDigest *updater.BotDigestClient
 	// downloadClient 是归档/二进制下载专用客户端：不设整体 Timeout，
 	// 使用连接/响应头超时 + 空闲读超时，并以 ctx 作为总上限。
 	// 零值时按当前超时变量惰性构建，测试可注入自定义客户端。
@@ -199,16 +188,8 @@ func (dm *DependencyManager) SetGitHubEndpoints(apiBaseURL, githubBaseURL string
 	dm.githubBaseURL = githubBaseURL
 }
 
-// SetBotDigest 注入服务端代取校验值的客户端；nil 表示不启用。
-func (dm *DependencyManager) SetBotDigest(c *updater.BotDigestClient) {
-	if dm == nil {
-		return
-	}
-	dm.botDigest = c
-}
-
 // downloadHTTPClient 返回归档/二进制下载专用客户端。
-// 与摘要/API 使用的 20s httpClient 不同：不设整体 Timeout，避免弱网下大文件
+// 与版本查询（API）使用的 20s httpClient 不同：不设整体 Timeout，避免弱网下大文件
 // 因传输超过 20s 被强制中断；连接/响应头超时与空闲读超时共同兜底，
 // 总时长仍受调用方 ctx 约束。
 func (dm *DependencyManager) downloadHTTPClient() *http.Client {
@@ -454,7 +435,7 @@ func (dm *DependencyManager) ensureDependency(ctx context.Context, budget time.D
 
 		path, err := dm.UpdateDependencyWithin(ctx, budget, normalized, targetPath, version, log)
 		if err != nil && ctx.Err() != nil && !isContextError(err) {
-			// 底层可能把取消错误包成了普通文本（重试摘要会压缩错误），
+			// 底层可能把取消错误包成了普通文本（包装时可能丢失错误链），
 			// 这里补回 ctx 错误链，供等待者判断“leader 因 ctx 失败”并自行重试。
 			err = fmt.Errorf("%w：%v", ctx.Err(), err)
 		}
@@ -832,262 +813,13 @@ func privateBinPath(name, fallback string) string {
 	return filepath.Join(bin, name)
 }
 
-// 依赖摘要获取的重试参数。国内直连 api.github.com / github.com 经常出现
-// 连接重置或短时 5xx，单次失败就放弃会让“缺失依赖自动安装”在弱网下几乎不可用。
-// 每次请求有独立短超时，重试次数与退避受父 ctx 控制。
-const digestFetchAttempts = 3
-
-var (
-	digestRetryBaseDelay = 200 * time.Millisecond
-	digestRetryMaxDelay  = 2 * time.Second
-	digestRequestTimeout = 10 * time.Second
-)
-
-// nonRetryableHTTPError 标记确定性的 4xx 响应（429 限流除外）：
-// 这类错误重试只会浪费任务预算，应立即放弃并回退到另一个来源。
-type nonRetryableHTTPError struct{ err error }
-
-func (e *nonRetryableHTTPError) Error() string { return e.err.Error() }
-func (e *nonRetryableHTTPError) Unwrap() error { return e.err }
-
-func markNonRetryableHTTPStatus(status int, err error) error {
-	if status >= 400 && status < 500 && status != http.StatusTooManyRequests {
-		return &nonRetryableHTTPError{err: err}
-	}
-	return err
-}
-
-func isNonRetryableHTTPError(err error) bool {
-	var target *nonRetryableHTTPError
-	return errors.As(err, &target)
-}
-
-// summaryErrorLimit 是单个来源错误在最终提示中的字节上限。
-// 保留首尾（HTTP 状态/关键字常在末尾），避免多层包装把关键原因挤出 clampText(300)。
-const summaryErrorLimit = 80
-
-func compactErrorText(err error, maxBytes int) string {
-	if err == nil {
-		return ""
-	}
-	text := err.Error()
-	if len(text) <= maxBytes {
-		return text
-	}
-	if maxBytes < 8 {
-		return text[:maxBytes]
-	}
-	// 多保留尾部：HTTP 状态码和“已中止更新”等关键结论通常在错误链末尾。
-	// 头部预算留 55/80 左右，确保“格式非法”“不经 gh-proxy”等关键短语不被截掉。
-	head := maxBytes - 23
-	if head < 4 {
-		head = maxBytes / 2
-	}
-	for head > 0 && !utf8.RuneStart(text[head]) {
-		head--
-	}
-	tail := len(text) - (maxBytes - head - 3)
-	for tail < len(text) && !utf8.RuneStart(text[tail]) {
-		tail++
-	}
-	return text[:head] + "…" + text[tail:]
-}
-
-func digestSourceError(source string, attempts int, err error) string {
-	return fmt.Sprintf("%s失败（%d次：%s）", source, attempts, compactErrorText(err, summaryErrorLimit))
-}
-
-// retryDigest 对单个摘要来源做指数退避 + 抖动重试，错误里带上来源、尝试次数与
-// 压缩后的最后错误；确定性 4xx（429 除外）不再重试。
-func retryDigest(ctx context.Context, source string, fn func(context.Context) (string, error)) (string, error) {
-	var lastErr error
-	delay := digestRetryBaseDelay
-	attempts := 0
-	for attempt := 1; attempt <= digestFetchAttempts; attempt++ {
-		if err := ctx.Err(); err != nil {
-			if lastErr != nil {
-				return "", fmt.Errorf("%s；%s", digestSourceError(source, attempts, lastErr), compactErrorText(err, summaryErrorLimit))
-			}
-			return "", fmt.Errorf("%s失败（0次，%s）", source, compactErrorText(err, summaryErrorLimit))
-		}
-		attemptCtx, cancel := context.WithTimeout(ctx, digestRequestTimeout)
-		sum, err := fn(attemptCtx)
-		cancel()
-		if err == nil && sum != "" {
-			return sum, nil
-		}
-		if err == nil {
-			err = errors.New("返回空摘要")
-		}
-		lastErr = err
-		attempts = attempt
-		if isNonRetryableHTTPError(err) || attempt == digestFetchAttempts {
-			break
-		}
-		wait := delay + time.Duration(rand.Int64N(int64(delay)+1))
-		timer := time.NewTimer(wait)
-		select {
-		case <-ctx.Done():
-			timer.Stop()
-			return "", fmt.Errorf("%s；%s", digestSourceError(source, attempts, lastErr), compactErrorText(ctx.Err(), summaryErrorLimit))
-		case <-timer.C:
-		}
-		delay = min(delay*2, digestRetryMaxDelay)
-	}
-	return "", errors.New(digestSourceError(source, attempts, lastErr))
-}
-
-// fetchAssetDigest 获取指定 Release 附件的 SHA-256 摘要。
-//
-// 首选服务端代取（mengnanbot 代访问 GitHub，只尝试一次）；失败后回退到
-// "<资产>.sha256" 与 api.github.com 的 assets[].digest，两个直连来源各自重试、
-// 互为兜底。缓存与直连来源都不拼接 gh-proxy。
-// 依赖这条路径不做交叉校验：上游（nexttrace / miaospeed）未发布 .sha256，
-// 没有可对照的第二个来源。
-// 拿不到有效摘要（上游未发布 .sha256、API 不可达、限流、附件不存在或未提供 digest）
-// 一律返回错误：这些依赖以 root 运行，宁可拒绝安装也不能跳过完整性校验。
-func (dm *DependencyManager) fetchAssetDigest(ctx context.Context, repo, tag, assetName string) (string, error) {
-	var attempted []string
-	if dm.botDigest != nil {
-		sum, err := dm.botDigest.Fetch(ctx, repo, tag, assetName)
-		if err == nil && sum != "" {
-			return sum, nil
-		}
-		if err == nil {
-			err = errors.New("返回空摘要")
-		}
-		attempted = append(attempted, fmt.Sprintf("服务端代取（1次：%s）", compactErrorText(err, summaryErrorLimit)))
-	}
-	sum, err := retryDigest(ctx, "同源 .sha256", func(ctx context.Context) (string, error) {
-		return dm.fetchAssetDigestFile(ctx, repo, tag, assetName)
-	})
-	if err == nil {
-		return sum, nil
-	}
-	attempted = append(attempted, err.Error())
-
-	sum, err = retryDigest(ctx, "GitHub API", func(ctx context.Context) (string, error) {
-		return dm.fetchAssetDigestAPI(ctx, repo, tag, assetName)
-	})
-	if err == nil {
-		return sum, nil
-	}
-	attempted = append(attempted, err.Error())
-	return "", digestAPIHint(fmt.Errorf("无法获取 %s 的 SHA-256 摘要：%s", assetName, strings.Join(attempted, "；")))
-}
-
-// fetchAssetDigestAPI 通过直连 api.github.com 的 Release 附件 digest 字段获取摘要。
-func (dm *DependencyManager) fetchAssetDigestAPI(ctx context.Context, repo, tag, assetName string) (string, error) {
-	targetURL := fmt.Sprintf("%s/repos/%s/releases/tags/%s", strings.TrimRight(dm.apiBaseURL, "/"), repo, url.PathEscape(tag))
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, targetURL, nil)
-	if err != nil {
-		return "", err
-	}
-	req.Header.Set("User-Agent", "mnagent")
-	req.Header.Set("Accept", "application/vnd.github+json")
-	client := dm.httpClient
-	if client == nil {
-		client = http.DefaultClient
-	}
-	resp, err := client.Do(req)
-	if err != nil {
-		return "", err
-	}
-	defer resp.Body.Close()
-	if resp.StatusCode != http.StatusOK {
-		return "", markNonRetryableHTTPStatus(resp.StatusCode, fmt.Errorf("GitHub API 返回 HTTP %s", resp.Status))
-	}
-	var data struct {
-		Assets []struct {
-			Name   string `json:"name"`
-			Digest string `json:"digest"`
-		} `json:"assets"`
-	}
-	if err := json.NewDecoder(io.LimitReader(resp.Body, 4<<20)).Decode(&data); err != nil {
-		return "", fmt.Errorf("解析 Release JSON 失败：%w", err)
-	}
-	for _, a := range data.Assets {
-		if a.Name != assetName {
-			continue
-		}
-		if d, ok := strings.CutPrefix(strings.ToLower(a.Digest), "sha256:"); ok && sha256HexPattern.MatchString(d) {
-			return d, nil
-		}
-		return "", fmt.Errorf("Release %s 的附件 %s 未提供 SHA-256 digest", tag, assetName)
-	}
-	return "", fmt.Errorf("Release %s 中不存在附件 %s", tag, assetName)
-}
-
-// digestAPIHint 给“拿不到摘要”的错误补上可操作说明：依赖校验必须能访问 api.github.com。
-// 上游（nexttrace / miaospeed）目前并不发布 <资产>.sha256，因此 API 是唯一来源。
-func digestAPIHint(err error) error {
-	return fmt.Errorf("%w；获取依赖的上游 SHA-256 需要 api.github.com 连通性（或手动预装依赖）", err)
-}
-
-// fetchAssetDigestFile 直连读取 Release 附件的同源 "<资产>.sha256" 文件。
-// URL 使用 githubBaseURL（默认直连 github.com，绝不拼接 gh-proxy），因此即使
-// 配置了 gh-proxy，校验文件仍来自直连来源，不会被代理同时替换。
-// 失败返回具体原因，由 fetchAssetDigest 决定是否回退到 API。
-func (dm *DependencyManager) fetchAssetDigestFile(ctx context.Context, repo, tag, assetName string) (string, error) {
-	sumURL := fmt.Sprintf("%s/%s/releases/download/%s/%s.sha256", strings.TrimRight(dm.githubBaseURL, "/"), repo, tag, assetName)
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, sumURL, nil)
-	if err != nil {
-		return "", err
-	}
-	req.Header.Set("User-Agent", "mnagent")
-	client := dm.httpClient
-	if client == nil {
-		client = http.DefaultClient
-	}
-	resp, err := client.Do(req)
-	if err != nil {
-		return "", err
-	}
-	defer resp.Body.Close()
-	if resp.StatusCode == http.StatusNotFound {
-		return "", markNonRetryableHTTPStatus(resp.StatusCode, fmt.Errorf("该版本未发布 %s.sha256（HTTP 404）", assetName))
-	}
-	if resp.StatusCode != http.StatusOK {
-		return "", markNonRetryableHTTPStatus(resp.StatusCode, fmt.Errorf("获取 %s.sha256 返回 HTTP %s", assetName, resp.Status))
-	}
-	body, err := io.ReadAll(io.LimitReader(resp.Body, 64<<10))
-	if err != nil {
-		return "", err
-	}
-	fields := strings.Fields(string(body))
-	if len(fields) == 0 {
-		return "", fmt.Errorf("%s.sha256 为空", assetName)
-	}
-	sum := strings.ToLower(fields[0])
-	if !sha256HexPattern.MatchString(sum) {
-		return "", fmt.Errorf("%s.sha256 不是合法的 SHA-256", assetName)
-	}
-	// 带文件名的格式（"<hash>  <file>"）必须指向同一个资产，避免错误配对。
-	if len(fields) > 1 {
-		name := strings.TrimPrefix(fields[1], "*")
-		if filepath.Base(name) != assetName {
-			return "", fmt.Errorf("%s.sha256 指向了其他资产 %s", assetName, filepath.Base(name))
-		}
-	}
-	return sum, nil
-}
-
-// downloadVerified 下载附件到调用方专用的临时路径 tmpPath，并强制校验上游 SHA-256 摘要；
-// 摘要拿不到或不一致即报错。
+// downloadAsset 下载依赖附件到调用方专用的临时路径 tmpPath。
+// 依赖（nexttrace/miaospeed）不做 SHA-256 校验：上游未发布 .sha256，安装安全性
+// 由 HTTPS 传输与下载后的 -V/-version 自检保证。
 //
 // tmpPath 必须只是本次下载的临时文件（调用方应始终 defer os.Remove(tmpPath)）：
-// 函数在写入失败或体积超限时会主动删除半成品，其余路径（含校验失败）由调用方统一清理。
-func (dm *DependencyManager) downloadVerified(ctx context.Context, repo, tag, assetName, downloadURL, tmpPath string, log Logger) (int64, error) {
-	digest, digestErr := dm.fetchAssetDigest(ctx, repo, tag, assetName)
-	if digest == "" {
-		if digestErr == nil {
-			digestErr = errors.New("上游未提供摘要")
-		}
-		return 0, fmt.Errorf("无法获取 %s 的上游 SHA-256 摘要，已中止安装：%w", assetName, digestErr)
-	}
-	if log != nil {
-		log.Debug("已获取依赖的上游 SHA-256 摘要", "asset", assetName, "digest", digest)
-	}
+// 函数在写入失败或体积超限时会主动删除半成品，其余路径由调用方统一清理。
+func (dm *DependencyManager) downloadAsset(ctx context.Context, assetName, downloadURL, tmpPath string) (int64, error) {
 	// 归档/二进制下载用独立客户端：不设整体 Timeout（弱网下大文件可能传很久），
 	// 改为连接/响应头超时 + 空闲读超时，并以 ctx 作为总上限。
 	downloadCtx, cancelDownload := context.WithCancel(ctx)
@@ -1113,14 +845,13 @@ func (dm *DependencyManager) downloadVerified(ctx context.Context, repo, tag, as
 		return 0, fmt.Errorf("创建临时文件失败：%w", err)
 	}
 	limit := dependencyDownloadLimit(assetName)
-	hasher := sha256.New()
 	body := io.Reader(resp.Body)
 	idle := newIdleReadMonitor(dependencyDownloadIdleTimeout, cancelDownload)
 	if idle != nil {
 		defer idle.stop()
 		body = idleMonitoredReader{r: resp.Body, m: idle}
 	}
-	written, err := io.Copy(io.MultiWriter(f, hasher), io.LimitReader(body, limit+1))
+	written, err := io.Copy(f, io.LimitReader(body, limit+1))
 	if closeErr := f.Close(); err == nil {
 		err = closeErr
 	}
@@ -1134,10 +865,6 @@ func (dm *DependencyManager) downloadVerified(ctx context.Context, repo, tag, as
 	if written > limit {
 		_ = os.Remove(tmpPath)
 		return 0, fmt.Errorf("%s 下载体积超过上限（%d MB），已中止安装", assetName, limit>>20)
-	}
-	actual := hex.EncodeToString(hasher.Sum(nil))
-	if subtle.ConstantTimeCompare([]byte(actual), []byte(digest)) != 1 {
-		return 0, fmt.Errorf("%s SHA-256 完整性校验失败：期望 %s，实际 %s (防篡改拦截)", assetName, digest, actual)
 	}
 	return written, nil
 }
@@ -1229,7 +956,7 @@ func (dm *DependencyManager) UpdateNextTrace(ctx context.Context, targetPath, ve
 	tmpFile := filepath.Join(filepath.Dir(destPath), fmt.Sprintf(".nexttrace-update-%d", time.Now().UnixNano()))
 	defer os.Remove(tmpFile)
 
-	written, err := dm.downloadVerified(ctx, "nxtrace/NTrace-core", tag, assetName, downloadURL, tmpFile, log)
+	written, err := dm.downloadAsset(ctx, assetName, downloadURL, tmpFile)
 	if err != nil {
 		return "", err
 	}
@@ -1305,7 +1032,7 @@ func (dm *DependencyManager) UpdateMiaospeed(ctx context.Context, targetPath, ve
 		return "", fmt.Errorf("创建 miaospeed 下载临时文件失败：%w", err)
 	}
 	defer os.Remove(dlPath)
-	if _, err := dm.downloadVerified(ctx, "AirportR/miaospeed", tag, archiveName, downloadURL, dlPath, log); err != nil {
+	if _, err := dm.downloadAsset(ctx, archiveName, downloadURL, dlPath); err != nil {
 		return "", err
 	}
 
@@ -1345,7 +1072,7 @@ func (dm *DependencyManager) UpdateMiaospeed(ctx context.Context, targetPath, ve
 }
 
 // createSecureTempPath 在目标同目录用 os.CreateTemp 生成随机临时路径并立即释放。
-// 调用方随后用 O_EXCL 创建（downloadVerified/解压函数），与直接使用可预测文件名相比
+// 调用方随后用 O_EXCL 创建（downloadAsset/解压函数），与直接使用可预测文件名相比
 // 不会被预先放置的软链接接管家；立即删除是为了让 O_EXCL 能重新创建。
 func createSecureTempPath(dir, pattern string) (string, error) {
 	f, err := os.CreateTemp(dir, pattern)
@@ -1386,7 +1113,7 @@ func ExtractZipFile(zipPath, destFile string) error {
 				return err
 			}
 			// O_EXCL：目标路径由调用方用 os.CreateTemp 生成并保证不存在，
-			// 与 downloadVerified 一致，拒绝被预先放置的软链接/旧文件。
+			// 与 downloadAsset 一致，拒绝被预先放置的软链接/旧文件。
 			out, err := os.OpenFile(destFile, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0755)
 			if err != nil {
 				_ = rc.Close()
@@ -1445,7 +1172,7 @@ func ExtractTarGzFile(r io.Reader, destFile string) error {
 		if strings.HasSuffix(lower, ".exe") || strings.Contains(lower, "miaospeed") ||
 			hdr.Name == "runner/runner" { // 4.7.11 起部分 miaospeed 归档把二进制放在 runner/runner
 			// O_EXCL：目标路径由调用方用 os.CreateTemp 生成并保证不存在，
-			// 与 downloadVerified 一致，拒绝被预先放置的软链接/旧文件。
+			// 与 downloadAsset 一致，拒绝被预先放置的软链接/旧文件。
 			f, err := os.OpenFile(destFile, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0755)
 			if err != nil {
 				return err
@@ -1481,7 +1208,7 @@ func (dm *DependencyManager) UpdateDependency(ctx context.Context, name, targetP
 }
 
 // UpdateDependencyWithin 在指定预算内更新指定依赖（budget <= 0 表示使用默认宽松预算）。
-// 预算覆盖整个流程（代取/直连摘要、下载、解压、自检）。
+// 预算覆盖整个流程（下载、解压、自检）。
 //
 // 区分两种失败：
 //   - 调用方 ctx 取消/超时：保留 context 错误，不写失败冷却；
@@ -1518,7 +1245,7 @@ func (dm *DependencyManager) updateDependency(ctx context.Context, name, targetP
 		return "", fmt.Errorf("未知的依赖：%q", name)
 	}
 	if err != nil && ctx.Err() != nil && !isContextError(err) {
-		// 底层重试摘要可能把 deadline 包成普通文本，这里补回错误链，
+		// 底层可能把 deadline 包成普通文本，这里补回错误链，
 		// 让调用方能正确区分调用方 ctx 取消与真实失败。
 		err = fmt.Errorf("%w：%v", ctx.Err(), err)
 	}

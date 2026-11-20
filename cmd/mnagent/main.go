@@ -104,7 +104,6 @@ func runWithContext(ctx context.Context, args []string) error {
 
 	if cfg.DiagJob != "" {
 		rnr := runner.NewRunnerFull(cfg.Binary, cfg.MiaospeedBinary, cfg.GHProxy, cfg.AllowPrivateProbes, log)
-		rnr.SetBotDigest(runner.NewBotDigestClient(cfg))
 		res := rnr.Run(ctx, model.Job{
 			ID:        "diag",
 			Kind:      "miaospeed",
@@ -150,7 +149,6 @@ func runWithContext(ctx context.Context, args []string) error {
 	cli := client.New(cfg)
 	trk := tracker.New()
 	rnr := runner.NewRunnerFull(cfg.Binary, cfg.MiaospeedBinary, cfg.GHProxy, cfg.AllowPrivateProbes, log)
-	rnr.SetBotDigest(runner.NewBotDigestClient(cfg))
 	rnr.SetProgressReporter(func(p model.Progress) {
 		pCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
 		defer cancel()

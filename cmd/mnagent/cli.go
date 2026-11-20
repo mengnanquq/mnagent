@@ -252,7 +252,6 @@ func buildLocalProbeJob(cfg *config.Config) (model.Job, error) {
 // handleProbeCLI 本地执行探针任务，直接在终端打印结构化诊断结果。
 func handleProbeCLI(ctx context.Context, cfg *config.Config, log *slog.Logger) error {
 	rnr := runner.NewRunnerFull(cfg.Binary, cfg.MiaospeedBinary, cfg.GHProxy, cfg.AllowPrivateProbes, log)
-	rnr.SetBotDigest(runner.NewBotDigestClient(cfg))
 	job, err := buildLocalProbeJob(cfg)
 	if err != nil {
 		return err

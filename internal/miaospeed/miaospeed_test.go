@@ -9,7 +9,6 @@ import (
 	"bytes"
 	"compress/gzip"
 	"context"
-	"crypto/sha256"
 	"encoding/base64"
 	"encoding/json"
 	"errors"
@@ -453,14 +452,10 @@ func TestBuildMiaospeedTestPlan(t *testing.T) {
 	}
 }
 
-// testMiaospeedBotToken 是服务端代取客户端所需的固定令牌。
-type testMiaospeedBotToken struct{}
-
-func (testMiaospeedBotToken) Get() (string, error) { return "tok", nil }
-
-// TestAutoInstallMiaospeedUsesBotDigest 验证运行时自动安装 miaospeed 时，
-// 会把服务端代取客户端注入依赖管理器，优先使用代取的摘要。
-func TestAutoInstallMiaospeedUsesBotDigest(t *testing.T) {
+// TestAutoInstallMiaospeedSkipsDigest 验证运行时自动安装 miaospeed 时不再获取
+// 任何 SHA-256 摘要（服务端代取、.sha256、API digest 都不会被请求）。
+// 安装成功本身依赖下载后的 -version 自检通过。
+func TestAutoInstallMiaospeedSkipsDigest(t *testing.T) {
 	var buf bytes.Buffer
 	gw := gzip.NewWriter(&buf)
 	tw := tar.NewWriter(gw)
@@ -480,22 +475,14 @@ func TestAutoInstallMiaospeedUsesBotDigest(t *testing.T) {
 	tw.Close()
 	gw.Close()
 	tarBytes := buf.Bytes()
-	tarDigest := sha256.Sum256(tarBytes)
 
-	var botHits, sumHits, apiHits atomic.Int32
+	var digestHits atomic.Int32
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch {
-		case r.URL.Path == "/agent/release-digest":
-			botHits.Add(1)
-			if got := r.Header.Get("Authorization"); got != "Bearer tok" {
-				t.Errorf("代取请求 Authorization = %q", got)
-			}
-			fmt.Fprintf(w, `{"ok":true,"sha256":"%x"}`, tarDigest)
-		case strings.HasSuffix(r.URL.Path, ".sha256"):
-			sumHits.Add(1)
-			http.Error(w, "should not be called", http.StatusInternalServerError)
-		case strings.Contains(r.URL.Path, "/releases/tags/"):
-			apiHits.Add(1)
+		case r.URL.Path == "/agent/release-digest",
+			strings.HasSuffix(r.URL.Path, ".sha256"),
+			strings.Contains(r.URL.Path, "/releases/tags/"):
+			digestHits.Add(1)
 			http.Error(w, "should not be called", http.StatusInternalServerError)
 		case strings.Contains(r.URL.Path, "releases/latest"):
 			_, _ = w.Write([]byte(`{"tag_name":"4.7.7"}`))
@@ -516,25 +503,15 @@ func TestAutoInstallMiaospeedUsesBotDigest(t *testing.T) {
 	defer func() { newDependencyManager = oldNew }()
 
 	dest := filepath.Join(t.TempDir(), "bin", "miaospeed")
-	path, err := autoInstallMiaospeed(context.Background(), dest, srv.URL, &updater.BotDigestClient{
-		BaseURL: srv.URL + "/agent",
-		Token:   testMiaospeedBotToken{},
-		Client:  srv.Client(),
-	}, nil)
+	path, err := autoInstallMiaospeed(context.Background(), dest, srv.URL, nil)
 	if err != nil {
 		t.Fatalf("autoInstallMiaospeed 失败: %v", err)
 	}
 	if path != dest {
 		t.Fatalf("安装路径异常: got=%q, want=%q", path, dest)
 	}
-	if got := botHits.Load(); got != 1 {
-		t.Fatalf("自动安装应走服务端代取且只请求 1 次，实际 %d 次", got)
-	}
-	if got := sumHits.Load(); got != 0 {
-		t.Fatalf("代取命中时不应回退直连 .sha256，实际 %d 次", got)
-	}
-	if got := apiHits.Load(); got != 0 {
-		t.Fatalf("代取命中时不应回退 GitHub API，实际 %d 次", got)
+	if got := digestHits.Load(); got != 0 {
+		t.Fatalf("依赖下载不应请求任何 .sha256 或 API digest，实际 %d 次", got)
 	}
 	if fi, err := os.Stat(path); err != nil || (fi.Mode()&0111) == 0 {
 		t.Fatalf("安装产物不存在或不可执行: %v", err)
@@ -599,14 +576,8 @@ func TestAutoInstallMiaospeedWithProxy(t *testing.T) {
 
 	// 启动模拟代理服务器
 	var requestedURLs []string
-	tarDigest := sha256.Sum256(tarBytes)
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		requestedURLs = append(requestedURLs, r.URL.String())
-		if strings.Contains(r.URL.Path, "/releases/tags/") {
-			w.Header().Set("Content-Type", "application/json")
-			fmt.Fprintf(w, `{"assets":[{"name":"miaospeed-linux-amd64-4.7.7.tar.gz","digest":"sha256:%x"}]}`, tarDigest)
-			return
-		}
 		if strings.Contains(r.URL.Path, "releases/latest") {
 			w.Header().Set("Content-Type", "application/json")
 			w.Write([]byte(`{"tag_name":"4.7.7"}`))
@@ -630,7 +601,7 @@ func TestAutoInstallMiaospeedWithProxy(t *testing.T) {
 	defer func() { newDependencyManager = oldNew }()
 
 	dest := filepath.Join(t.TempDir(), "bin", "miaospeed")
-	path, err := autoInstallMiaospeed(context.Background(), dest, srv.URL, nil, nil)
+	path, err := autoInstallMiaospeed(context.Background(), dest, srv.URL, nil)
 	if err != nil {
 		t.Fatalf("autoInstallMiaospeed 失败: %v", err)
 	}
@@ -2762,7 +2733,7 @@ func TestRunJobWithOptionsAutoInstallGated(t *testing.T) {
 
 	job := model.Job{ID: "job-auto-install", Kind: "miaospeed", Target: "trojan://pass@example.com:443#n"}
 	binary := filepath.Join(t.TempDir(), "miaospeed")
-	_, _, err := RunJobWithOptions(context.Background(), binary, "", job, testLogger{t}, nil, RunOptions{})
+	_, _, err := RunJobWithOptions(context.Background(), binary, "http://127.0.0.1:1", job, testLogger{t}, nil, RunOptions{})
 	if err == nil || !strings.Contains(err.Error(), "自动安装 miaospeed 失败") {
 		t.Fatalf("缺失 miaospeed 时应自动安装并返回明确错误，实际: %v", err)
 	}
@@ -2787,7 +2758,7 @@ func TestRunJobWithOptionsAutoInstallEnabled(t *testing.T) {
 
 	job := model.Job{ID: "job-auto-install-2", Kind: "miaospeed", Target: "trojan://pass@example.com:443#n"}
 	binary := filepath.Join(t.TempDir(), "miaospeed")
-	_, _, err := RunJobWithOptions(context.Background(), binary, "", job, testLogger{t}, nil, RunOptions{})
+	_, _, err := RunJobWithOptions(context.Background(), binary, "http://127.0.0.1:1", job, testLogger{t}, nil, RunOptions{})
 	if err == nil || !strings.Contains(err.Error(), "自动安装 miaospeed 失败") {
 		t.Fatalf("自动安装失败应返回明确错误，实际: %v", err)
 	}

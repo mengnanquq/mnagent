@@ -9,7 +9,6 @@ import (
 	"time"
 
 	"github.com/mengnanquq/mnagent/internal/dep"
-	"github.com/mengnanquq/mnagent/internal/updater"
 )
 
 // newDependencyManager 可在测试中替换，避免访问真实 GitHub。
@@ -80,12 +79,10 @@ func getMiaospeedVersion(ctx context.Context, binPath string, serverOutput strin
 
 // autoInstallMiaospeed 在运行时自动下载并解压 AirportR/miaospeed Release，严格继承使用 ghProxy。
 // EnsureMiaospeed 会在多个任务并发触发时只下载一次，并在失败后短暂冷却。
-// botDigest 用于服务端代取校验值；nil 表示只走直连来源。
-func autoInstallMiaospeed(ctx context.Context, targetPath, ghProxy string, botDigest *updater.BotDigestClient, log Logger) (string, error) {
+func autoInstallMiaospeed(ctx context.Context, targetPath, ghProxy string, log Logger) (string, error) {
 	dm := newDependencyManager(ghProxy)
 	if dm == nil {
 		return "", errors.New("依赖管理器初始化失败")
 	}
-	dm.SetBotDigest(botDigest)
 	return dm.EnsureMiaospeed(ctx, targetPath, "latest", log)
 }

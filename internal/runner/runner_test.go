@@ -12,7 +12,6 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
-	"runtime"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -1044,19 +1043,11 @@ func TestRunnerAutoInstallsMissingNexttrace(t *testing.T) {
 		body += "# padding\n"
 	}
 	content := []byte(body)
-	digest := fmt.Sprintf("%x", sha256.Sum256(content))
-	asset, err := dep.NexttraceAsset(runtime.GOOS, runtime.GOARCH)
-	if err != nil {
-		t.Fatal(err)
-	}
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch {
 		case strings.Contains(r.URL.Path, "/releases/latest"):
 			w.Header().Set("Content-Type", "application/json")
 			_, _ = w.Write([]byte(`{"tag_name":"v1.7.4"}`))
-		case strings.Contains(r.URL.Path, "/releases/tags/v1.7.4"):
-			w.Header().Set("Content-Type", "application/json")
-			fmt.Fprintf(w, `{"assets":[{"name":%q,"digest":"sha256:%s"}]}`, asset, digest)
 		case strings.Contains(r.URL.Path, "/releases/download/"):
 			_, _ = w.Write(content)
 		default:
@@ -1081,29 +1072,22 @@ func TestRunnerAutoInstallsMissingNexttrace(t *testing.T) {
 	}
 }
 
-// TestRunnerAutoInstallNexttraceUsesBotDigest 验证 nexttrace 缺失触发运行时安装时，
-// Runner 会把服务端代取客户端注入依赖管理器，优先使用代取的摘要。
-func TestRunnerAutoInstallNexttraceUsesBotDigest(t *testing.T) {
+// TestRunnerAutoInstallNexttraceSkipsDigest 验证 nexttrace 缺失触发运行时安装时，
+// 不再请求任何 SHA-256 摘要（服务端代取、.sha256、API digest），
+// 仍会下载、执行 -V 自检并完成安装。
+func TestRunnerAutoInstallNexttraceSkipsDigest(t *testing.T) {
 	body := "#!/bin/sh\ncase \"$1\" in\n  -V|--version) echo \"NextTrace  v1.7.4\" ;;\n  *) echo \"trace ok\" ;;\nesac\n"
 	for len(body) < 150*1024 {
 		body += "# padding\n"
 	}
 	content := []byte(body)
-	digest := fmt.Sprintf("%x", sha256.Sum256(content))
-	var botHits, shaHits, apiHits atomic.Int32
+	var digestHits atomic.Int32
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch {
-		case r.URL.Path == "/agent/release-digest":
-			botHits.Add(1)
-			if got := r.Header.Get("Authorization"); got != "Bearer tok" {
-				t.Errorf("代取请求 Authorization = %q", got)
-			}
-			fmt.Fprintf(w, `{"ok":true,"sha256":%q}`, digest)
-		case strings.HasSuffix(r.URL.Path, ".sha256"):
-			shaHits.Add(1)
-			http.Error(w, "should not be called", http.StatusInternalServerError)
-		case strings.Contains(r.URL.Path, "/releases/tags/"):
-			apiHits.Add(1)
+		case r.URL.Path == "/agent/release-digest",
+			strings.HasSuffix(r.URL.Path, ".sha256"),
+			strings.Contains(r.URL.Path, "/releases/tags/"):
+			digestHits.Add(1)
 			http.Error(w, "should not be called", http.StatusInternalServerError)
 		case strings.Contains(r.URL.Path, "/releases/latest"):
 			_, _ = w.Write([]byte(`{"tag_name":"v1.7.4"}`))
@@ -1122,23 +1106,12 @@ func TestRunnerAutoInstallNexttraceUsesBotDigest(t *testing.T) {
 		dm.SetGitHubEndpoints(srv.URL, srv.URL)
 		return dm
 	}
-	r.SetBotDigest(&updater.BotDigestClient{
-		BaseURL: srv.URL + "/agent",
-		Token:   &config.TokenSource{Value: "tok"},
-		Client:  srv.Client(),
-	})
 	res := r.Run(context.Background(), model.Job{ID: "auto-trace-bot", Kind: "trace", Target: "1.1.1.1", Hops: 3, TimeoutMS: 10000})
 	if res.ExitCode != 0 || !strings.Contains(res.Output, "trace ok") {
 		t.Fatalf("缺失 nexttrace 时应自动安装并执行成功：%+v", res)
 	}
-	if got := botHits.Load(); got != 1 {
-		t.Fatalf("运行时安装应走服务端代取且只请求 1 次，实际 %d 次", got)
-	}
-	if got := shaHits.Load(); got != 0 {
-		t.Fatalf("代取命中时不应回退直连 .sha256，实际 %d 次", got)
-	}
-	if got := apiHits.Load(); got != 0 {
-		t.Fatalf("代取命中时不应回退 GitHub API，实际 %d 次", got)
+	if got := digestHits.Load(); got != 0 {
+		t.Fatalf("依赖下载不应请求任何 .sha256 或 API digest，实际 %d 次", got)
 	}
 	if _, err := os.Stat(target); err != nil {
 		t.Fatalf("nexttrace 应安装到配置路径 %s: %v", target, err)
@@ -1225,11 +1198,6 @@ func TestAgentCheckAndUpdateDependenciesInstallsMissing(t *testing.T) {
 		body += "# padding\n"
 	}
 	content := []byte(body)
-	digest := fmt.Sprintf("%x", sha256.Sum256(content))
-	asset, err := dep.NexttraceAsset(runtime.GOOS, runtime.GOARCH)
-	if err != nil {
-		t.Fatal(err)
-	}
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch {
 		case strings.Contains(r.URL.Path, "/nxtrace/NTrace-core/releases/latest"):
@@ -1238,9 +1206,6 @@ func TestAgentCheckAndUpdateDependenciesInstallsMissing(t *testing.T) {
 		case strings.Contains(r.URL.Path, "/AirportR/miaospeed/releases/latest"):
 			w.Header().Set("Content-Type", "application/json")
 			_, _ = w.Write([]byte(`{"tag_name":"4.7.7"}`))
-		case strings.Contains(r.URL.Path, "/nxtrace/NTrace-core/releases/tags/v1.7.4"):
-			w.Header().Set("Content-Type", "application/json")
-			fmt.Fprintf(w, `{"assets":[{"name":%q,"digest":"sha256:%s"}]}`, asset, digest)
 		case strings.Contains(r.URL.Path, "/releases/download/"):
 			_, _ = w.Write(content)
 		default:

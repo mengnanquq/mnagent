@@ -6,8 +6,6 @@ import (
 	"bytes"
 	"compress/gzip"
 	"context"
-	"crypto/sha256"
-	"encoding/hex"
 	"errors"
 	"fmt"
 	"net/http"
@@ -195,11 +193,12 @@ func TestUpdateNextTrace(t *testing.T) {
 	targetPath := filepath.Join(tmpDir, "bin", "nexttrace")
 
 	content := bytes.Repeat([]byte("F"), 150*1024) // 150KB
-	sum := sha256.Sum256(content)
-	digest := hex.EncodeToString(sum[:])
+	var digestHits, selfChecks atomic.Int32
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if strings.Contains(r.URL.Path, "/repos/nxtrace/NTrace-core/releases/tags/v1.7.4") {
-			fmt.Fprintf(w, `{"assets":[{"name":"nexttrace_linux_amd64","digest":"sha256:%s"}]}`, digest)
+		// 依赖不再获取任何摘要：.sha256 与 releases/tags API 都不应被请求。
+		if strings.HasSuffix(r.URL.Path, ".sha256") || strings.Contains(r.URL.Path, "/releases/tags/") {
+			digestHits.Add(1)
+			http.Error(w, "should not be called", http.StatusInternalServerError)
 			return
 		}
 		if strings.Contains(r.URL.Path, "releases/download") {
@@ -216,6 +215,11 @@ func TestUpdateNextTrace(t *testing.T) {
 	dm.goos = "linux"
 	dm.goarch = "amd64"
 	mockDependencyVersion(dm, "v1.7.4", "4.7.7")
+	selfCheck := dm.cmdRunner
+	dm.cmdRunner = func(ctx context.Context, name string, args ...string) ([]byte, error) {
+		selfChecks.Add(1)
+		return selfCheck(ctx, name, args...)
+	}
 
 	dest, err := dm.UpdateNextTrace(context.Background(), targetPath, "v1.7.4", nil)
 	if err != nil {
@@ -234,6 +238,12 @@ func TestUpdateNextTrace(t *testing.T) {
 	}
 	if fi.Size() != int64(len(content)) {
 		t.Fatalf("文件大小不符合预期: got=%d want=%d", fi.Size(), len(content))
+	}
+	if got := digestHits.Load(); got != 0 {
+		t.Fatalf("依赖下载不应请求任何 .sha256 或 API digest，实际 %d 次", got)
+	}
+	if got := selfChecks.Load(); got == 0 {
+		t.Fatal("依赖下载后仍应执行 -V 自检")
 	}
 }
 
@@ -257,11 +267,12 @@ func TestUpdateMiaospeed(t *testing.T) {
 	_ = tw.Close()
 	_ = gw.Close()
 
-	miaoSum := sha256.Sum256(buf.Bytes())
-	miaoDigest := hex.EncodeToString(miaoSum[:])
+	var digestHits, selfChecks atomic.Int32
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if strings.Contains(r.URL.Path, "/repos/AirportR/miaospeed/releases/tags/4.7.7") {
-			fmt.Fprintf(w, `{"assets":[{"name":"miaospeed-linux-amd64-4.7.7.tar.gz","digest":"sha256:%s"}]}`, miaoDigest)
+		// 依赖不再获取任何摘要：.sha256 与 releases/tags API 都不应被请求。
+		if strings.HasSuffix(r.URL.Path, ".sha256") || strings.Contains(r.URL.Path, "/releases/tags/") {
+			digestHits.Add(1)
+			http.Error(w, "should not be called", http.StatusInternalServerError)
 			return
 		}
 		if strings.Contains(r.URL.Path, ".tar.gz") {
@@ -278,6 +289,11 @@ func TestUpdateMiaospeed(t *testing.T) {
 	dm.goos = "linux"
 	dm.goarch = "amd64"
 	mockDependencyVersion(dm, "4.7.7", "4.7.7")
+	selfCheck := dm.cmdRunner
+	dm.cmdRunner = func(ctx context.Context, name string, args ...string) ([]byte, error) {
+		selfChecks.Add(1)
+		return selfCheck(ctx, name, args...)
+	}
 
 	dest, err := dm.UpdateMiaospeed(context.Background(), targetPath, "4.7.7", nil)
 	if err != nil {
@@ -294,6 +310,12 @@ func TestUpdateMiaospeed(t *testing.T) {
 	if (fi.Mode() & 0111) == 0 {
 		t.Fatalf("目标文件未设置执行权限: %v", fi.Mode())
 	}
+	if got := digestHits.Load(); got != 0 {
+		t.Fatalf("依赖下载不应请求任何 .sha256 或 API digest，实际 %d 次", got)
+	}
+	if got := selfChecks.Load(); got == 0 {
+		t.Fatal("依赖下载后仍应执行 -version 自检")
+	}
 }
 
 // TestUpdateMiaospeedRejectsOversizedArchive 验证归档下载超过体积上限时中止安装，
@@ -307,13 +329,7 @@ func TestUpdateMiaospeedRejectsOversizedArchive(t *testing.T) {
 	}()
 
 	body := bytes.Repeat([]byte("A"), int(maxDependencyArchiveBytes)+1)
-	sum := sha256.Sum256(body)
-	digest := hex.EncodeToString(sum[:])
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if strings.Contains(r.URL.Path, "/repos/AirportR/miaospeed/releases/tags/4.7.7") {
-			fmt.Fprintf(w, `{"assets":[{"name":"miaospeed-linux-amd64-4.7.7.tar.gz","digest":"sha256:%s"}]}`, digest)
-			return
-		}
 		if strings.Contains(r.URL.Path, ".tar.gz") {
 			_, _ = w.Write(body)
 			return
@@ -338,21 +354,15 @@ func TestUpdateMiaospeedRejectsOversizedArchive(t *testing.T) {
 	}
 }
 
-// TestDownloadVerifiedRemovesTemporaryFileOnFailure 验证下载超限失败时函数会清理
+// TestDownloadAssetRemovesTemporaryFileOnFailure 验证下载超限失败时函数会清理
 // 传入的临时路径；调用方的 defer 仍可无副作用地再次 Remove。
-func TestDownloadVerifiedRemovesTemporaryFileOnFailure(t *testing.T) {
+func TestDownloadAssetRemovesTemporaryFileOnFailure(t *testing.T) {
 	old := maxDependencyBinaryBytes
 	maxDependencyBinaryBytes = 16
 	defer func() { maxDependencyBinaryBytes = old }()
 
 	body := bytes.Repeat([]byte("A"), int(maxDependencyBinaryBytes)+1)
-	sum := sha256.Sum256(body)
-	digest := hex.EncodeToString(sum[:])
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if strings.Contains(r.URL.Path, "/releases/tags/v1.0.0") {
-			fmt.Fprintf(w, `{"assets":[{"name":"asset","digest":"sha256:%s"}]}`, digest)
-			return
-		}
 		if strings.HasSuffix(r.URL.Path, "/asset") {
 			_, _ = w.Write(body)
 			return
@@ -364,7 +374,7 @@ func TestDownloadVerifiedRemovesTemporaryFileOnFailure(t *testing.T) {
 	dm := newDependencyManager(srv.URL)
 	dm.apiBaseURL = srv.URL
 	tmpPath := filepath.Join(t.TempDir(), ".asset-download-tmp")
-	if _, err := dm.downloadVerified(context.Background(), "owner/repo", "v1.0.0", "asset", srv.URL+"/asset", tmpPath, nil); err == nil || !strings.Contains(err.Error(), "上限") {
+	if _, err := dm.downloadAsset(context.Background(), "asset", srv.URL+"/asset", tmpPath); err == nil || !strings.Contains(err.Error(), "上限") {
 		t.Fatalf("下载超限应报错，实际: %v", err)
 	}
 	if _, err := os.Stat(tmpPath); !os.IsNotExist(err) {
@@ -410,13 +420,7 @@ func TestUpdateMiaospeedWindowsZip(t *testing.T) {
 	_, _ = binWriter.Write(miaoContent)
 	_ = zw.Close()
 
-	zipSum := sha256.Sum256(buf.Bytes())
-	zipDigest := hex.EncodeToString(zipSum[:])
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if strings.Contains(r.URL.Path, "/repos/AirportR/miaospeed/releases/tags/4.7.7") {
-			fmt.Fprintf(w, `{"assets":[{"name":"miaospeed-windows-amd64-4.7.7.zip","digest":"sha256:%s"}]}`, zipDigest)
-			return
-		}
 		if strings.Contains(r.URL.Path, ".zip") {
 			w.Header().Set("Content-Type", "application/zip")
 			w.Write(buf.Bytes())
@@ -571,129 +575,13 @@ func TestUpdateDependencyDispatch(t *testing.T) {
 	}
 }
 
-// TestUpdateNextTraceVerifiesDigest 验证：上游 API 给出的 SHA-256 摘要与下载内容不一致时拒绝安装，一致时正常安装。
-func TestUpdateNextTraceVerifiesDigest(t *testing.T) {
-	content := bytes.Repeat([]byte("N"), 150*1024)
-	sum := sha256.Sum256(content)
-	digest := hex.EncodeToString(sum[:])
-	var tampered atomic.Bool
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		switch {
-		case strings.Contains(r.URL.Path, "/repos/nxtrace/NTrace-core/releases/tags/v1.7.4"):
-			d := digest
-			if tampered.Load() {
-				d = strings.Repeat("0", 64)
-			}
-			fmt.Fprintf(w, `{"assets":[{"name":"nexttrace_linux_amd64","digest":"sha256:%s"}]}`, d)
-		case strings.Contains(r.URL.Path, "releases/download"):
-			_, _ = w.Write(content)
-		default:
-			http.NotFound(w, r)
-		}
-	}))
-	defer srv.Close()
-
-	dm := newDependencyManager(srv.URL)
-	dm.apiBaseURL = srv.URL
-	dm.goos = "linux"
-	dm.goarch = "amd64"
-	mockDependencyVersion(dm, "v1.7.4", "4.7.7")
-	target := filepath.Join(t.TempDir(), "nexttrace")
-
-	tampered.Store(true)
-	if _, err := dm.UpdateNextTrace(context.Background(), target, "v1.7.4", nil); err == nil || !strings.Contains(err.Error(), "完整性校验失败") {
-		t.Fatalf("摘要不一致应拒绝安装，实际 err=%v", err)
-	}
-	if _, err := os.Stat(target); err == nil {
-		t.Fatal("校验失败时不应写入目标文件")
-	}
-	tampered.Store(false)
-	if _, err := dm.UpdateNextTrace(context.Background(), target, "v1.7.4", nil); err != nil {
-		t.Fatalf("摘要一致应安装成功: %v", err)
-	}
-	if _, err := dm.UpdateNextTrace(context.Background(), target, "v1.7.4/../../x", nil); err == nil {
-		t.Fatal("非法版本号应被拒绝")
-	}
-}
-
-// TestUpdateNextTraceDigestMissingAborts 验证摘要缺失时 fail-closed：
-// API 404、附件未带 digest、API 完全不可达都必须中止安装，且不得覆盖已有二进制。
-func TestUpdateNextTraceDigestMissingAborts(t *testing.T) {
-	content := bytes.Repeat([]byte("N"), 150*1024)
-	cases := []struct {
-		name    string
-		handler http.HandlerFunc
-	}{
-		{"API 404", func(w http.ResponseWriter, r *http.Request) { http.NotFound(w, r) }},
-		{"附件未提供 digest", func(w http.ResponseWriter, r *http.Request) {
-			if strings.Contains(r.URL.Path, "/releases/tags/") {
-				_, _ = w.Write([]byte(`{"assets":[{"name":"nexttrace_linux_amd64","digest":null}]}`))
-				return
-			}
-			_, _ = w.Write(content)
-		}},
-		{"digest 格式非法", func(w http.ResponseWriter, r *http.Request) {
-			if strings.Contains(r.URL.Path, "/releases/tags/") {
-				_, _ = w.Write([]byte(`{"assets":[{"name":"nexttrace_linux_amd64","digest":"sha256:deadbeef"}]}`))
-				return
-			}
-			_, _ = w.Write(content)
-		}},
-	}
-	for _, tc := range cases {
-		t.Run(tc.name, func(t *testing.T) {
-			srv := httptest.NewServer(tc.handler)
-			defer srv.Close()
-
-			dm := newDependencyManager(srv.URL)
-			dm.apiBaseURL = srv.URL
-			dm.githubBaseURL = srv.URL
-			dm.goos = "linux"
-			dm.goarch = "amd64"
-			target := filepath.Join(t.TempDir(), "nexttrace")
-			if err := os.WriteFile(target, []byte("old-binary"), 0755); err != nil {
-				t.Fatal(err)
-			}
-
-			_, err := dm.UpdateNextTrace(context.Background(), target, "v1.7.4", nil)
-			if err == nil || !strings.Contains(err.Error(), "SHA-256 摘要") {
-				t.Fatalf("摘要缺失应中止安装，实际 err=%v", err)
-			}
-			got, err := os.ReadFile(target)
-			if err != nil || string(got) != "old-binary" {
-				t.Fatalf("摘要缺失时不得覆盖已有二进制: content=%q err=%v", string(got), err)
-			}
-		})
-	}
-
-	// API 完全不可达（连接被拒绝）同样必须 fail-closed。
-	dead := httptest.NewServer(http.NotFoundHandler())
-	deadURL := dead.URL
-	dead.Close()
-	dm := newDependencyManager("")
-	dm.apiBaseURL = deadURL
-	dm.githubBaseURL = deadURL
-	dm.goos = "linux"
-	dm.goarch = "amd64"
-	target := filepath.Join(t.TempDir(), "nexttrace")
-	if _, err := dm.UpdateNextTrace(context.Background(), target, "v1.7.4", nil); err == nil {
-		t.Fatal("API 不可达时应中止安装")
-	}
-	if _, err := os.Stat(target); err == nil {
-		t.Fatal("API 不可达时不应写入目标文件")
-	}
-}
-
 // TestUpdateNextTraceLatestFailureKeepsInstalled 验证已安装时查询最新版本失败不会回落到写死的旧版本。
 func TestUpdateNextTraceLatestFailureKeepsInstalled(t *testing.T) {
 	content := bytes.Repeat([]byte("F"), 150*1024)
-	sum := sha256.Sum256(content)
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch {
 		case strings.Contains(r.URL.Path, "/releases/latest"):
 			http.NotFound(w, r)
-		case strings.Contains(r.URL.Path, "/releases/tags/v1.7.3"):
-			fmt.Fprintf(w, `{"assets":[{"name":"nexttrace_linux_amd64","digest":"sha256:%x"}]}`, sum)
 		case strings.Contains(r.URL.Path, "releases/download"):
 			_, _ = w.Write(content)
 		default:
@@ -723,16 +611,15 @@ func TestUpdateNextTraceLatestFailureKeepsInstalled(t *testing.T) {
 // TestUpdateNextTraceLatestFailureFallsBackWhenMissing 验证未安装时才允许安装兜底版本。
 func TestUpdateNextTraceLatestFailureFallsBackWhenMissing(t *testing.T) {
 	content := bytes.Repeat([]byte("F"), 150*1024)
-	sum := sha256.Sum256(content)
 	var gotTag atomic.Value
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch {
 		case strings.Contains(r.URL.Path, "/releases/latest"):
 			http.NotFound(w, r)
-		case strings.Contains(r.URL.Path, "/releases/tags/"):
-			gotTag.Store(strings.TrimPrefix(r.URL.Path, "/repos/nxtrace/NTrace-core/releases/tags/"))
-			fmt.Fprintf(w, `{"assets":[{"name":"nexttrace_linux_amd64","digest":"sha256:%x"}]}`, sum)
 		case strings.Contains(r.URL.Path, "releases/download"):
+			if i := strings.Index(r.URL.Path, "/releases/download/"); i >= 0 {
+				gotTag.Store(strings.SplitN(r.URL.Path[i+len("/releases/download/"):], "/", 2)[0])
+			}
 			_, _ = w.Write(content)
 		default:
 			http.NotFound(w, r)
@@ -858,12 +745,7 @@ func TestSelfCheckDependencyTimeout(t *testing.T) {
 // 保留已有二进制，避免架构不匹配或损坏的依赖落盘。
 func TestUpdateNextTraceSelfCheckMismatchAborts(t *testing.T) {
 	content := bytes.Repeat([]byte("F"), 150*1024)
-	sum := sha256.Sum256(content)
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if strings.Contains(r.URL.Path, "/releases/tags/v1.7.4") {
-			fmt.Fprintf(w, `{"assets":[{"name":"nexttrace_linux_amd64","digest":"sha256:%x"}]}`, sum)
-			return
-		}
 		_, _ = w.Write(content)
 	}))
 	defer srv.Close()
@@ -1043,184 +925,18 @@ func TestExtractZipSizeLimit(t *testing.T) {
 	}
 }
 
-// TestFetchAssetDigestPrefersUpstreamSha256 验证优先使用同源 .sha256，
-// 且配置 gh-proxy 时不信任该文件（代理可同时替换二进制与校验文件），必须回退到 API。
-func TestFetchAssetDigestPrefersUpstreamSha256(t *testing.T) {
-	sum := strings.Repeat("a", 64)
-	apiSum := strings.Repeat("b", 64)
-	var apiHits, sumHits atomic.Int32
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		switch {
-		case strings.HasSuffix(r.URL.Path, ".sha256"):
-			sumHits.Add(1)
-			fmt.Fprintf(w, "%s  nexttrace_linux_amd64\n", sum)
-		case strings.Contains(r.URL.Path, "/releases/tags/"):
-			apiHits.Add(1)
-			fmt.Fprintf(w, `{"assets":[{"name":"nexttrace_linux_amd64","digest":"sha256:%s"}]}`, apiSum)
-		default:
-			http.NotFound(w, r)
-		}
-	}))
-	defer srv.Close()
-
-	dm := newDependencyManager("")
-	dm.apiBaseURL = srv.URL
-	dm.githubBaseURL = srv.URL
-	got, err := dm.fetchAssetDigest(context.Background(), "nxtrace/NTrace-core", "v1.7.4", "nexttrace_linux_amd64")
-	if err != nil || got != sum {
-		t.Fatalf("应优先使用同源 .sha256：got=%q err=%v", got, err)
-	}
-	if apiHits.Load() != 0 || sumHits.Load() == 0 {
-		t.Fatalf("不应触发 API 回退：api=%d sum=%d", apiHits.Load(), sumHits.Load())
-	}
-
-	// 配置 gh-proxy 时，同源 .sha256 仍从 githubBaseURL 直连获取（不经过代理），
-	// 因此可以优先采用它；API 只作为 .sha256 失败后的兜底。
-	dmProxy := newDependencyManager("https://gh-proxy.example/")
-	dmProxy.apiBaseURL = srv.URL
-	dmProxy.githubBaseURL = srv.URL
-	sumHits.Store(0)
-	apiHits.Store(0)
-	got, err = dmProxy.fetchAssetDigest(context.Background(), "nxtrace/NTrace-core", "v1.7.4", "nexttrace_linux_amd64")
-	if err != nil || got != sum {
-		t.Fatalf("配置 gh-proxy 时仍应直连同源 .sha256：got=%q err=%v", got, err)
-	}
-	if sumHits.Load() == 0 {
-		t.Fatal("配置 gh-proxy 时也应直连请求同源 .sha256")
-	}
-	if apiHits.Load() != 0 {
-		t.Fatal(".sha256 成功时不应回退 API")
-	}
-}
-
-// TestFetchAssetDigestErrorMentionsAPI 验证摘要获取失败时明确提示需要 api.github.com 连通性。
-func TestFetchAssetDigestErrorMentionsAPI(t *testing.T) {
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { http.NotFound(w, r) }))
-	defer srv.Close()
-	dm := newDependencyManager("")
-	dm.apiBaseURL = srv.URL
-	dm.githubBaseURL = srv.URL
-	_, err := dm.fetchAssetDigest(context.Background(), "nxtrace/NTrace-core", "v1.7.4", "nexttrace_linux_amd64")
-	if err == nil || !strings.Contains(err.Error(), "api.github.com") {
-		t.Fatalf("错误信息应说明需要 api.github.com 连通性：%v", err)
-	}
-}
-
-// TestFetchAssetDigestRejectsMismatchedSha256Name 验证 .sha256 里文件名不匹配时不采用（避免错误配对）。
-func TestFetchAssetDigestRejectsMismatchedSha256Name(t *testing.T) {
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if strings.HasSuffix(r.URL.Path, ".sha256") {
-			fmt.Fprintf(w, "%s  nexttrace_linux_arm64\n", strings.Repeat("c", 64))
-			return
-		}
-		http.NotFound(w, r)
-	}))
-	defer srv.Close()
-	dm := newDependencyManager("")
-	dm.apiBaseURL = srv.URL
-	dm.githubBaseURL = srv.URL
-	if _, err := dm.fetchAssetDigest(context.Background(), "x/y", "v1.7.4", "nexttrace_linux_amd64"); err == nil {
-		t.Fatal("文件名不匹配时不应采用该 .sha256")
-	}
-}
-
-// TestFetchAssetDigestRetriesUpstreamSha256 验证同源 .sha256 前两次失败、第三次成功时
-// 会自动重试并采用该摘要，不再回退 API。
-func TestFetchAssetDigestRetriesUpstreamSha256(t *testing.T) {
-	origDelay := digestRetryBaseDelay
-	digestRetryBaseDelay = 5 * time.Millisecond
-	defer func() { digestRetryBaseDelay = origDelay }()
-
-	sum := strings.Repeat("a", 64)
-	var sumHits, apiHits atomic.Int32
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		switch {
-		case strings.HasSuffix(r.URL.Path, ".sha256"):
-			if sumHits.Add(1) < 3 {
-				http.Error(w, "temporary", http.StatusServiceUnavailable)
-				return
-			}
-			fmt.Fprintf(w, "%s  nexttrace_linux_amd64\n", sum)
-		case strings.Contains(r.URL.Path, "/releases/tags/"):
-			apiHits.Add(1)
-			http.Error(w, "should not fallback", http.StatusInternalServerError)
-		default:
-			http.NotFound(w, r)
-		}
-	}))
-	defer srv.Close()
-
-	dm := newDependencyManager("")
-	dm.apiBaseURL = srv.URL
-	dm.githubBaseURL = srv.URL
-	got, err := dm.fetchAssetDigest(context.Background(), "nxtrace/NTrace-core", "v1.7.4", "nexttrace_linux_amd64")
-	if err != nil || got != sum {
-		t.Fatalf("重试后应返回 .sha256 摘要：got=%q err=%v", got, err)
-	}
-	if sumHits.Load() != digestFetchAttempts {
-		t.Fatalf(".sha256 应尝试 %d 次，实际 %d 次", digestFetchAttempts, sumHits.Load())
-	}
-	if apiHits.Load() != 0 {
-		t.Fatalf(".sha256 最终成功时不应调用 API，实际 %d 次", apiHits.Load())
-	}
-}
-
-// TestFetchAssetDigestFallsBackToAPIWithRetry 验证 .sha256 持续失败后回退 API，
-// API 前两次失败也会重试，最终成功取得 digest。
-func TestFetchAssetDigestFallsBackToAPIWithRetry(t *testing.T) {
-	origDelay := digestRetryBaseDelay
-	digestRetryBaseDelay = 5 * time.Millisecond
-	defer func() { digestRetryBaseDelay = origDelay }()
-
-	apiSum := strings.Repeat("b", 64)
-	var sumHits, apiHits atomic.Int32
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		switch {
-		case strings.HasSuffix(r.URL.Path, ".sha256"):
-			sumHits.Add(1)
-			http.Error(w, "down", http.StatusBadGateway)
-		case strings.Contains(r.URL.Path, "/releases/tags/"):
-			if apiHits.Add(1) < 3 {
-				http.Error(w, "temporary", http.StatusServiceUnavailable)
-				return
-			}
-			fmt.Fprintf(w, `{"assets":[{"name":"nexttrace_linux_amd64","digest":"sha256:%s"}]}`, apiSum)
-		default:
-			http.NotFound(w, r)
-		}
-	}))
-	defer srv.Close()
-
-	dm := newDependencyManager("")
-	dm.apiBaseURL = srv.URL
-	dm.githubBaseURL = srv.URL
-	got, err := dm.fetchAssetDigest(context.Background(), "nxtrace/NTrace-core", "v1.7.4", "nexttrace_linux_amd64")
-	if err != nil || got != apiSum {
-		t.Fatalf("应回退到 API digest：got=%q err=%v", got, err)
-	}
-	if sumHits.Load() != digestFetchAttempts {
-		t.Fatalf(".sha256 应尝试 %d 次，实际 %d 次", digestFetchAttempts, sumHits.Load())
-	}
-	if apiHits.Load() != digestFetchAttempts {
-		t.Fatalf("API 应尝试 %d 次，实际 %d 次", digestFetchAttempts, apiHits.Load())
-	}
-}
-
 // TestEnsureDependencySingleFlight 验证多个任务并发补装同一依赖时只下载一次。
 func TestEnsureDependencySingleFlight(t *testing.T) {
 	resetDependencyInstallState()
 	t.Cleanup(resetDependencyInstallState)
 
 	content := bytes.Repeat([]byte("F"), 150*1024)
-	sum := sha256.Sum256(content)
-	digest := hex.EncodeToString(sum[:])
-	var downloads atomic.Int32
+	var downloads, digestHits atomic.Int32
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch {
-		case strings.HasSuffix(r.URL.Path, ".sha256"):
+		case strings.HasSuffix(r.URL.Path, ".sha256") || strings.Contains(r.URL.Path, "/releases/tags/"):
+			digestHits.Add(1)
 			http.NotFound(w, r)
-		case strings.Contains(r.URL.Path, "/releases/tags/"):
-			fmt.Fprintf(w, `{"assets":[{"name":"nexttrace_linux_amd64","digest":"sha256:%s"}]}`, digest)
 		case strings.Contains(r.URL.Path, "releases/download"):
 			downloads.Add(1)
 			time.Sleep(50 * time.Millisecond)
@@ -1231,7 +947,7 @@ func TestEnsureDependencySingleFlight(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	// 配置 gh-proxy 让二进制下载指向本地测试服务；摘要走本地 API。
+	// 配置 gh-proxy 让二进制下载指向本地测试服务。
 	dm := newDependencyManager(srv.URL)
 	dm.apiBaseURL = srv.URL
 	dm.githubBaseURL = srv.URL
@@ -1267,6 +983,9 @@ func TestEnsureDependencySingleFlight(t *testing.T) {
 	if got := downloads.Load(); got != 1 {
 		t.Fatalf("并发补装应只下载 1 次，实际 %d 次", got)
 	}
+	if got := digestHits.Load(); got != 0 {
+		t.Fatalf("依赖安装不应请求任何 .sha256 或 API digest，实际 %d 次", got)
+	}
 }
 
 // TestEnsureDependencyFailureCooldown 验证安装失败后冷却期内不再重复下载，
@@ -1274,9 +993,6 @@ func TestEnsureDependencySingleFlight(t *testing.T) {
 func TestEnsureDependencyFailureCooldown(t *testing.T) {
 	resetDependencyInstallState()
 	t.Cleanup(resetDependencyInstallState)
-	origDelay := digestRetryBaseDelay
-	digestRetryBaseDelay = 5 * time.Millisecond
-	defer func() { digestRetryBaseDelay = origDelay }()
 
 	var hits atomic.Int32
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -1285,9 +1001,7 @@ func TestEnsureDependencyFailureCooldown(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	dm := newDependencyManager("")
-	dm.apiBaseURL = srv.URL
-	dm.githubBaseURL = srv.URL
+	dm := newDependencyManager(srv.URL)
 	dm.goos = "linux"
 	dm.goarch = "amd64"
 	target := filepath.Join(t.TempDir(), "bin", "nexttrace")
@@ -1298,8 +1012,8 @@ func TestEnsureDependencyFailureCooldown(t *testing.T) {
 		t.Fatal("上游持续失败时安装应报错")
 	}
 	firstHits := hits.Load()
-	if firstHits != digestFetchAttempts*2 {
-		t.Fatalf("首次安装应分别尝试 .sha256 与 API 各 %d 次，实际总请求 %d 次", digestFetchAttempts, firstHits)
+	if firstHits != 1 {
+		t.Fatalf("首次安装应只发起 1 次下载请求，实际 %d 次", firstHits)
 	}
 	_, err := dm.EnsureDependency(ctx, "nexttrace", target, "v1.7.4", nil)
 	if err == nil || !strings.Contains(err.Error(), "不会重复下载") {
@@ -1322,9 +1036,7 @@ func TestEnsureDependencyContextFailureNoCooldown(t *testing.T) {
 		http.NotFound(w, r)
 	}))
 	defer srv.Close()
-	dm := newDependencyManager("")
-	dm.apiBaseURL = srv.URL
-	dm.githubBaseURL = srv.URL
+	dm := newDependencyManager(srv.URL)
 	dm.goos = "linux"
 	dm.goarch = "amd64"
 	target := filepath.Join(t.TempDir(), "bin", "nexttrace")
@@ -1367,9 +1079,7 @@ func TestEnsureDependencyWaiterRetriesLeaderContextFailure(t *testing.T) {
 		http.NotFound(w, r)
 	}))
 	defer srv.Close()
-	dm := newDependencyManager("")
-	dm.apiBaseURL = srv.URL
-	dm.githubBaseURL = srv.URL
+	dm := newDependencyManager(srv.URL)
 	dm.goos = "linux"
 	dm.goarch = "amd64"
 	target := filepath.Join(t.TempDir(), "bin", "nexttrace")
@@ -1416,74 +1126,31 @@ func TestEnsureDependencyWaiterRetriesLeaderContextFailure(t *testing.T) {
 	case <-time.After(3 * time.Second):
 		t.Fatal("等待者未完成重试")
 	}
-	if got := hits.Load(); got < 3 {
-		t.Fatalf("等待者重试后应重新请求两个摘要来源，实际总请求 %d 次", got)
+	if got := hits.Load(); got < 2 {
+		t.Fatalf("等待者重试后应重新发起下载请求，实际总请求 %d 次", got)
 	}
 }
 
-// TestFetchAssetDigestNoRetryOnDeterministic4xx 验证确定性 4xx 不重试，
-// 429 限流仍按原策略重试。
-func TestFetchAssetDigestNoRetryOnDeterministic4xx(t *testing.T) {
-	origDelay := digestRetryBaseDelay
-	digestRetryBaseDelay = time.Millisecond
-	defer func() { digestRetryBaseDelay = origDelay }()
-
-	for _, tc := range []struct {
-		status int
-		want   int32
-	}{
-		{http.StatusNotFound, 2},
-		{http.StatusForbidden, 2},
-		{http.StatusTooManyRequests, int32(digestFetchAttempts * 2)},
-	} {
-		t.Run(http.StatusText(tc.status), func(t *testing.T) {
-			var hits atomic.Int32
-			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-				hits.Add(1)
-				w.WriteHeader(tc.status)
-			}))
-			defer srv.Close()
-			dm := newDependencyManager("")
-			dm.apiBaseURL = srv.URL
-			dm.githubBaseURL = srv.URL
-			if _, err := dm.fetchAssetDigest(context.Background(), "x/y", "v1.7.4", "nexttrace_linux_amd64"); err == nil {
-				t.Fatal("全部来源失败时应返回错误")
-			}
-			if got := hits.Load(); got != tc.want {
-				t.Fatalf("HTTP %d 请求次数 = %d，期望 %d", tc.status, got, tc.want)
-			}
-		})
-	}
-}
-
-// TestDownloadVerifiedRefusesExistingTempPath 验证临时文件用 O_EXCL 创建：
+// TestDownloadAssetRefusesExistingTempPath 验证临时文件用 O_EXCL 创建：
 // 预先放置的路径（可能是指向别处的软链接）会让下载直接失败，绝不会被覆盖。
-func TestDownloadVerifiedRefusesExistingTempPath(t *testing.T) {
+func TestDownloadAssetRefusesExistingTempPath(t *testing.T) {
 	content := bytes.Repeat([]byte("D"), 2048)
-	sum := sha256.Sum256(content)
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		switch {
-		case strings.HasSuffix(r.URL.Path, ".sha256"):
-			http.NotFound(w, r)
-		case strings.Contains(r.URL.Path, "/releases/tags/"):
-			fmt.Fprintf(w, `{"assets":[{"name":"nexttrace_linux_amd64","digest":"sha256:%x"}]}`, sum)
-		case strings.Contains(r.URL.Path, "/dl"):
+		if strings.Contains(r.URL.Path, "/dl") {
 			_, _ = w.Write(content)
-		default:
-			http.NotFound(w, r)
+			return
 		}
+		http.NotFound(w, r)
 	}))
 	defer srv.Close()
 
 	dm := newDependencyManager("")
-	dm.apiBaseURL = srv.URL
-	dm.githubBaseURL = srv.URL
 
 	tmp := filepath.Join(t.TempDir(), "pre-existing")
 	if err := os.WriteFile(tmp, []byte("attacker-content"), 0600); err != nil {
 		t.Fatal(err)
 	}
-	_, err := dm.downloadVerified(context.Background(), "x/y", "v1.7.4", "nexttrace_linux_amd64", srv.URL+"/dl", tmp, nil)
+	_, err := dm.downloadAsset(context.Background(), "nexttrace_linux_amd64", srv.URL+"/dl", tmp)
 	if err == nil || !strings.Contains(err.Error(), "临时文件") {
 		t.Fatalf("已存在的临时路径必须被拒绝，实际 err=%v", err)
 	}

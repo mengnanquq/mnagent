@@ -33,12 +33,6 @@ func botDigestClient(cfg *config.Config) *updater.BotDigestClient {
 	}
 }
 
-// NewBotDigestClient 返回按配置构造的服务端代取客户端，供 CLI/诊断路径
-// 为 Runner 注入与 Updater/Agent 相同的代取能力；不可信或未配置时返回 nil。
-func NewBotDigestClient(cfg *config.Config) *updater.BotDigestClient {
-	return botDigestClient(cfg)
-}
-
 func newUpdater(cfg *config.Config, log Logger) *updater.Updater {
 	exe, err := os.Executable()
 	if err != nil {
@@ -95,7 +89,6 @@ func HandleUpdateCLI(cfg *config.Config, log Logger) (handled bool, err error) {
 			fmt.Printf("已是最新版本（%s）\n", Version)
 		}
 		dm := dep.NewDependencyManager(cfg.GHProxy)
-		dm.SetBotDigest(botDigestClient(cfg))
 		statuses := dm.CheckAll(context.Background(), cfg.Binary, cfg.MiaospeedBinary)
 		for _, st := range statuses {
 			fmt.Println(st.Summary())
@@ -115,7 +108,6 @@ func HandleUpdateCLI(cfg *config.Config, log Logger) (handled bool, err error) {
 
 		// 更新依赖项
 		dm := dep.NewDependencyManager(cfg.GHProxy)
-		dm.SetBotDigest(botDigestClient(cfg))
 		statuses := dm.CheckAll(context.Background(), cfg.Binary, cfg.MiaospeedBinary)
 		for _, st := range statuses {
 			if st.HasUpdate {
@@ -148,16 +140,10 @@ func (a *Agent) newDependencyManager() *dep.DependencyManager {
 	if a.cfg != nil {
 		ghProxy = a.cfg.GHProxy
 	}
-	var dm *dep.DependencyManager
 	if a.depManagerFactory != nil {
-		dm = a.depManagerFactory(ghProxy)
-	} else {
-		dm = dep.NewDependencyManager(ghProxy)
+		return a.depManagerFactory(ghProxy)
 	}
-	if dm != nil {
-		dm.SetBotDigest(botDigestClient(a.cfg))
-	}
-	return dm
+	return dep.NewDependencyManager(ghProxy)
 }
 
 // dependencyTargetPath 返回依赖的配置路径（用于缺失时自动安装）。
