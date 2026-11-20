@@ -104,6 +104,7 @@ func runWithContext(ctx context.Context, args []string) error {
 
 	if cfg.DiagJob != "" {
 		rnr := runner.NewRunnerFull(cfg.Binary, cfg.MiaospeedBinary, cfg.GHProxy, cfg.AllowPrivateProbes, log)
+		rnr.SetBotDigest(runner.NewBotDigestClient(cfg))
 		res := rnr.Run(ctx, model.Job{
 			ID:        "diag",
 			Kind:      "miaospeed",
@@ -149,6 +150,7 @@ func runWithContext(ctx context.Context, args []string) error {
 	cli := client.New(cfg)
 	trk := tracker.New()
 	rnr := runner.NewRunnerFull(cfg.Binary, cfg.MiaospeedBinary, cfg.GHProxy, cfg.AllowPrivateProbes, log)
+	rnr.SetBotDigest(runner.NewBotDigestClient(cfg))
 	rnr.SetProgressReporter(func(p model.Progress) {
 		pCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
 		defer cancel()
@@ -158,6 +160,10 @@ func runWithContext(ctx context.Context, args []string) error {
 	})
 
 	upd := runner.NewUpdater(cfg, log)
+	// 公网明文 -bot 可能被中间人篡改代取的校验值，启动时明确告知已禁用。
+	if !cfg.NoBotChecksum && !cfg.BotChecksumTrusted {
+		log.Warn("-bot 为明文 HTTP 且非回环/私网 IP，已禁用服务端代取校验值")
+	}
 	agent := runner.NewAgent(cfg, log, cli, rnr, upd, trk)
 	// 启动后在后台补齐缺失依赖；无论 -auto-update 是否开启都会执行。
 	agent.StartInitialDependencyCheck(ctx)
