@@ -57,8 +57,27 @@ type Client struct {
 	wsOnce     sync.Once
 	ws         atomic.Pointer[websocket.Conn]
 	wsJobs     chan *model.Job
+	wsCancel   chan *model.Job   // 取消指令独立队列，读循环永不为它阻塞
 	wsReject   chan model.Result // 队列满时的失败结果，由独立协程回传，避免阻塞读循环
 	wsAck      atomic.Bool       // 当前连接的机器人是否会确认结果（hello 声明）
+
+	// wsRejectMu/wsRejectStop/wsRejectWG 用于退出时与失败回传协程同步：
+	// FailPending 先通知 wsRejectLoop 停止取新条目，再等待其在途 SendResult
+	// 结束，避免进程退出时截断最后一条结果。wsRejectHalt 阻止退出阶段
+	// 重新建立连接时再启动新的回传协程。
+	wsRejectMu   sync.Mutex
+	wsRejectStop chan struct{}
+	wsRejectWG   sync.WaitGroup
+	wsRejectHalt bool
+	wsRejectBusy atomic.Int32 // 正在回传的残留结果数（用于退出告警计数）
+
+	// wsCancelOverflow 承接 wsCancel 满后的取消指令，并配合 wsCancelNotify
+	// 唤醒 Poll；普通任务再多也不能挤掉取消指令。wsCancelOverflow 达到硬上限
+	// 后丢弃最旧条目，wsCancelDropped 记录累计丢弃数用于节流告警。
+	wsCancelMu       sync.Mutex
+	wsCancelOverflow []*model.Job
+	wsCancelDropped  int
+	wsCancelNotify   chan struct{}
 
 	ackMu sync.Mutex
 	acks  map[string]chan struct{} // 等待机器人确认的结果 ID
@@ -103,7 +122,9 @@ func New(cfg *config.Config) *Client {
 		resultTotalTimeout: resultTotalTimeout,
 		wsDisabled:         wsDisabledByEnv(),
 		wsHTTP:             newWSHTTPClient(),
-		wsJobs:             make(chan *model.Job, 16),
+		wsJobs:             make(chan *model.Job, wsJobsCapacity),
+		wsCancel:           make(chan *model.Job, wsCancelCapacity),
+		wsCancelNotify:     make(chan struct{}, 1),
 		wsReject:           make(chan model.Result, 64),
 	}
 }
@@ -124,6 +145,10 @@ func (c *Client) Poll(ctx context.Context) (*model.Job, error) {
 		return nil, model.ErrUpdating
 	}
 	c.startWS(ctx)
+	// 取消指令优先于普通任务，避免排队取消被前面的长任务拖住。
+	if job := c.takeWSCancel(); job != nil {
+		return job, nil
+	}
 	// 先取走长连接已推送的任务（含断线前缓冲的）
 	select {
 	case job := <-c.wsJobs:
