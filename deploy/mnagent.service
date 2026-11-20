@@ -47,6 +47,26 @@ ProtectKernelTunables=true
 ProtectControlGroups=true
 RestrictSUIDSGID=true
 LockPersonality=true
+# 保守加固：只限制本服务不可能用到的内核/设备/命名空间能力。
+# 禁止加载/卸载内核模块（nexttrace/miaospeed 都不需要）。
+ProtectKernelModules=true
+# 禁止读取内核日志（/dev/kmsg、syslog），避免泄露内核地址等信息。
+ProtectKernelLogs=true
+# 禁止修改系统时钟（NTP 由宿主机负责，agent 无此需求）。
+ProtectClock=true
+# 禁止修改主机名（agent 不负责主机名管理）。
+ProtectHostname=true
+# 禁止创建新的 mount/pid/net 等命名空间，降低提权面。
+RestrictNamespaces=true
+# 禁止使用实时调度策略，避免抢占宿主机实时任务。
+RestrictRealtime=true
+# 不启用 SystemCallArchitectures=native：32 位用户态二进制跑在 64 位内核上（如树莓派
+# 32 位系统）会被拒绝全部系统调用，导致 agent 无法启动。
+# 提供最小 /dev（保留 null/zero/random/urandom 等），不暴露物理设备。
+PrivateDevices=true
+# 只保留服务实际需要的地址族：本地监听/Unix socket、IPv4/IPv6、netlink、
+# 以及 nexttrace 的原始套接字（AF_PACKET）所需。
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6 AF_NETLINK AF_PACKET
 
 [Install]
 WantedBy=multi-user.target
