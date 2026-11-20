@@ -109,6 +109,21 @@ func (d *jobDedup) start(id string) (dedupAction, *model.Result, dedupCacheState
 	return dedupRun, nil, dedupCacheNone
 }
 
+// forget 移除任务的去重记录。用于“队列满/未真正执行”等可重试失败：
+// 调用方在入队前已经 start 登记为 running，若不撤销，服务端重发同一 jobID
+// 会在 TTL 内被误判为“正在执行”而直接忽略。
+func (d *jobDedup) forget(id string) {
+	if id == "" {
+		return
+	}
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	d.expireLocked(d.now())
+	if e, ok := d.entries[id]; ok {
+		d.removeLocked(e)
+	}
+}
+
 // complete 把任务标记为已完成，并在体积允许时缓存结果供重复下发时重发。
 func (d *jobDedup) complete(id string, res *model.Result) {
 	if id == "" {

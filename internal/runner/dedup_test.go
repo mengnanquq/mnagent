@@ -38,6 +38,20 @@ func TestJobDedupSkipsRunningAndReplaysCompleted(t *testing.T) {
 	}
 }
 
+func TestJobDedupForgetAllowsRetry(t *testing.T) {
+	d := newJobDedup()
+	if action, _, _ := d.start("rejected"); action != dedupRun {
+		t.Fatalf("首次登记应允许执行，实际 action=%v", action)
+	}
+	if action, _, _ := d.start("rejected"); action != dedupRunning {
+		t.Fatalf("登记后重复下发应跳过，实际 action=%v", action)
+	}
+	d.forget("rejected")
+	if action, cached, _ := d.start("rejected"); action != dedupRun || cached != nil {
+		t.Fatalf("forget 后服务端重发应能重新执行，实际 action=%v cached=%+v", action, cached)
+	}
+}
+
 func TestJobDedupExpiresAndEvictsLRU(t *testing.T) {
 	now := time.Unix(1000, 0)
 	d := newJobDedup()

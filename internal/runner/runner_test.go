@@ -1359,7 +1359,7 @@ func TestAgentResendInFlightGuard(t *testing.T) {
 }
 
 // TestAgentEnqueueHeavyQueueFullRejectsImmediately 验证 heavyQueue 满时不会阻塞主循环，
-// 而是立即回传“队列已满”的失败结果，并记录为已完成避免重复执行。
+// 而是立即回传“队列已满”的失败结果；该结果不写去重缓存，服务端重发时能真正重跑。
 func TestAgentEnqueueHeavyQueueFullRejectsImmediately(t *testing.T) {
 	results := make(chan model.Result, 1)
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -1385,6 +1385,11 @@ func TestAgentEnqueueHeavyQueueFullRejectsImmediately(t *testing.T) {
 	a.heavyQueue <- model.Job{ID: "queued", Kind: "trace", Target: "1.1.1.1"}
 
 	job := model.Job{ID: "overflow", Kind: "miaospeed", Target: "sub"}
+	// 主循环在入队前会先登记去重状态；队列满被拒时必须撤销该登记，
+	// 否则服务端重发同一 jobID 会在 TTL 内被当成“正在执行”直接忽略。
+	if action, _, _ := a.dedupStore().start(job.ID); action != dedupRun {
+		t.Fatalf("入队前应登记为可执行，实际 action=%v", action)
+	}
 	if a.enqueueHeavy(context.Background(), job) {
 		t.Fatal("队列已满时不应入队成功")
 	}
@@ -1397,8 +1402,62 @@ func TestAgentEnqueueHeavyQueueFullRejectsImmediately(t *testing.T) {
 		t.Fatal("队列已满时应立即回传失败结果")
 	}
 	action, cached, _ := a.dedupStore().start("overflow")
-	if action != dedupCompleted || cached == nil || cached.ID != "overflow" {
-		t.Fatalf("队列满任务应标记为已完成并缓存失败结果，实际 action=%v cached=%+v", action, cached)
+	if action != dedupRun || cached != nil {
+		t.Fatalf("队列满任务不应写去重缓存，服务端重发时应能重跑，实际 action=%v cached=%+v", action, cached)
+	}
+}
+
+// TestAgentEnqueueLightQueueFullRejectsImmediately 验证轻任务队列有界：队列满时
+// 立即回报“轻任务队列已满”，不在主长轮询路径上阻塞，也不无界堆集协程。
+func TestAgentEnqueueLightQueueFullRejectsImmediately(t *testing.T) {
+	srv, results := newResultTestServer(t, 1)
+	cfg := &config.Config{
+		BotURL:        srv.URL,
+		Tokens:        &config.TokenSource{Value: "tok"},
+		PollTimeout:   time.Second,
+		ResultTimeout: time.Second,
+	}
+	a := &Agent{cfg: cfg, logger: testLogger{t}, client: client.New(cfg)}
+	a.lightQueue = make(chan model.Job, 1)
+	a.lightQueue <- model.Job{ID: "queued", Kind: "ping", Target: "1.1.1.1"}
+
+	job := model.Job{ID: "overflow-light", Kind: "ping", Target: "1.1.1.1"}
+	if action, _, _ := a.dedupStore().start(job.ID); action != dedupRun {
+		t.Fatalf("入队前应登记为可执行，实际 action=%v", action)
+	}
+	if a.enqueueLight(context.Background(), job) {
+		t.Fatal("轻任务队列已满时不应入队成功")
+	}
+	select {
+	case res := <-results:
+		if res.ID != "overflow-light" || res.ExitCode != -1 || !strings.Contains(res.Error, "节点轻任务队列已满") {
+			t.Fatalf("轻任务队列满失败结果异常: %+v", res)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("轻任务队列满时应立即回传失败结果")
+	}
+	if action, cached, _ := a.dedupStore().start("overflow-light"); action != dedupRun || cached != nil {
+		t.Fatalf("队列满任务不应写入去重缓存，实际 action=%v cached=%+v", action, cached)
+	}
+}
+
+// TestAgentLightWorkersExitOnCancel 验证固定 worker 池受 ctx 约束，
+// waitTasks 不会被常驻 worker 无限阻塞。
+func TestAgentLightWorkersExitOnCancel(t *testing.T) {
+	a := &Agent{logger: testLogger{t}, lightQueue: make(chan model.Job, 1)}
+	ctx, cancel := context.WithCancel(context.Background())
+	a.startLightWorkers(ctx)
+	cancel()
+
+	done := make(chan struct{})
+	go func() {
+		a.tasksWG.Wait()
+		close(done)
+	}()
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("取消后轻任务 worker 未退出，waitTasks 会被永久阻塞")
 	}
 }
 

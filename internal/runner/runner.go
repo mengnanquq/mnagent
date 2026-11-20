@@ -64,16 +64,6 @@ func (r *Runner) SetProgressReporter(fn func(model.Progress)) {
 	r.onProgress = fn
 }
 
-// NewRunner 构建执行器，默认请求 JSON 输出。
-func NewRunner(binary string, log Logger) *Runner {
-	return NewRunnerFull(binary, "miaospeed", "", false, log)
-}
-
-// NewRunnerWithMiaospeed 构建执行器，可指定 miaospeed 可执行文件路径。
-func NewRunnerWithMiaospeed(binary, miaospeed string, log Logger) *Runner {
-	return NewRunnerFull(binary, miaospeed, "", false, log)
-}
-
 // NewRunnerFull 构建执行器，可指定 miaospeed 路径与 GitHub 代理前缀。
 func NewRunnerFull(binary, miaospeed, ghProxy string, allowPrivate bool, log Logger) *Runner {
 	r := &Runner{
@@ -393,7 +383,13 @@ func looksLikeUnknownFlag(out string) bool {
 }
 
 // 调度器并发参数。
-const defaultMaxConcurrentLight = 8
+const (
+	defaultMaxConcurrentLight = 8
+	// lightQueueCapacity 是轻任务有界队列容量。旧实现为每个轻任务即时开协程再
+	// 等 lightSem，队列满时协程会无界堆集；改为固定 worker 池 + 有界 channel 后，
+	// 入队失败立即回报“队列已满”，常驻内存只取决于队列容量。
+	lightQueueCapacity = 128
+)
 
 // exitInflightWait 是退出时等待在途任务结束的上限，剩余约 20s 留给
 // FailPending 与 heavyQueue 回报（总预算 config.DefaultExitResultTimeout=60s）。
@@ -409,7 +405,7 @@ type Agent struct {
 	tracker *tracker.Tracker
 
 	heavyQueue chan model.Job
-	lightSem   chan struct{}
+	lightQueue chan model.Job
 	tasksWG    sync.WaitGroup
 
 	// rejectOnce/rejectSem 限制 rejectBusyJob 并发回传的协程数。
@@ -474,6 +470,9 @@ func (a *Agent) Loop(ctx context.Context) error {
 		if n := a.failPendingHeavy(stopCtx, "节点停止，未执行"); n > 0 {
 			a.logger.Info("已回报 heavyQueue 中未执行的任务", "count", n)
 		}
+		if n := a.failPendingLight(stopCtx, "节点停止，未执行"); n > 0 {
+			a.logger.Info("已回报轻任务队列中未执行的任务", "count", n)
+		}
 	}()
 	defer cancel() // LIFO：先取消内部协程，再执行上面的退出回报。
 	a.startHeartbeat(ctx)
@@ -481,13 +480,16 @@ func (a *Agent) Loop(ctx context.Context) error {
 	if a.heavyQueue == nil {
 		a.heavyQueue = make(chan model.Job, 32)
 	}
-	if a.lightSem == nil {
-		a.lightSem = make(chan struct{}, defaultMaxConcurrentLight)
+	if a.lightQueue == nil {
+		a.lightQueue = make(chan model.Job, lightQueueCapacity)
 	}
 
 	// 启动重任务专用消费协程：串行化重任务与更新指令，并与主长轮询解耦
 	a.tasksWG.Add(1)
 	go a.heavyWorker(ctx)
+
+	// 轻任务固定 worker 池：并发数沿用原来的 8，队列有界，主循环入队绝不阻塞。
+	a.startLightWorkers(ctx)
 
 	backoff := a.cfg.MinBackoff
 	var nextCheck time.Time
@@ -580,18 +582,11 @@ func (a *Agent) Loop(ctx context.Context) error {
 		}
 
 		// 轻任务（ping / tcping / http / dns）：
-		// 派发至轻任务 worker pool 并发执行，主循环绝不阻塞挂起，秒级处理后续长轮询
-		a.tasksWG.Add(1)
-		go func(j model.Job) {
-			defer a.tasksWG.Done()
-			select {
-			case a.lightSem <- struct{}{}:
-				defer func() { <-a.lightSem }()
-			case <-ctx.Done():
-				return
-			}
-			a.execute(ctx, j)
-		}(*job)
+		// 派发至有界队列，由固定 worker 池并发执行；主循环绝不阻塞，也不会
+		// 因服务端持续推送轻任务而无界堆集协程。
+		if !a.enqueueLight(ctx, *job) && ctx.Err() != nil {
+			return nil
+		}
 	}
 }
 

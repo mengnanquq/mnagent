@@ -140,23 +140,101 @@ func (a *Agent) failPendingHeavy(ctx context.Context, reason string) int {
 		select {
 		case job, ok := <-a.heavyQueue:
 			if !ok {
-				goto send
+				return a.failPendingJobs(ctx, reason, "重任务", jobs)
 			}
 			if job.NormalizedKind() == "cancel" {
 				continue
 			}
 			jobs = append(jobs, job)
 		default:
-			goto send
+			return a.failPendingJobs(ctx, reason, "重任务", jobs)
 		}
 	}
+}
 
-send:
+// enqueueLight 把轻任务写入有界队列；队列满或节点正在退出时立即异步回报失败，
+// 绝不在主长轮询路径上阻塞。返回值仅表示是否入队成功。
+func (a *Agent) enqueueLight(ctx context.Context, job model.Job) bool {
+	if ctx.Err() != nil {
+		a.rejectBusyJob(job, "节点正在退出")
+		return false
+	}
+	if a.lightQueue == nil {
+		a.rejectBusyJob(job, "节点轻任务队列未初始化，任务未执行")
+		return false
+	}
+	select {
+	case a.lightQueue <- job:
+		return true
+	case <-ctx.Done():
+		a.rejectBusyJob(job, "节点正在退出")
+		return false
+	default:
+		// 队列满不是任务的最终结果：不写去重缓存，服务端重发时才能真正重跑。
+		a.rejectBusyJobUncached(job, "节点轻任务队列已满，任务未执行，请稍后重试")
+		return false
+	}
+}
+
+// startLightWorkers 启动固定并发数的轻任务 worker（并发数沿用原 lightSem 的 8）。
+func (a *Agent) startLightWorkers(ctx context.Context) {
+	for i := 0; i < defaultMaxConcurrentLight; i++ {
+		a.tasksWG.Add(1)
+		go a.lightWorker(ctx)
+	}
+}
+
+// lightWorker 从有界队列取轻任务执行，直到 ctx 退出。
+func (a *Agent) lightWorker(ctx context.Context) {
+	defer a.tasksWG.Done()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case job, ok := <-a.lightQueue:
+			if !ok {
+				return
+			}
+			if ctx.Err() != nil {
+				// 取消与取任务同时发生时，把任务放回刚腾出的队列槽位，交给退出
+				// 清理统一回报；放不回去才直接回报失败。
+				select {
+				case a.lightQueue <- job:
+				default:
+					a.rejectBusyJob(job, "节点正在退出")
+				}
+				return
+			}
+			a.execute(ctx, job)
+		}
+	}
+}
+
+// failPendingLight 在退出/重启前回报 lightQueue 中尚未执行的轻任务。
+func (a *Agent) failPendingLight(ctx context.Context, reason string) int {
+	if a.lightQueue == nil {
+		return 0
+	}
+	var jobs []model.Job
+	for {
+		select {
+		case job, ok := <-a.lightQueue:
+			if !ok {
+				return a.failPendingJobs(ctx, reason, "轻任务", jobs)
+			}
+			jobs = append(jobs, job)
+		default:
+			return a.failPendingJobs(ctx, reason, "轻任务", jobs)
+		}
+	}
+}
+
+// failPendingJobs 小并发回报一批未执行任务，共享退出预算（见 Loop），
+// 既比串行更宽裕，也不会超过 systemd 的停止超时。
+func (a *Agent) failPendingJobs(ctx context.Context, reason, label string, jobs []model.Job) int {
 	if len(jobs) == 0 {
 		return 0
 	}
-	// 退出时可能积压多个任务：小并发回报，共享同一个退出预算（见 Loop），
-	// 既比原来 5s 串行更宽裕，也不会超过 systemd 的停止超时。
 	var (
 		wg sync.WaitGroup
 		n  atomic.Int64
@@ -176,8 +254,8 @@ send:
 			}
 			a.dedupStore().complete(job.ID, &res)
 			if a.client != nil {
-				if err := a.client.SendResult(ctx, res); err != nil {
-					a.logger.Warn("回报未执行重任务失败", "job", job.ID, "error", err)
+				if err := a.client.SendResult(ctx, res); err != nil && a.logger != nil {
+					a.logger.Warn("回报未执行"+label+"失败", "job", job.ID, "error", err)
 				}
 			}
 			n.Add(1)
@@ -219,7 +297,8 @@ func (a *Agent) enqueueHeavy(ctx context.Context, job model.Job) bool {
 		a.rejectBusyJob(job, "节点正在退出")
 		return false
 	default:
-		a.rejectBusyJob(job, "节点任务队列已满，任务未执行，请稍后重试")
+		// 队列满不写去重缓存，让服务端重发时能真正重跑而不是回放“队列已满”。
+		a.rejectBusyJobUncached(job, "节点任务队列已满，任务未执行，请稍后重试")
 		return false
 	}
 }
@@ -236,16 +315,31 @@ func (a *Agent) rejectSendLimiter() chan struct{} {
 	return a.rejectSem
 }
 
-// rejectBusyJob 异步回传“队列已满/正在退出”的失败结果，并标记任务已完成，避免重复下发再次执行。
-// 失败结果会写入去重缓存，即使并发上限已满而丢弃本次回传，服务端重发时仍能拿到结果。
+// rejectBusyJob 异步回传“正在退出”等失败结果并写入去重缓存：这是最终结论，
+// 服务端重发时直接回放缓存，避免退出期间反复执行。
 func (a *Agent) rejectBusyJob(job model.Job, reason string) {
+	a.rejectBusyJobWithCache(job, reason, true)
+}
+
+// rejectBusyJobUncached 回传“队列已满”等可重试失败，但不写去重缓存：
+// 服务端重发同一任务时应能真正重跑，而不是永远命中旧的“队列已满”结果。
+func (a *Agent) rejectBusyJobUncached(job model.Job, reason string) {
+	// 入队路径在调用本函数前已经把 jobID 登记为 running；队列满时任务并未执行，
+	// 必须撤销登记，否则服务端重发同一任务会在 TTL 内被当作“正在执行”忽略。
+	a.dedupStore().forget(job.ID)
+	a.rejectBusyJobWithCache(job, reason, false)
+}
+
+func (a *Agent) rejectBusyJobWithCache(job model.Job, reason string, cache bool) {
 	res := model.Result{
 		ID:       job.ID,
 		Kind:     probe.ProbeKind(job),
 		ExitCode: -1,
 		Error:    reason,
 	}
-	a.dedupStore().complete(job.ID, &res)
+	if cache {
+		a.dedupStore().complete(job.ID, &res)
+	}
 	if a.logger != nil {
 		a.logger.Warn("节点任务队列不可用，立即回报失败", "job", job.ID, "kind", probe.ProbeKind(job), "reason", reason)
 	}
@@ -258,8 +352,8 @@ func (a *Agent) rejectBusyJob(job model.Job, reason string) {
 		// 已占用一个并发槽位。
 	default:
 		// 并发已满：这里在入队路径上，同步发送会拖住主长轮询与退出流程，
-		// 无界开协程则会在服务端异常时堆集。结果已写入去重缓存，
-		// 因此选择丢弃本次回传并告警（服务端重发同一任务时会命中去重缓存）。
+		// 无界开协程则会在服务端异常时堆集。最终结论已写入去重缓存时，
+		// 丢弃本次回传仍可由服务端重发取回；队列满这类可重试结果则依赖服务端重发重跑。
 		if a.logger != nil {
 			a.logger.Warn("失败结果回传并发已达上限，本次回传丢弃待服务端重发",
 				"job", job.ID, "limit", maxConcurrentRejectSends)

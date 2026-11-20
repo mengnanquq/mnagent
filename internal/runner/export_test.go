@@ -11,11 +11,11 @@ import (
 // 避免生产代码里长期保留无调用者的测试专用别名。
 
 func newRunner(binary string, log Logger) *Runner {
-	return NewRunner(binary, log)
+	return NewRunnerFull(binary, "miaospeed", "", false, log)
 }
 
 func newRunnerWithMiaospeed(binary, miaospeed string, log Logger) *Runner {
-	return NewRunnerWithMiaospeed(binary, miaospeed, log)
+	return NewRunnerFull(binary, miaospeed, "", false, log)
 }
 
 func newRunnerFull(binary, miaospeed, ghProxy string, allowPrivate bool, log Logger) *Runner {
