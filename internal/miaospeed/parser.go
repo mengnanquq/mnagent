@@ -170,7 +170,9 @@ func isPossibleBase64(s string) bool {
 func newSafeSubscriptionClient(allowPrivate bool) *http.Client {
 	dialer := &net.Dialer{Timeout: 8 * time.Second}
 	transport := &http.Transport{
-		Proxy: http.ProxyFromEnvironment,
+		// 禁止使用环境代理：设置 HTTP(S)_PROXY 时 DialContext 拿到的是代理地址，
+		// 代理会自行解析并连接目标，下面按解析 IP 做的 SSRF 校验会被完全绕过（与 probe 包一致）。
+		Proxy: nil,
 		DialContext: func(ctx context.Context, network, addr string) (net.Conn, error) {
 			host, port, err := net.SplitHostPort(addr)
 			if err != nil {
@@ -199,6 +201,10 @@ func newSafeSubscriptionClient(allowPrivate bool) *http.Client {
 		CheckRedirect: func(req *http.Request, via []*http.Request) error {
 			if len(via) >= 10 {
 				return errors.New("重定向次数过多")
+			}
+			// 重定向目标同样经过 DialContext 的 IP 校验；这里额外拒绝非 http(s) 协议。
+			if req.URL.Scheme != "http" && req.URL.Scheme != "https" {
+				return fmt.Errorf("不支持的重定向协议: %s", req.URL.Scheme)
 			}
 			return nil
 		},

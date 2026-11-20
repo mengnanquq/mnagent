@@ -2314,3 +2314,19 @@ func TestQueryIPGeoCanceledWaiterDoesNotCacheEmpty(t *testing.T) {
 	}
 	defaultGeoCache.mu.Unlock()
 }
+
+// TestSubscriptionClientIgnoresEnvProxy 验证订阅客户端不走环境代理：
+// 走代理时 DialContext 拿到的是代理地址，按目标 IP 的 SSRF 校验会被绕过。
+func TestSubscriptionClientIgnoresEnvProxy(t *testing.T) {
+	t.Setenv("HTTP_PROXY", "http://proxy.example.com:3128")
+	t.Setenv("HTTPS_PROXY", "http://proxy.example.com:3128")
+	for _, allow := range []bool{false, true} {
+		tr, ok := newSafeSubscriptionClient(allow).Transport.(*http.Transport)
+		if !ok {
+			t.Fatal("订阅客户端应使用 *http.Transport")
+		}
+		if tr.Proxy != nil {
+			t.Fatalf("allowPrivate=%v 时订阅客户端不应使用环境代理", allow)
+		}
+	}
+}
