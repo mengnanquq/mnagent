@@ -275,6 +275,71 @@ func TestHTTPProbeRejectsBadURL(t *testing.T) {
 	}
 }
 
+// TestBlockedProbeIPReservedRanges 表驱动覆盖新增的保留/过渡机制地址段，
+// 并确认普通公网 IPv4/IPv6 不会被误伤。
+func TestBlockedProbeIPReservedRanges(t *testing.T) {
+	tests := []struct {
+		ip      string
+		blocked bool
+	}{
+		{"0.1.2.3", true},               // 0.0.0.0/8
+		{"198.18.0.1", true},            // 198.18.0.0/15
+		{"198.19.255.255", true},        // 198.18.0.0/15 上边界
+		{"240.0.0.1", true},             // 240.0.0.0/4
+		{"255.255.255.255", true},       // 广播地址
+		{"100.64.0.1", true},            // CGNAT
+		{"::a9fe:a9fe", true},           // IPv4 兼容 ::/96，内嵌 169.254.169.254
+		{"64:ff9b:1::1", true},          // NAT64 本地使用前缀
+		{"2001:0:4136:e378::1", true},   // Teredo 2001::/32
+		{"1.1.1.1", false},              // 普通公网 IPv4
+		{"11.0.0.1", false},             // 公网 IPv4（DoD 段，不在拦截列表）
+		{"198.17.255.255", false},       // 198.18/15 之外
+		{"198.20.0.1", false},           // 198.18/15 之外
+		{"2606:4700:4700::1111", false}, // 普通公网 IPv6
+		{"2001:4860:4860::8888", false}, // 普通公网 IPv6（2001::/32 之外）
+		{"64:ff9b:2::1", false},         // 不属于 NAT64 前缀
+		{"::8.8.8.8", false},            // IPv4 兼容地址内嵌公网地址，不应整段拦截
+		{"64:ff9b::8.8.8.8", false},     // NAT64 内嵌公网地址，不应整段拦截
+		{"2002:808:808::1", false},      // 6to4 内嵌公网地址，不应整段拦截
+	}
+	for _, tc := range tests {
+		ip := net.ParseIP(tc.ip)
+		if ip == nil {
+			t.Fatalf("测试用例 IP 非法: %q", tc.ip)
+		}
+		if got := IsBlockedProbeIP(ip); got != tc.blocked {
+			t.Errorf("IsBlockedProbeIP(%q) = %v, want %v", tc.ip, got, tc.blocked)
+		}
+	}
+}
+
+func TestBlockedProbeIPEmbeddedIPv4(t *testing.T) {
+	// 过渡机制地址（NAT64 / 6to4 / IPv4-compatible）只按内嵌 IPv4 判定：
+	// 内嵌公网地址必须放行，否则 IPv6-only + NAT64 网络下所有公网 IPv4 都会被拦截。
+	tests := []struct {
+		ip      string
+		blocked bool
+	}{
+		{"64:ff9b::8.8.8.8", false},
+		{"64:ff9b::a9fe:a9fe", true}, // 169.254.169.254 云元数据
+		{"64:ff9b::7f00:1", true},    // 127.0.0.1
+		{"2002:808:808::", false},    // 内嵌 8.8.8.8
+		{"2002:a9fe:a9fe::", true},   // 内嵌 169.254.169.254
+		{"2002:a00:1::", true},       // 内嵌 10.0.0.1
+		{"::808:808", false},         // ::/96 内嵌 8.8.8.8
+		{"::7f00:1", true},           // ::/96 内嵌 127.0.0.1
+	}
+	for _, tc := range tests {
+		ip := net.ParseIP(tc.ip)
+		if ip == nil {
+			t.Fatalf("测试用例 IP 非法: %q", tc.ip)
+		}
+		if got := IsBlockedProbeIP(ip); got != tc.blocked {
+			t.Errorf("IsBlockedProbeIP(%q) = %v, want %v", tc.ip, got, tc.blocked)
+		}
+	}
+}
+
 func TestBlockedProbeIP(t *testing.T) {
 	blocked := []string{
 		"127.0.0.1",
@@ -284,6 +349,9 @@ func TestBlockedProbeIP(t *testing.T) {
 		"172.16.0.1",
 		"169.254.169.254", // AWS/GCP/Alibaba Cloud metadata
 		"100.64.0.1",      // CGNAT
+		"192.0.0.1",       // IETF 协议分配 192.0.0.0/24
+		"198.18.0.1",      // 基准测试保留 198.18.0.0/15
+		"240.0.0.1",       // 保留 240.0.0.0/4
 	}
 	for _, ipStr := range blocked {
 		ip := net.ParseIP(ipStr)
@@ -295,6 +363,8 @@ func TestBlockedProbeIP(t *testing.T) {
 	public := []string{
 		"1.1.1.1",
 		"8.8.8.8",
+		"100.128.0.1", // 紧邻 CGNAT 之外，必须保持放行
+		"192.0.2.1",   // 文档示例段，不能被 192.0.0.0/24 误伤
 		"2606:4700:4700::1111",
 	}
 	for _, ipStr := range public {
@@ -344,12 +414,86 @@ func TestDNSProbeBlocksPrivate(t *testing.T) {
 		}
 	}
 
-	// 域名解析到回环地址（localhost）时，A/AAAA/ALL 结果应被拒绝。
+	// 单标签 localhost 现在会在名称级校验直接拒绝，不再进入解析器。
 	for _, recordType := range []string{"A", "AAAA", "ALL"} {
 		if _, err := DNSProbe(context.Background(), model.Job{Target: "localhost", Query: recordType, TimeoutMS: 3000}, false); err == nil ||
-			!strings.Contains(err.Error(), "DNS 查询结果包含") {
-			t.Fatalf("%s 查询 localhost 应因结果含私网地址被拒绝，实际 err=%v", recordType, err)
+			!strings.Contains(err.Error(), "安全策略拦截") {
+			t.Fatalf("%s 查询 localhost 应被名称级校验拒绝，实际 err=%v", recordType, err)
 		}
+	}
+}
+
+// TestDNSProbeBlocksReservedNamesAndPrivateReverse 验证名称级 SSRF 校验：
+// 单标签、内网保留后缀与私网反向域名在查询前被拒绝。
+func TestDNSProbeBlocksReservedNamesAndPrivateReverse(t *testing.T) {
+	cases := []struct {
+		target string
+		query  string
+	}{
+		{"localhost", "A"},
+		{"printer.local", "A"},
+		{"router.home.arpa", "A"},
+		{"foo.internal", "TXT"},
+		{"service.lan", "CNAME"},
+		{"1.0.0.10.in-addr.arpa", "PTR"},
+		{"1.0.0.127.in-addr.arpa", "PTR"},
+		{"0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.ip6.arpa", "PTR"},
+	}
+	for _, tc := range cases {
+		if _, err := DNSProbe(context.Background(), model.Job{Target: tc.target, Query: tc.query, TimeoutMS: 1000}, false); err == nil ||
+			!strings.Contains(err.Error(), "安全策略拦截") {
+			t.Fatalf("目标 %s 应被拦截，实际 err=%v", tc.target, err)
+		}
+	}
+}
+
+// TestDNSQueryNameAllowsPublicDomains 验证公网域名、TXT 下划线前缀与公网反向域名
+// 不会被名称级校验误伤（CNAME/MX/NS/TXT 不要求能解析出 A 记录）。
+func TestDNSQueryNameAllowsPublicDomains(t *testing.T) {
+	for _, host := range []string{
+		"example.com",
+		"_dmarc.example.com",
+		"mail.example.com",
+		"8.8.8.8",
+		"8.8.8.8.in-addr.arpa",
+		"2606:4700:4700::1111",
+	} {
+		if err := validateDNSQueryName(host); err != nil {
+			t.Fatalf("公网名称 %s 不应被拦截: %v", host, err)
+		}
+	}
+}
+
+// TestParseReverseDNSName 验证反向域名还原为 IP，供私网判定复用。
+func TestParseReverseDNSName(t *testing.T) {
+	ip, ok := parseReverseDNSName("8.8.8.8.in-addr.arpa")
+	if !ok || !ip.Equal(net.ParseIP("8.8.8.8")) {
+		t.Fatalf("IPv4 反解异常: ip=%v ok=%v", ip, ok)
+	}
+	ip, ok = parseReverseDNSName("1.0.0.10.in-addr.arpa")
+	if !ok || !ip.Equal(net.ParseIP("10.0.0.1")) {
+		t.Fatalf("私网 IPv4 反解异常: ip=%v ok=%v", ip, ok)
+	}
+
+	want := net.ParseIP("2001:db8::1")
+	hex := fmt.Sprintf("%032x", []byte(want.To16()))
+	var b strings.Builder
+	for i := len(hex) - 1; i >= 0; i-- {
+		b.WriteByte(hex[i])
+		if i > 0 {
+			b.WriteByte('.')
+		}
+	}
+	ip, ok = parseReverseDNSName(b.String() + ".ip6.arpa")
+	if !ok || !ip.Equal(want) {
+		t.Fatalf("IPv6 反解异常: ip=%v ok=%v", ip, ok)
+	}
+
+	if _, ok := parseReverseDNSName("not-a-reverse.example.com"); ok {
+		t.Fatal("普通域名不应被识别为反向域名")
+	}
+	if _, ok := parseReverseDNSName("999.0.0.10.in-addr.arpa"); ok {
+		t.Fatal("非法 IPv4 标签不应反解成功")
 	}
 }
 

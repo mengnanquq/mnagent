@@ -143,15 +143,71 @@ func IsBlockedProbeIP(ip net.IP) bool {
 		return true
 	}
 	if ip4 := ip.To4(); ip4 != nil {
-		// 100.64.0.0/10 (CGNAT) & 169.254.0.0/16 (Link-local / Cloud Metadata)
-		if ip4[0] == 100 && ip4[1] >= 64 && ip4[1] <= 127 {
+		return isBlockedIPv4(ip4)
+	}
+	ip16 := ip.To16()
+	if ip16 == nil {
+		return false
+	}
+	// IPv4 兼容地址 ::/96（::a.b.c.d）：Go 的 To4 不识别，但内核/部分库会把它当作 IPv4 使用。
+	// 只按内嵌 IPv4 判定，不能整段拦截：公网 IPv4 的兼容地址本身并不指向内网。
+	if isZeroIPBytes(ip16[:12]) {
+		return isBlockedIPv4(ip16[12:16])
+	}
+	// NAT64 知名前缀 64:ff9b::/96：解出低 32 位内嵌 IPv4 后递归判定。
+	// IPv6-only + NAT64 网络里所有公网 IPv4 都会表现为该前缀，整段拦截会误伤全部探测。
+	if ip16[0] == 0x00 && ip16[1] == 0x64 && ip16[2] == 0xff && ip16[3] == 0x9b {
+		if ip16[4] == 0x00 && ip16[5] == 0x01 { // 64:ff9b:1::/48 为本地使用前缀，保持整段拦截
 			return true
 		}
-		if ip4[0] == 169 && ip4[1] == 254 {
-			return true
+		if isZeroIPBytes(ip16[4:12]) { // 64:ff9b::/96
+			return isBlockedIPv4(ip16[12:16])
 		}
 	}
+	// 6to4 2002::/16：第 2-5 字节是内嵌 IPv4，按内嵌地址判定（2002::/16 本身不是内网）。
+	if ip16[0] == 0x20 && ip16[1] == 0x02 {
+		return isBlockedIPv4(ip16[2:6])
+	}
+	// Teredo 2001:0000::/32 的地址里是对端/客户端 IPv4 与端口，无法安全映射为单一目标，保持整段拦截。
+	// 注意只匹配 2001:0000::/32，普通的 2001:db8:: 等公网 IPv6 不受影响。
+	if ip16[0] == 0x20 && ip16[1] == 0x01 && ip16[2] == 0x00 && ip16[3] == 0x00 {
+		return true
+	}
 	return false
+}
+
+// isBlockedIPv4 判断 4 字节 IPv4 地址是否属于保留/内网/元数据网段。
+// IPv4 兼容地址、NAT64、6to4 的内嵌地址统一走这里，保证各入口判定一致。
+func isBlockedIPv4(ip4 net.IP) bool {
+	if len(ip4) < 4 {
+		return true
+	}
+	switch {
+	case ip4[0] == 0: // 0.0.0.0/8（“本网络”，常被解析成 0.x 绕过回环判断）
+		return true
+	case ip4[0] == 100 && ip4[1] >= 64 && ip4[1] <= 127: // 100.64.0.0/10 (CGNAT)
+		return true
+	case ip4[0] == 169 && ip4[1] == 254: // 169.254.0.0/16 (Link-local / Cloud Metadata)
+		return true
+	case ip4[0] == 192 && ip4[1] == 0 && ip4[2] == 0: // 192.0.0.0/24（IETF 协议分配）
+		return true
+	case ip4[0] == 198 && (ip4[1] == 18 || ip4[1] == 19): // 198.18.0.0/15（基准测试保留）
+		return true
+	case ip4[0] >= 240: // 240.0.0.0/4（含 255.255.255.255 广播）
+		return true
+	}
+	// 复用标准库判定回环/私有/链路本地（内嵌地址同样适用）。
+	return net.IP(ip4).IsLoopback() || net.IP(ip4).IsPrivate() || net.IP(ip4).IsLinkLocalUnicast()
+}
+
+// isZeroIPBytes 判断字节切片是否全为 0。
+func isZeroIPBytes(b []byte) bool {
+	for _, v := range b {
+		if v != 0 {
+			return false
+		}
+	}
+	return true
 }
 
 // runProbe 执行一次进程内探针。这些探针不依赖任何外部二进制，
@@ -823,6 +879,95 @@ func collapseWhitespace(s string, limit int) string {
 
 // ---------- dns ----------
 
+// privateDNSNameSuffixes 是不应通过 DNS 探针查询的内网保留后缀。
+var privateDNSNameSuffixes = []string{
+	".local", ".localhost", ".internal", ".intranet", ".lan",
+	".home", ".home.arpa", ".corp", ".localdomain",
+}
+
+// parseReverseDNSName 把 in-addr.arpa / ip6.arpa 反向域名还原为 IP。
+// 返回 false 表示不是合法的反向域名（标签数量或取值不合法）。
+func parseReverseDNSName(name string) (net.IP, bool) {
+	name = strings.TrimSuffix(strings.ToLower(strings.TrimSpace(name)), ".")
+	switch {
+	case strings.HasSuffix(name, ".in-addr.arpa"):
+		labels := strings.Split(strings.TrimSuffix(name, ".in-addr.arpa"), ".")
+		if len(labels) != 4 {
+			return nil, false
+		}
+		octets := make(net.IP, 4)
+		for i, label := range labels {
+			n, err := strconv.Atoi(label)
+			if err != nil || n < 0 || n > 255 {
+				return nil, false
+			}
+			octets[3-i] = byte(n)
+		}
+		return octets, true
+	case strings.HasSuffix(name, ".ip6.arpa"):
+		labels := strings.Split(strings.TrimSuffix(name, ".ip6.arpa"), ".")
+		if len(labels) != 32 {
+			return nil, false
+		}
+		ip := make(net.IP, 16)
+		for i := range ip {
+			hi, okHi := parseHexNibble(labels[31-2*i])
+			lo, okLo := parseHexNibble(labels[30-2*i])
+			if !okHi || !okLo {
+				return nil, false
+			}
+			ip[i] = hi<<4 | lo
+		}
+		return ip, true
+	}
+	return nil, false
+}
+
+// parseHexNibble 解析单个十六进制字符。
+func parseHexNibble(s string) (byte, bool) {
+	if len(s) != 1 {
+		return 0, false
+	}
+	switch c := s[0]; {
+	case c >= '0' && c <= '9':
+		return c - '0', true
+	case c >= 'a' && c <= 'f':
+		return c - 'a' + 10, true
+	default:
+		return 0, false
+	}
+}
+
+// validateDNSQueryName 在 allowPrivate=false 时做名称级 SSRF 校验：
+// 拒绝单标签名、内网保留后缀，以及指向私网/元数据地址的反向解析域名。
+// 对 CNAME/MX/NS/TXT 只检查名称本身，不要求能解析出 A 记录。
+func validateDNSQueryName(host string) error {
+	name := strings.TrimSuffix(strings.ToLower(strings.TrimSpace(host)), ".")
+	if net.ParseIP(name) != nil {
+		// 字面 IP 的私网判定由调用方完成；公网 IPv6 字面量没有点，不能按单标签拒绝。
+		return nil
+	}
+	if strings.HasSuffix(name, ".in-addr.arpa") || strings.HasSuffix(name, ".ip6.arpa") {
+		ip, ok := parseReverseDNSName(name)
+		if !ok {
+			return fmt.Errorf("安全策略拦截：无法识别的反向解析域名 (%s)", host)
+		}
+		if IsBlockedProbeIP(ip) {
+			return fmt.Errorf("安全策略拦截：禁止查询私有或云元数据地址的反向解析 (%s)", ip.String())
+		}
+		return nil
+	}
+	if !strings.Contains(name, ".") {
+		return fmt.Errorf("安全策略拦截：禁止查询单标签域名 (%s)", host)
+	}
+	for _, suffix := range privateDNSNameSuffixes {
+		if name == strings.TrimPrefix(suffix, ".") || strings.HasSuffix(name, suffix) {
+			return fmt.Errorf("安全策略拦截：禁止查询内网保留域名 (%s)", host)
+		}
+	}
+	return nil
+}
+
 // dnsProbe 用主机自身的解析器查询记录，便于对比不同地域/线路的解析结果。
 // allowPrivate=false 时与其他探针保持一致的 fail-closed 策略：查询目标本身是私网/元数据
 // 地址、或 A/AAAA/ALL 结果中出现这类地址时直接拒绝，不返回任何记录。
@@ -836,6 +981,9 @@ func DNSProbe(ctx context.Context, job model.Job, allowPrivate bool) (DNSReport,
 	if !allowPrivate {
 		if ip := net.ParseIP(host); ip != nil && IsBlockedProbeIP(ip) {
 			return DNSReport{}, fmt.Errorf("安全策略拦截：禁止查询私有或云元数据地址 (%s)", ip.String())
+		}
+		if err := validateDNSQueryName(host); err != nil {
+			return DNSReport{}, err
 		}
 	}
 	recordType := strings.ToUpper(strings.TrimSpace(job.Query))
