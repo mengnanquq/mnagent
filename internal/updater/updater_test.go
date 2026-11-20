@@ -1032,6 +1032,51 @@ func TestUpdaterNoProxyWarnsSHA256Only(t *testing.T) {
 
 // TestDownloadAndReplaceRejectsOversizedBinary 验证下载体积超过上限时中止更新，
 // 原二进制不变，且临时文件被清理。
+func TestDownloadAndReplaceRejectsOversizedBinary(t *testing.T) {
+	oldLimit := maxBinaryBytes
+	maxBinaryBytes = 2048
+	defer func() { maxBinaryBytes = oldLimit }()
+
+	body := bytes.Repeat([]byte("A"), int(maxBinaryBytes)+1)
+	checksum := fmt.Sprintf("%x  mnagent_linux_amd64\n", sha256.Sum256(body))
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if strings.HasSuffix(r.URL.Path, ".sha256") {
+			_, _ = w.Write([]byte(checksum))
+			return
+		}
+		_, _ = w.Write(body)
+	}))
+	defer ts.Close()
+
+	dir := t.TempDir()
+	exe := filepath.Join(dir, "mnagent")
+	if err := os.WriteFile(exe, []byte("old-bin"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	u := New(Config{
+		CurrentVersion: "v0.1.7",
+		Repo:           "owner/repo",
+		Platform:       "linux",
+		Arch:           "amd64",
+		DownloadClient: ts.Client(),
+		Executable:     exe,
+	})
+	u.URLForFunc = func(version string) string { return ts.URL + "/d/" + version + "/" + u.AssetName() }
+	u.ChecksumURLFunc = func(version string) string { return ts.URL + "/d/" + version + "/" + u.AssetName() + ".sha256" }
+	u.verifyBinary = func(string, string) error { return nil }
+
+	if _, err := u.DownloadAndReplace("v0.1.8"); err == nil || !strings.Contains(err.Error(), "上限") {
+		t.Fatalf("超过体积上限应中止更新，实际 err=%v", err)
+	}
+	if got, _ := os.ReadFile(exe); string(got) != "old-bin" {
+		t.Fatalf("超过体积上限时不得替换二进制: %q", string(got))
+	}
+	if leftovers, _ := filepath.Glob(filepath.Join(dir, "mnagent-upd-*")); len(leftovers) != 0 {
+		t.Fatalf("超限下载后应删除临时文件，仍残留: %v", leftovers)
+	}
+}
+
+// TestSkipStateDirPermission 验证跳过版本的状态目录以 0700 创建（不再使用 0755）。
 func TestUpdaterCheckAllowsProxy(t *testing.T) {
 	var hits atomic.Int32
 	proxy := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {

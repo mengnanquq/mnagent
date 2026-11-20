@@ -37,6 +37,10 @@ const (
 	minBinaryBytes         = 1024 // 校验下载内容不是 404 HTML 或空文件。
 )
 
+// maxBinaryBytes 限制单次更新下载的二进制体积（128MB）。
+// 变量而非常量，便于测试缩短；生产环境保持 128MB。
+var maxBinaryBytes int64 = 128 << 20
+
 // Version 是默认版本号（未指定时使用）。
 var Version = "dev"
 
@@ -681,9 +685,12 @@ func (u *Updater) downloadTo(targetURL string, w io.Writer) error {
 		return fmt.Errorf("HTTP %d", resp.StatusCode)
 	}
 
-	n, err := io.Copy(w, resp.Body)
+	n, err := io.Copy(w, io.LimitReader(resp.Body, maxBinaryBytes+1))
 	if err != nil {
 		return err
+	}
+	if n > maxBinaryBytes {
+		return fmt.Errorf("下载的文件超过体积上限（%d MB），已中止更新", maxBinaryBytes>>20)
 	}
 	if n < minBinaryBytes {
 		return fmt.Errorf("下载的文件过小（%d 字节），可能非有效二进制", n)
