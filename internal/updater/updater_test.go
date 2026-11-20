@@ -1077,6 +1077,26 @@ func TestDownloadAndReplaceRejectsOversizedBinary(t *testing.T) {
 }
 
 // TestSkipStateDirPermission 验证跳过版本的状态目录以 0700 创建（不再使用 0755）。
+func TestSkipStateDirPermission(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("Windows 不适用 POSIX 权限")
+	}
+	dir := filepath.Join(t.TempDir(), "state", "nested")
+	u := &Updater{SkipFile: filepath.Join(dir, "skip-versions")}
+	if err := u.Skip("v0.1.8", time.Hour); err != nil {
+		t.Fatal(err)
+	}
+	fi, err := os.Stat(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if perm := fi.Mode().Perm(); perm != 0o700 {
+		t.Fatalf("状态目录权限 = %04o，期望 0700", perm)
+	}
+}
+
+// TestUpdaterCheckAllowsProxy 验证配置代理时 Check 不被拒绝：
+// 版本号可以经代理获取（完整性由后续直连 .sha256 与 -version 自检兜底）。
 func TestUpdaterCheckAllowsProxy(t *testing.T) {
 	var hits atomic.Int32
 	proxy := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -1114,3 +1134,26 @@ func TestUpdaterCheckAllowsProxy(t *testing.T) {
 }
 
 // TestSkipTightensExistingStateDir 验证 MkdirAll 遇到已存在的宽权限目录时会收紧到 0700。
+func TestSkipTightensExistingStateDir(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("Windows 不适用 POSIX 权限")
+	}
+	dir := filepath.Join(t.TempDir(), "state")
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chmod(dir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	u := &Updater{SkipFile: filepath.Join(dir, "skip-versions"), logger: &recordingLogger{}}
+	if err := u.Skip("v0.1.8", time.Hour); err != nil {
+		t.Fatal(err)
+	}
+	fi, err := os.Stat(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if perm := fi.Mode().Perm(); perm != 0o700 {
+		t.Fatalf("已存在的状态目录权限 = %04o，期望收紧到 0700", perm)
+	}
+}

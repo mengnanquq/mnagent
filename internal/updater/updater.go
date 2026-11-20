@@ -737,9 +737,10 @@ func (u *Updater) Skip(version string, forDur time.Duration) error {
 	exp := time.Now().Add(forDur).Format(time.RFC3339)
 	line := fmt.Sprintf("%s %s\n", version, exp)
 
-	if err := os.MkdirAll(filepath.Dir(u.SkipFile), 0o755); err != nil {
+	if err := os.MkdirAll(filepath.Dir(u.SkipFile), 0o700); err != nil {
 		return err
 	}
+	u.tightenStateDirPerm(filepath.Dir(u.SkipFile))
 	f, err := os.OpenFile(u.SkipFile, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0o600)
 	if err != nil {
 		return err
@@ -747,6 +748,25 @@ func (u *Updater) Skip(version string, forDur time.Duration) error {
 	defer f.Close()
 	_, err = f.WriteString(line)
 	return err
+}
+
+// tightenStateDirPerm 把已存在的状态目录收紧到 0700。
+// MkdirAll 不会修改已存在目录的权限，旧版本或手工创建可能留下 0755；
+// 只有在当前进程是属主时 chmod 才会成功（非属主失败时保留原状，由 statedir 的启动校验拒绝）。
+func (u *Updater) tightenStateDirPerm(dir string) {
+	if runtime.GOOS == "windows" {
+		return
+	}
+	fi, err := os.Stat(dir)
+	if err != nil || !fi.IsDir() {
+		return
+	}
+	if fi.Mode().Perm()&0o077 == 0 {
+		return
+	}
+	if err := os.Chmod(dir, 0o700); err != nil {
+		u.warn("状态目录权限过宽且无法收紧到 0700，请手动执行 chmod 0700", "dir", dir, "error", err)
+	}
 }
 
 // DetectPlatformArch 探测当前系统与架构对应的 Release 命名。

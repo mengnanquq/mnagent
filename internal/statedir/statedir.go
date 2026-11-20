@@ -89,6 +89,9 @@ func ensurePrivate(dir string) error {
 		}
 		return err
 	}
+	// MkdirAll 不会修改已存在目录的权限；旧版本或手工创建可能留下 0755。
+	// 仅在属主是当前用户且权限更宽时收紧，失败只告警，不阻止使用。
+	tightenDirPerm(dir, fi)
 	// 确认当前进程确实能在其中写文件
 	f, err := os.CreateTemp(dir, ".probe-*")
 	if err != nil {
@@ -98,4 +101,22 @@ func ensurePrivate(dir string) error {
 	_ = f.Close()
 	_ = os.Remove(name)
 	return nil
+}
+
+// tightenDirPerm 把已存在且属主为当前用户的状态目录权限收紧到 0700。
+// 非当前用户拥有的目录不做修改（checkDirOwner 允许 root 拥有，但当前进程无权重置）。
+// 失败只告警，不中断状态目录的使用。
+func tightenDirPerm(dir string, fi os.FileInfo) {
+	if runtime.GOOS == "windows" {
+		return
+	}
+	if fi.Mode().Perm()&0o077 == 0 {
+		return
+	}
+	if !isCurrentUserOwner(fi) {
+		return
+	}
+	if err := os.Chmod(dir, 0o700); err != nil {
+		warnf("状态目录权限过宽且无法收紧到 0700，请手动执行 chmod 0700 %q：%v", dir, err)
+	}
 }

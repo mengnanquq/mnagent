@@ -119,6 +119,7 @@ usage() {
   GH_PROXY=<url>                          GitHub 代理前缀（如 https://gh-proxy.com/）
   MNAGENT_TOKEN=<token>                   接入令牌（避免出现在 argv；与 --token-file 二选一）
   MNAGENT_TOKEN_FILE=<path>              默认令牌文件路径（默认 /etc/mnagent/token；一般无需设置）
+  MNAGENT_STATE_DIR=<dir>                 procd/非 systemd 路径使用的状态目录（默认 /var/lib/mnagent）
 EOF
 }
 
@@ -500,6 +501,21 @@ make_dir() {
 		chown "$3:$4" "$1" 2>/dev/null || true
 	fi
 	chmod "$2" "$1"
+}
+
+# prepare_state_dir：确保状态目录（updater 的跳过版本记录等）只对服务用户开放。
+# systemd 由 StateDirectoryMode=0700 保证；procd/无 init 系统需要这里显式创建并收紧，
+# 与 internal/statedir 的 0700/属主校验保持一致。
+prepare_state_dir() {
+	# 默认与 systemd StateDirectory 一致；测试/非标准部署可用 MNAGENT_STATE_DIR 覆盖。
+	state_dir_path="${MNAGENT_STATE_DIR:-/var/lib/mnagent}"
+	if mkdir -p "$state_dir_path" 2>/dev/null; then
+		chown "$RUN_USER:$RUN_GROUP" "$state_dir_path" 2>/dev/null || true
+		chmod 0700 "$state_dir_path" 2>/dev/null \
+			|| warn "无法把状态目录 ${state_dir_path} 设为 0700，请手动执行：chmod 0700 ${state_dir_path}"
+	else
+		warn "无法创建状态目录 ${state_dir_path}：更新记录会退化到用户缓存目录"
+	fi
 }
 
 # ---------- 卸载 ----------
@@ -1088,6 +1104,8 @@ ExecStart="$PREFIX/mnagent" -bot "$BOT_URL" -token-file "$TOKEN_FILE" -nexttrace
 	# nexttrace 需要可写的主目录来存放配置与 IP 库；ProtectSystem=strict 下只有
 	# StateDirectory 指向的目录可写。
 	StateDirectory=mnagent
+	# 跳过版本/依赖状态等文件只允许服务用户访问（与 internal/statedir 的校验一致）。
+	StateDirectoryMode=0700
 	Environment=HOME=/var/lib/mnagent
 	ReadWritePaths=$PREFIX
 	Restart=always
@@ -1189,9 +1207,11 @@ case "$PLATFORM" in
 	openwrt)
 		log "写入 procd 服务 $INIT_DIR/$SERVICE_NAME"
 		install_procd_init
+		prepare_state_dir
 		;;
 	*)
 		warn "未检测到 systemd 或 OpenWrt(procd)：已安装二进制，请自行守护运行"
+		prepare_state_dir
 		printf '    "%s/mnagent" -bot "%s" -token-file "%s" -nexttrace "%s"%s\n' \
 			"$PREFIX" "$BOT_URL" "$TOKEN_FILE" "$NEXTTRACE_EXEC" "$AUTO_UPDATE_ARGS" >&2
 		if [ -n "$NEXTTRACE_PATH" ] && command -v setcap >/dev/null 2>&1; then

@@ -42,3 +42,8 @@ func checkDirOwner(dir string, _ os.FileInfo) error {
 	}
 	return fmt.Errorf("%s 属主既不是 SYSTEM / Administrators 也不是当前用户，拒绝使用", dir)
 }
+
+// isCurrentUserOwner 在 Windows 上不使用 POSIX 权限位，无需收紧目录权限。
+func isCurrentUserOwner(os.FileInfo) bool {
+	return false
+}

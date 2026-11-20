@@ -23,3 +23,9 @@ func checkDirOwner(dir string, fi os.FileInfo) error {
 	}
 	return nil
 }
+
+// isCurrentUserOwner 判断目录属主是否为当前进程用户。
+func isCurrentUserOwner(fi os.FileInfo) bool {
+	st, ok := fi.Sys().(*syscall.Stat_t)
+	return ok && int(st.Uid) == os.Geteuid()
+}

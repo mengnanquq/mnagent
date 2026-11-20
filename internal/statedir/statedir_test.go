@@ -76,3 +76,28 @@ func TestEnsurePrivateChecksOwner(t *testing.T) {
 		t.Fatalf("其他用户拥有的目录应被拒绝，实际 err=%v", err)
 	}
 }
+
+// TestEnsurePrivateTightensWidePermissions 验证已存在且属主为当前用户的宽权限目录
+// 会收紧到 0700（MkdirAll 不会修改已存在目录的权限）。
+func TestEnsurePrivateTightensWidePermissions(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("Windows 不适用 POSIX 权限")
+	}
+	dir := filepath.Join(t.TempDir(), "wide")
+	if err := os.Mkdir(dir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chmod(dir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := ensurePrivate(dir); err != nil {
+		t.Fatalf("当前用户拥有的宽权限目录应可用（仅告警并收紧）：%v", err)
+	}
+	fi, err := os.Stat(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if perm := fi.Mode().Perm(); perm != 0o700 {
+		t.Fatalf("状态目录权限 = %04o，期望收紧到 0700", perm)
+	}
+}
