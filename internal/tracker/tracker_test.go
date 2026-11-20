@@ -1,9 +1,14 @@
 package tracker
 
 import (
+	"bytes"
 	"context"
+	"fmt"
+	"log/slog"
+	"strings"
 	"sync"
 	"testing"
+	"time"
 )
 
 func TestJobTracker(t *testing.T) {
@@ -59,6 +64,56 @@ func TestJobTracker(t *testing.T) {
 	trk.Register("j3", cancel3)
 	if ctx3.Err() == nil {
 		t.Fatal("已标记取消的任务在 Register 时应立即触发取消")
+	}
+}
+
+// TestTrackerCancelledMapBounded 验证取消标记有容量上限，超限时淘汰最早的条目。
+func TestTrackerCancelledMapBounded(t *testing.T) {
+	trk := New()
+	base := time.Now().Add(time.Hour)
+	trk.mu.Lock()
+	for i := 0; i < maxCancelledEntries; i++ {
+		trk.cancelled[fmt.Sprintf("old-%d", i)] = base.Add(time.Duration(i) * time.Second)
+	}
+	trk.mu.Unlock()
+
+	trk.Cancel("new-job")
+	trk.mu.Lock()
+	defer trk.mu.Unlock()
+	if got := len(trk.cancelled); got != maxCancelledEntries {
+		t.Fatalf("取消标记数量 = %d，期望上限 %d", got, maxCancelledEntries)
+	}
+	if _, ok := trk.cancelled["old-0"]; ok {
+		t.Fatal("超限时应淘汰最早过期的条目 old-0")
+	}
+	if _, ok := trk.cancelled["old-1"]; !ok {
+		t.Fatal("只应淘汰最旧条目，old-1 不应被淘汰")
+	}
+	if _, ok := trk.cancelled["new-job"]; !ok {
+		t.Fatal("新取消标记应保留")
+	}
+}
+
+// TestTrackerEvictionLogsWarning 验证取消标记达到容量上限而淘汰仍在有效期内的条目时，
+// 会打出可排查的 Warn 日志（否则任务取消突然“失效”将无从定位）。
+func TestTrackerEvictionLogsWarning(t *testing.T) {
+	var buf bytes.Buffer
+	old := slog.Default()
+	slog.SetDefault(slog.New(slog.NewTextHandler(&buf, &slog.HandlerOptions{Level: slog.LevelWarn})))
+	defer slog.SetDefault(old)
+
+	trk := New()
+	base := time.Now().Add(time.Hour)
+	trk.mu.Lock()
+	for i := 0; i < maxCancelledEntries; i++ {
+		trk.cancelled[fmt.Sprintf("old-%d", i)] = base.Add(time.Duration(i) * time.Second)
+	}
+	trk.mu.Unlock()
+
+	trk.Cancel("new-job")
+	logged := buf.String()
+	if !strings.Contains(logged, "level=WARN") || !strings.Contains(logged, "old-0") {
+		t.Fatalf("淘汰有效期内的取消标记时应打印包含被淘汰 ID 的 Warn 日志，实际：%q", logged)
 	}
 }
 
