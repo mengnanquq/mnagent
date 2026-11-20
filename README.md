@@ -52,7 +52,7 @@ Remove-Item Env:MNAGENT_TOKEN
 > **⚠️ gh-proxy 信任说明**：
 > - 使用 `--gh-proxy` 安装时，二进制仍可经代理下载，但 `.sha256` 校验文件默认**不经 gh-proxy 镜像获取（仍遵循系统 `HTTPS_PROXY` 环境变量）**；获取失败会中止安装并提示。只有在确认代理可信时，才可用 `--insecure-proxy-checksum`（Windows 为 `-InsecureProxyChecksum`）允许经代理获取校验文件。
 > - Agent 自动更新（v0.4.2 起）的校验值按「服务端代取 → 直连 `.sha256` → 直连 API digest」三级获取：服务端代取只尝试一次（10 秒超时），成功后还会用 5 秒窗口单次直连 `.sha256` 交叉校验，两者不一致立即中止更新（fail-closed）；直连失败时直接采用服务端返回的值。配置 `-gh-proxy` 时，直连 `.sha256` 仍**不经 gh-proxy 镜像获取（仍遵循系统 `HTTPS_PROXY` 环境变量）**（二进制仍走代理），获取校验文件失败即拒绝更新。
-> - 依赖（nexttrace/miaospeed）的 SHA-256 摘要同样优先由服务端代取（只尝试一次，不做交叉校验，因为上游未发布 `.sha256`）；失败后回退到直连 `github.com` 的 `<资产>.sha256` 或直连 `api.github.com` 的 asset digest，两个直连来源各自重试（指数退避 + 抖动），失败信息会列出尝试过的来源与次数。
+> - 依赖（nexttrace/miaospeed，v0.4.3 起）**不做 SHA-256 校验**：上游未发布 `.sha256`，只经 HTTPS（可经 gh-proxy）下载，并在替换前执行 `-V` / `-version` 自检确认可执行且版本匹配，自检失败即中止替换。
 > - 为避免离线/被墙时长时间挂起，安装脚本中校验文件的直连尝试限时 30 秒（`curl --connect-timeout 5 --max-time 30` / `wget --timeout=30 --tries=2`），失败提示会区分 404 与网络不可达。
 >
 > **订阅拉取不使用环境代理**：miaospeed 订阅与进程内探针的 HTTP 客户端均显式设置 `Proxy: nil`，不会读取 `HTTP_PROXY` / `HTTPS_PROXY`。这是为了避免代理自行解析目标地址、绕过按解析 IP 做的 SSRF 校验；如需经代理拉取订阅，请改用服务端中转或本地自定义方案，而不是设置环境代理。
@@ -63,17 +63,19 @@ Remove-Item Env:MNAGENT_TOKEN
 
 ## 🔐 更新校验
 
-所有更新与安装仅做 SHA-256 校验。Agent 自身更新（v0.4.2 起）的校验值按以下顺序获取：
+SHA-256 校验只用于 **mnagent 自身更新**与安装脚本对 mnagent 二进制的校验。依赖 nexttrace/miaospeed **不做** SHA-256 校验，仅经 HTTPS 下载并通过 `-V` / `-version` 自检。Agent 自身更新（v0.4.2 起）的校验值按以下顺序获取：
 
 1. **服务端代取（首选）**：请求 `-bot` 服务端的 `/agent/release-digest`，由部署在海外、可稳定访问 GitHub 的服务端代为获取；令牌走 `Authorization` 头，只尝试一次，超时 10 秒。成功后还会用 5 秒窗口单次直连 `<资产>.sha256` 做交叉校验：两侧都拿到合法值且不一致时立即中止更新（fail-closed，疑似篡改或上游重新上传了资产），**不会**再回退到其他来源；直连失败、超时或格式非法时放行，直接使用服务端返回的值。
 2. **直连 `.sha256`**：直连 `github.com` 下载 `<资产>.sha256`，失败按指数退避重试 3 次。
 3. **直连 API digest**：直连 `api.github.com` 读取 Release 附件的 `digest` 字段，同样重试 3 次。
 
-服务端代取失败（任何非 200 响应、网络错误、缺少令牌等）只记录 Debug 日志并静默回退到直连来源，同时计入最终错误摘要；三个来源共用 75 秒的整体预算（含交叉校验），不会把各来源的超时与重试层层叠加，三个来源都失败时中止更新，并在错误中明确写出「整体校验值获取预算（75s）已用尽」。配置 `gh-proxy` 时，直连 `.sha256` 与 API 仍不经 gh-proxy 镜像（遵循系统 `HTTPS_PROXY` 环境变量），获取失败即拒绝更新或安装。
+服务端代取失败（任何非 200 响应、网络错误、缺少令牌等）只记录 Debug 日志并静默回退到直连来源，同时计入最终错误摘要；三个来源共用 75 秒的整体预算（含交叉校验），不会把各来源的超时与重试层层叠加，三个来源都失败时中止更新，并在错误中明确写出「整体校验值获取预算（75s）已用尽」。配置 `gh-proxy` 时，直连 `.sha256` 与 API 仍不经 gh-proxy 镜像（遵循系统 `HTTPS_PROXY` 环境变量），获取失败即拒绝更新。
 
-`-bot` 为公网 `http://` 地址时（即使加了 `-allow-insecure-http`），服务端代取会被禁用（启动时输出 WARN），只使用直连来源；`-no-bot-checksum` 可显式禁用服务端代取。依赖（nexttrace/miaospeed）同样优先走服务端代取，但**不做**交叉校验（上游未发布 `.sha256`），失败后回退原有的两个直连来源。
+依赖（nexttrace/miaospeed）不参与上述校验链：不请求服务端代取、不下载 `<资产>.sha256`、也不读取 `api.github.com` 的 digest。安装时仅要求 HTTPS 传输，下载后执行 `-V`（nexttrace）/ `-version`（miaospeed）自检，确认二进制可执行且版本匹配后才原子替换；自检失败绝不落盘。解压与下载体积上限、空闲超时、失败冷却与单飞（并发只安装一次）等保护仍然生效。
 
-**CLI 路径同样启用服务端代取**：`-check-update` / `-apply-update` / `-probe-target` / `-diag-job` 带上 `-bot` 时，会按与常驻模式一致的顺序（`-token` > `MNAGENT_TOKEN` > `-token-file`/默认令牌文件）读取令牌并启用代取；读取不到令牌时**静默忽略**（退出码不受影响），只走直连来源。`-diag` 也会展示令牌来源与状态。
+`-bot` 为公网 `http://` 地址时（即使加了 `-allow-insecure-http`），服务端代取会被禁用（启动时输出 WARN），只使用直连来源；`-no-bot-checksum` 可显式禁用服务端代取。依赖（nexttrace/miaospeed）自 v0.4.3 起完全不做 SHA-256 校验，见上。
+
+**CLI 路径的服务端代取只用于 Agent 自身更新**：`-apply-update` 带上 `-bot` 时，会按与常驻模式一致的顺序（`-token` > `MNAGENT_TOKEN` > `-token-file`/默认令牌文件）读取令牌并启用代取；读取不到令牌时**静默忽略**（退出码不受影响），只走直连来源。`-check-update` 只查询版本；`-probe-target` / `-diag-job` 只执行探针/测速任务，依赖下载不做 SHA-256 校验，因此都不会请求代取摘要。`-diag` 也会展示令牌来源与状态。
 
 ### ⏱️ 升级与下载时间预算
 
@@ -82,7 +84,7 @@ Remove-Item Env:MNAGENT_TOKEN
 | 服务端代取校验值（单次） | 10s | 静默回退直连来源 |
 | 代取成功后的交叉校验（单次） | 5s | 放行并使用服务端返回的值 |
 | 校验值获取（代取 + 直连 `.sha256` + API 兜底） | 整体 75s | 中止更新，错误中说明整体预算已用尽 |
-| 摘要 / API 等小请求（单个 HTTP 客户端） | 20s | 按来源重试或回退 |
+| 版本查询 / 自身更新校验的小请求（单个 HTTP 客户端） | 20s | 按来源重试或回退 |
 | 依赖归档 / 二进制下载 | 无整体超时；连接/TLS 10s、响应头 20s、连续 30s 无数据中止，另受调用方 ctx 约束 | 下载失败；由所在路径决定是否写冷却 |
 | 启动补齐 / 定期检查 / 运行时安装 | 单个依赖宽松整体 5m | 自身预算耗尽会写 5 分钟失败冷却，避免每轮重试重复下载；调用方主动取消不写冷却 |
 | CLI 依赖更新（`-apply-update`） | 单个依赖宽松整体 5m | 直接报错退出（进程结束，不涉及冷却） |
@@ -145,11 +147,12 @@ mnagent -apply-update latest         # 立即升级到最新版本并平滑重�
 
 ---
 
-## 📝 行为变更（v0.4.2）
+## 📝 行为变更（v0.4.3）
 
 与升级相关、会影响已有部署的实际行为调整：
 
-- **服务端代取 SHA-256（v0.4.2）**：Agent 自身更新与依赖安装的校验值改为优先由 `-bot` 服务端代取（`GET /agent/release-digest`），服务端不可用或返回非 200 时静默回退到直连来源。Agent 自身更新在代取成功后会额外用一次直连 `.sha256` 交叉校验，不一致立即中止（fail-closed）且不再走 API 兜底；依赖路径不做交叉校验。旧服务端（不认识该接口，返回 404）不会影响新探针，只会回退到直连。`-check-update` / `-apply-update` / `-probe-target` / `-diag-job` 等 CLI 路径带 `-bot` 与令牌时同样启用代取；缺少令牌时静默忽略，不会导致 CLI 报错退出。
+- **依赖不再做 SHA-256 校验（v0.4.3）**：`nexttrace` / `miaospeed` 的下载与安装不再获取或比对任何 SHA-256——服务端代取、`<资产>.sha256`、`api.github.com` 的 asset digest 三条路径全部移除。依赖只经 HTTPS（可经 `-gh-proxy`）下载，并通过下载后的 `-V` / `-version` 自检（可执行、版本匹配）后才原子替换；自检失败即中止，不覆盖已有二进制。**mnagent 自身更新（含服务端代取、直连 `.sha256`、API digest 与交叉校验）以及 `install.sh` / `install.ps1` 对 mnagent 二进制的 `.sha256` 校验完全不变**。运行时自动安装与 CLI 探针/诊断不再向依赖管理器注入服务端代取客户端，`/agent/release-digest` 只服务 Agent 自身更新；服务端接口白名单保持现状（仍包含这两个仓库，不影响功能）。
+- **服务端代取 SHA-256（v0.4.2）**：Agent 自身更新的校验值改为优先由 `-bot` 服务端代取（`GET /agent/release-digest`），服务端不可用或返回非 200 时静默回退到直连来源。Agent 自身更新在代取成功后会额外用一次直连 `.sha256` 交叉校验，不一致立即中止（fail-closed）且不再走 API 兜底。旧服务端（不认识该接口，返回 404）不会影响新探针，只会回退到直连。`-apply-update` 等 CLI 路径带 `-bot` 与令牌时同样启用代取；缺少令牌时静默忽略，不会导致 CLI 报错退出。
 - **新增 `-no-bot-checksum`（v0.4.2）**：显式禁用服务端代取校验值。`-bot` 为公网明文 HTTP 地址时默认就禁用（启动日志输出 WARN），即使同时加了 `-allow-insecure-http`；回环/内网 HTTP 与 HTTPS 端点默认启用。
 - **旧节点升级说明（v0.4.2）**：v0.4.0 运行的旧探针没有代取逻辑，无法使用服务端提供的哈希；升级途径与以前一致：设置 `HTTPS_PROXY` 让直连 `github.com`/`api.github.com` 走可达代理、在 `-check-update`/`-apply-update` 失败时多次重试，或执行 `install.sh --binary <gh-proxy 地址> --sha256 <核对过的哈希>` 直接安装（Windows 为 `install.ps1 -Binary ... -Sha256 ...`）。升级到 v0.4.2 后即可享受服务端代取。
 
