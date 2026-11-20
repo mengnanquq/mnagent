@@ -1,10 +1,6 @@
 package miaospeed
 
 import (
-	"github.com/mengnanquq/mnagent/internal/dep"
-	"github.com/mengnanquq/mnagent/internal/model"
-	"github.com/mengnanquq/mnagent/internal/process"
-
 	"bytes"
 	"context"
 	"crypto/rand"
@@ -24,6 +20,10 @@ import (
 	"time"
 
 	"golang.org/x/net/websocket"
+
+	"github.com/mengnanquq/mnagent/internal/dep"
+	"github.com/mengnanquq/mnagent/internal/model"
+	"github.com/mengnanquq/mnagent/internal/process"
 )
 
 // 常量定义：MiaoSpeed 任务类型与官方通用构建凭证。
@@ -251,21 +251,24 @@ func RunJob(ctx context.Context, binary, ghProxy string, job model.Job, log Logg
 		return "", nil, fmt.Errorf("解析测速目标失败: %s", redactProxyError(err.Error(), job.Target))
 	}
 
-	if !allowPriv {
-		var removed int
-		allNodes, removed = filterBlockedNodes(ctx, allNodes)
-		if removed > 0 && log != nil {
-			log.Warn("已剔除存在安全风险的节点（私有/保留/元数据地址或域名无法解析）", "removed", removed, "kept", len(allNodes))
+	// 节点安全闸门始终执行：-allow-private-probes 只关闭“IP 是否落在私网/保留段”
+	// 这一步，协议白名单、payload 结构、禁止字段与钉死照常生效（参见 nodeFilterPolicy）。
+	allNodes, removed := filterBlockedNodesWithPolicy(ctx, allNodes, nodeFilterPolicy{AllowPrivate: allowPriv}, log)
+	if removed > 0 && log != nil {
+		log.Warn("已剔除存在安全风险的节点（私有/保留/元数据地址、域名无法解析、协议不在白名单或节点配置无法安全改写）", "removed", removed, "kept", len(allNodes), "allow_private", allowPriv)
+	}
+	if len(allNodes) == 0 {
+		if allowPriv {
+			return "", nil, fmt.Errorf("安全拦截：全部 %d 个节点均未通过节点安全检查（协议不在白名单、节点配置无法安全改写，或服务器地址无法解析），已拒绝测速（已剔除 %d 个）", removed, removed)
 		}
-		if len(allNodes) == 0 {
-			return "", nil, fmt.Errorf("安全拦截：全部 %d 个节点的服务器地址均指向私有内网、保留或云元数据地址，或域名无法解析，已拒绝测速（已剔除 %d 个）", removed, removed)
-		}
+		return "", nil, fmt.Errorf("安全拦截：全部 %d 个节点的服务器地址均指向私有内网、保留或云元数据地址，或域名无法解析/协议不在白名单/节点配置无法安全改写，已拒绝测速（已剔除 %d 个）", removed, removed)
 	}
 
 	totalNodes := len(allNodes)
 	nodes := selectJobNodes(allNodes, job.Count)
-	// totalNodes 保持截断前的原始总数：报告里 TotalNodes 与实测结果数可不同，
-	// 机器人据此展示“已测 M 个 / 订阅共 N 个”，无需新增协议字段。
+	// totalNodes 是 selectJobNodes 截断前的总数（已过安全闸门与候选上限 maxNodeFilterCandidates）：
+	// 报告里 TotalNodes 与实测结果数可不同，机器人据此展示“已测 M 个 / 订阅共 N 个”，
+	// 无需新增协议字段。
 	if totalNodes > maxMiaospeedNodes && log != nil {
 		log.Warn("测速节点数超过上限，已截断", "total", totalNodes, "limit", maxMiaospeedNodes, "selected", len(nodes))
 	}

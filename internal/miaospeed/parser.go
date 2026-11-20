@@ -14,7 +14,6 @@ import (
 	"strconv"
 	"strings"
 	"time"
-	"unicode"
 	"unicode/utf8"
 
 	"github.com/mengnanquq/mnagent/internal/model"
@@ -130,6 +129,12 @@ func parseProxyContent(content string) ([]MiaospeedNode, error) {
 		server := ""
 		port := ""
 		for _, line := range trimmedLines {
+			// 只认顶层键：嵌套映射（如 notes:
+			//   server: ...）里的 server 不能覆盖顶层 server，否则会校验诱饵地址、
+			// 实际把未校验地址原样交给 miaospeed。
+			if len(line)-len(strings.TrimLeft(line, " \t")) != 0 {
+				continue
+			}
 			parseLineKeyValue(strings.TrimSpace(line), &name, &pType, &server, &port)
 		}
 		srv := formatServerPortString(server, port)
@@ -541,6 +546,9 @@ func parseClashYAMLProxies(content string) []MiaospeedNode {
 }
 
 func parseLineKeyValue(line string, name, pType, server, port *string) {
+	// 先去掉引号外的行尾注释，避免 `server: 1.2.3.4 # 备注` 把注释一起当成地址，
+	// 进而导致合法公网节点被误剔除。
+	line = stripYAMLInlineComment(line)
 	if idx := strings.Index(line, ":"); idx != -1 {
 		k := strings.ToLower(strings.TrimSpace(line[:idx]))
 		v := strings.Trim(strings.TrimSpace(line[idx+1:]), "\"'")
@@ -557,107 +565,60 @@ func parseLineKeyValue(line string, name, pType, server, port *string) {
 	}
 }
 
+// stripYAMLInlineComment 去掉 YAML 行内注释：从引号外、前面为空白（或行首）的 '#'
+// 开始直到行尾。与 YAML 一致，`value#not-comment` 不视作注释。
+func stripYAMLInlineComment(line string) string {
+	var quote byte
+	for i := 0; i < len(line); i++ {
+		c := line[i]
+		if quote != 0 {
+			if quote == '"' && c == '\\' {
+				i++
+				continue
+			}
+			if c == quote {
+				if quote == '\'' && i+1 < len(line) && line[i+1] == '\'' {
+					i++
+					continue
+				}
+				quote = 0
+			}
+			continue
+		}
+		switch c {
+		case '\'', '"':
+			quote = c
+		case '#':
+			if i == 0 || line[i-1] == ' ' || line[i-1] == '\t' {
+				return strings.TrimRight(line[:i], " \t")
+			}
+		}
+	}
+	return line
+}
+
 // extractField 从单行 YAML 项（如 {name: '...', type: hysteria2}）中安全提取指定键对应的值。
+// 只接受映射顶层的键：嵌套映射里的同名键（如 ws-opts: { server: ... }）不会被误当成顶层字段。
 func extractField(raw, key string) string {
 	key = strings.TrimSuffix(strings.TrimSpace(key), ":")
-	if key == "" || len(raw) == 0 {
+	if key == "" || raw == "" {
 		return ""
 	}
-
-	rawLen := len(raw)
-	start := 0
-	for {
-		idx := strings.Index(raw[start:], key)
-		if idx == -1 {
-			return ""
+	valStart, valEnd, ok := topLevelFieldValueSpan(raw, key)
+	if !ok || valStart >= valEnd {
+		return ""
+	}
+	val := raw[valStart:valEnd]
+	switch val[0] {
+	case '\'', '"':
+		if len(val) >= 2 && val[len(val)-1] == val[0] {
+			return val[1 : len(val)-1]
 		}
-		actualIdx := start + idx
-
-		// 检查 key 前置边界：必须是开头、空白、'{' 或 ','
-		validPrefix := false
-		if actualIdx == 0 {
-			validPrefix = true
-		} else {
-			prev := raw[actualIdx-1]
-			if prev == '{' || prev == ',' || unicode.IsSpace(rune(prev)) {
-				validPrefix = true
-			}
-		}
-
-		// 检查 key 后置边界：必须紧跟可选空白与冒号 ':'
-		valStart := -1
-		if validPrefix {
-			afterKey := actualIdx + len(key)
-			k := afterKey
-			for k < rawLen && unicode.IsSpace(rune(raw[k])) {
-				k++
-			}
-			if k < rawLen && raw[k] == ':' {
-				k++ // 跳过 ':'
-				for k < rawLen && unicode.IsSpace(rune(raw[k])) {
-					k++
-				}
-				valStart = k
-			}
-		}
-
-		if valStart != -1 {
-			if valStart >= rawLen {
-				return ""
-			}
-
-			firstChar := raw[valStart]
-			// 1. 引号包裹情况
-			if firstChar == '\'' || firstChar == '"' {
-				quote := firstChar
-				escaped := false
-				for i := valStart + 1; i < rawLen; i++ {
-					c := raw[i]
-					if escaped {
-						escaped = false
-						continue
-					}
-					if c == '\\' {
-						escaped = true
-						continue
-					}
-					if c == quote {
-						// 支持单引号双写转义 ''
-						if quote == '\'' && i+1 < rawLen && raw[i+1] == '\'' {
-							i++
-							continue
-						}
-						return raw[valStart+1 : i]
-					}
-				}
-				return strings.TrimSpace(raw[valStart+1:])
-			}
-
-			// 2. 嵌套花括号情况
-			if firstChar == '{' {
-				braceDepth := 0
-				for i := valStart; i < rawLen; i++ {
-					if raw[i] == '{' {
-						braceDepth++
-					} else if raw[i] == '}' {
-						braceDepth--
-						if braceDepth == 0 {
-							return strings.TrimSpace(raw[valStart : i+1])
-						}
-					}
-				}
-			}
-
-			// 3. 普通标量值：截止到下一个 ',' 或最外层 '}'
-			end := valStart
-			for end < rawLen && raw[end] != ',' && raw[end] != '}' {
-				end++
-			}
-			val := strings.TrimSpace(raw[valStart:end])
-			return strings.Trim(val, "\"'")
-		}
-
-		start = actualIdx + len(key)
+		return strings.TrimSpace(val[1:])
+	case '{', '[':
+		return strings.TrimSpace(val)
+	default:
+		return strings.Trim(strings.TrimSpace(val), "\"'")
 	}
 }
 
