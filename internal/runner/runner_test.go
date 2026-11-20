@@ -1636,3 +1636,24 @@ func TestStartAutoUpdateNoReentry(t *testing.T) {
 	a.tasksWG.Wait()
 }
 
+// TestRunnerMiaospeedRequiresExplicitAutoInstall 验证 Runner 默认不允许远程测速任务
+// 触发 miaospeed 的自动下载安装（必须显式 -allow-auto-install-deps）。
+func TestRunnerMiaospeedRequiresExplicitAutoInstall(t *testing.T) {
+	r := newRunnerWithMiaospeed("nexttrace", filepath.Join(t.TempDir(), "miaospeed"), nil)
+	if r.allowAutoInstallDeps {
+		t.Fatal("Runner 默认不应允许依赖自动安装")
+	}
+	res := r.Run(context.Background(), model.Job{
+		ID:        "m1",
+		Kind:      "miaospeed",
+		Target:    "trojan://pass@example.com:443#n",
+		TimeoutMS: 5000,
+	})
+	if res.ExitCode != -1 || !strings.Contains(res.ErrText, "allow-auto-install-deps") {
+		t.Fatalf("默认应拒绝自动安装并提示开关：%+v", res)
+	}
+	r.SetAllowAutoInstallDeps(true)
+	if !r.allowAutoInstallDeps {
+		t.Fatal("SetAllowAutoInstallDeps 未生效")
+	}
+}

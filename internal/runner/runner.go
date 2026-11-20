@@ -44,8 +44,15 @@ type Runner struct {
 	// 避免超时任务因为派生的孙进程而把 agent 卡死。
 	waitDelay          time.Duration
 	allowPrivateProbes bool
-	logger             Logger // 可选：记录实际执行的 argv，便于与主机上手跑结果对照。
-	onProgress         func(model.Progress)
+	// allowAutoInstallDeps 是否允许远程测速任务在 miaospeed 缺失时自动下载安装（默认否）。
+	allowAutoInstallDeps bool
+	logger               Logger // 可选：记录实际执行的 argv，便于与主机上手跑结果对照。
+	onProgress           func(model.Progress)
+}
+
+// SetAllowAutoInstallDeps 设置是否允许远程任务触发依赖的自动下载安装（-allow-auto-install-deps）。
+func (r *Runner) SetAllowAutoInstallDeps(allow bool) {
+	r.allowAutoInstallDeps = allow
 }
 
 // setProgressReporter 注入实时进度回调。
@@ -115,7 +122,10 @@ func (r *Runner) runMiaospeed(ctx context.Context, job model.Job) runResult {
 	runCtx, cancel := context.WithTimeout(ctx, model.JobMiaospeedMaxTimeout)
 	defer cancel()
 
-	output, data, err := miaospeed.RunJob(runCtx, r.miaospeedBinary, r.ghProxy, job, r.logger, r.onProgress, r.allowPrivateProbes)
+	output, data, err := miaospeed.RunJobWithOptions(runCtx, r.miaospeedBinary, r.ghProxy, job, r.logger, r.onProgress, miaospeed.RunOptions{
+		AllowPrivate:         r.allowPrivateProbes,
+		AllowAutoInstallDeps: r.allowAutoInstallDeps,
+	})
 	if err != nil {
 		return buildMiaospeedResult(output, data, err.Error(), -1)
 	}

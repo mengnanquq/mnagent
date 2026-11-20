@@ -65,6 +65,8 @@ type Config struct {
 
 	// AllowInsecureHTTP 允许 -bot 使用明文 HTTP 连接公网地址（默认仅允许回环/内网）。
 	AllowInsecureHTTP bool
+	// AllowAutoInstallDeps 允许测速任务在 miaospeed 缺失时自动下载安装依赖（默认禁止）。
+	AllowAutoInstallDeps bool
 }
 
 // DefaultTokenFile 根据操作系统平台返回默认的令牌文件路径。
@@ -224,9 +226,10 @@ func ParseConfig(args []string, version string) (*Config, error) {
 		runDiag      = fs.Bool("diag", false, "执行本地环境与系统依赖健康自检并输出诊断看板后退出")
 		probeTarget  = fs.String("probe-target", "", "本地直接执行一次探针网络测试的目标（域名或 IP）")
 		probeKind    = fs.String("probe-kind", "ping", "本地探针类型：ping / tcping / trace / http / dns")
-		allowPrivate = fs.Bool("allow-private-probes", false, "允许探测内网私有地址与链路本地地址（默认禁止，防范 SSRF/云元数据盗取）")
+		allowPrivate = fs.Bool("allow-private-probes", false, "允许探测/测速私网与链路本地地址（默认禁止，防范 SSRF/云元数据盗取）；只跳过地址段判定，节点协议白名单、payload 结构、禁止字段与 server 钉死等安全闸门仍照常执行")
 		allowDown    = fs.Bool("allow-remote-downgrade", false, "允许服务端远程下发降级到旧版本（默认只接受更高版本；本地 -apply-update 不受限）")
 		allowHTTP    = fs.Bool("allow-insecure-http", false, "允许 -bot 使用明文 HTTP 连接公网地址（默认仅允许回环/内网，明文传输令牌有被窃听风险）")
+		allowAutoDep = fs.Bool("allow-auto-install-deps", false, "允许测速任务在 miaospeed 缺失时自动下载安装依赖（默认禁止：远程任务不应触发以 root 下载执行新二进制）")
 	)
 	if err := fs.Parse(args); err != nil {
 		return nil, err
@@ -325,6 +328,7 @@ func ParseConfig(args []string, version string) (*Config, error) {
 		AllowPrivateProbes:   *allowPrivate,
 		AllowRemoteDowngrade: *allowDown,
 		AllowInsecureHTTP:    *allowHTTP,
+		AllowAutoInstallDeps: *allowAutoDep,
 	}, nil
 }
 
