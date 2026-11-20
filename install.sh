@@ -1498,96 +1498,12 @@ map_nexttrace_arch() {
 	esac
 }
 
-# fetch_github_asset_digest <owner/repo> <资产名> [tag]
-# 从 GitHub Releases API 取指定资产的 sha256 摘要（形如 sha256:<hex>）。
-# tag 缺省或为 latest 时读取最新发布；否则读取 /releases/tags/<tag>。
-# 不执行任何远端脚本；取不到摘要时返回非零，由调用方中止（绝不跳过后安装）。
-fetch_github_asset_digest() {
-	digest_repo="$1"
-	digest_asset="$2"
-	digest_tag="${3:-latest}"
-	if [ -n "$digest_tag" ] && [ "$digest_tag" != "latest" ]; then
-		digest_base="https://github.com/${digest_repo}/releases/download/${digest_tag}"
-	else
-		digest_base="https://github.com/${digest_repo}/releases/latest/download"
-	fi
-
-	# 优先下载 Release 附件中的 "<资产>.sha256"：直接、稳定，不依赖 GitHub API 的
-	# JSON 结构，也不消耗 API 限额。使用 gh-proxy 时必须直连 github.com 获取校验
-	# 文件，否则代理可以同时替换压缩包与同源 .sha256；只有显式
-	# --insecure-proxy-checksum 才退化为经代理获取。直连失败时还会回退到
-	# api.github.com 的 digest 字段（API 始终直连）。
-	digest_sum_url="${digest_base}/${digest_asset}.sha256"
-	if [ -n "$GH_PROXY" ] && [ "$INSECURE_PROXY_CHECKSUM" = "yes" ]; then
-		digest_sum_url="$(apply_gh_proxy "$digest_sum_url")"
-	fi
-	digest_sum="$(download_stdout "$digest_sum_url" fast 2>/dev/null || true)"
-	if [ -n "$digest_sum" ]; then
-		digest_value="$(printf '%s\n' "$digest_sum" | awk 'NF >= 1 { print $1; exit }' | tr 'A-F' 'a-f')"
-		case "$digest_value" in
-			*[!0-9a-f]*|'') digest_value="";;
-		esac
-		if [ "${#digest_value}" -eq 64 ]; then
-			printf 'sha256:%s' "$digest_value"
-			return 0
-		fi
-	fi
-
-	if [ -n "$digest_tag" ] && [ "$digest_tag" != "latest" ]; then
-		digest_api="https://api.github.com/repos/${digest_repo}/releases/tags/${digest_tag}"
-	else
-		digest_api="https://api.github.com/repos/${digest_repo}/releases/latest"
-	fi
-	digest_json="$(download_stdout "$digest_api" 2>/dev/null || true)"
-	[ -n "$digest_json" ] || return 1
-	# 按 "name" 字段精确匹配资产后再取其 sha256 digest：
-	# 不能用子串匹配（arm 会命中 arm64，amd64 会命中 amd64-v3），也不能依赖
-	# 两个字段在同一行/同一段——GitHub 的资产对象里 uploader 子对象会插在中间。
-	# 必须把搜索范围限制在当前资产对象内（到下一个 "name" 之前），并显式匹配
-	# "digest": "sha256:<64hex>"：digest 为 null 时绝不能借用下一个资产的值。
-	digest_value="$(printf '%s' "$digest_json" \
-		| tr '\n' ' ' \
-		| awk -v target="$digest_asset" '
-			function regex_escape(s,   out, i, c) {
-				out = ""
-				for (i = 1; i <= length(s); i++) {
-					c = substr(s, i, 1)
-					if (index("\\^$[]|()*+?{}.", c) > 0) out = out "\\"
-					out = out c
-				}
-				return out
-			}
-			{
-				json = $0
-				if (!match(json, "\"name\"[ \t]*:[ \t]*\"" regex_escape(target) "\"")) exit
-				rest = substr(json, RSTART + RLENGTH)
-				# 只允许在当前资产对象内查找（下一个资产以 "name" 开始）。
-				if (match(rest, "\"name\"[ \t]*:")) rest = substr(rest, 1, RSTART - 1)
-				if (!match(rest, "\"digest\"[ \t]*:[ \t]*\"sha256:[0-9a-fA-F]+\"")) exit
-				field = substr(rest, RSTART, RLENGTH)
-				hex = field
-				sub(/^.*sha256:/, "", hex)
-				sub(/"$/, "", hex)
-				# 不依赖 awk 的 {n} 区间表达式（busybox 兼容）。
-				if (length(hex) != 64) exit
-				print "sha256:" hex
-			}')"
-	[ -n "$digest_value" ] || return 1
-	printf '%s' "$digest_value"
-}
-
 download_nexttrace() {
 	nt_arch="$(map_nexttrace_arch "$ARCH")"
 	nt_asset="nexttrace_${OS}_${nt_arch}"
 	if [ "$OS" = "darwin" ]; then
 		nt_asset="nexttrace_darwin_universal"
 	fi
-	nt_digest="$(fetch_github_asset_digest "nxtrace/NTrace-core" "$nt_asset" || true)"
-	if [ -z "$nt_digest" ]; then
-		warn "无法获取 nexttrace（${nt_asset}）的 SHA-256 摘要，已跳过自动安装（请检查网络或 GitHub API 限额）"
-		return 1
-	fi
-	nt_expected="${nt_digest#sha256:}"
 	url="https://github.com/nxtrace/NTrace-core/releases/latest/download/${nt_asset}"
 	url="$(apply_gh_proxy "$url")"
 	if [ -n "$GH_PROXY" ]; then
@@ -1598,18 +1514,8 @@ download_nexttrace() {
 	if ! download "$url" "$PREFIX/.nexttrace.new"; then
 		return 1
 	fi
-	nt_actual="$(sha256_of "$PREFIX/.nexttrace.new" || true)"
-	if [ -z "$nt_actual" ]; then
-		rm -f "$PREFIX/.nexttrace.new"
-		warn "未找到可用的 SHA-256 工具，已跳过 nexttrace 自动安装"
-		return 1
-	fi
-	if [ "$nt_actual" != "$nt_expected" ]; then
-		rm -f "$PREFIX/.nexttrace.new"
-		warn "nexttrace SHA-256 校验失败：期望 ${nt_expected}，实际 ${nt_actual}（已丢弃下载文件）"
-		return 1
-	fi
-	log "nexttrace SHA-256 校验通过"
+	# 依赖不再做 SHA-256 校验（上游未发布对应 .sha256）：仅经 HTTPS 下载，
+	# 由 mnagent 安装后的 -V/-version 自检确认可执行与版本。
 	install_file "$PREFIX/.nexttrace.new" "$PREFIX/nexttrace" 0755 \
 		|| die "安装 nexttrace 到 $PREFIX/nexttrace 失败（请检查磁盘空间与目录权限）"
 	rm -f "$PREFIX/.nexttrace.new"
@@ -1620,7 +1526,7 @@ NEXTTRACE_PATH="$(find_binary "$NEXTTRACE_BIN" || true)"
 
 # 缺少 nexttrace 时自动安装：
 # 1. OpenWrt opkg 包管理器（保留原有分支）
-# 2. GitHub Releases 预编译二进制，下载前从 GitHub API 取 asset digest 强制校验
+# 2. GitHub Releases 预编译二进制，仅经 HTTPS 下载（依赖不做 SHA-256 校验）
 # 不再执行远端一键脚本（curl https://nxtrace.org/nt | bash），避免以 root 运行未固定版本的远端代码。
 if [ -z "$NEXTTRACE_PATH" ] && [ "$INSTALL_NEXTTRACE" = "yes" ]; then
 	log "环境缺少 nexttrace，正在安装..."
@@ -1632,7 +1538,7 @@ if [ -z "$NEXTTRACE_PATH" ] && [ "$INSTALL_NEXTTRACE" = "yes" ]; then
 		NEXTTRACE_PATH="$(find_binary "$NEXTTRACE_BIN" || true)"
 	fi
 
-	# 2. 直接从 GitHub Releases 下载预编译二进制并校验完整性
+	# 2. 直接从 GitHub Releases 下载预编译二进制（不做 SHA-256 校验）
 	if [ -z "$NEXTTRACE_PATH" ]; then
 		download_nexttrace || true
 		# 下载成功时 download_nexttrace 已设置 NEXTTRACE_PATH；不要再用 PATH 中的同名文件覆盖它。
@@ -1731,14 +1637,6 @@ download_miaospeed() {
 	url="https://github.com/AirportR/miaospeed/releases/download/${miao_tag}/${tar_name}"
 	url="$(apply_gh_proxy "$url")"
 
-	# 先取上游摘要；拿不到就跳过安装，绝不以 root 执行未经校验的压缩包。
-	miao_digest="$(fetch_github_asset_digest "AirportR/miaospeed" "$tar_name" "$miao_tag" || true)"
-	if [ -z "$miao_digest" ]; then
-		warn "无法获取 miaospeed（${tar_name}）的 SHA-256 摘要，已跳过自动安装（请检查网络或 GitHub API 限额）"
-		return 1
-	fi
-	miao_expected="${miao_digest#sha256:}"
-
 	# 临时目录放在 $PREFIX 下而不是 /tmp：OpenWrt 的 /tmp 是 tmpfs，压缩包与
 	# 解压后的二进制会直接占用内存。该目录已纳入 cleanup_partial_install 清理。
 	tmp="$PREFIX/.miaospeed.tmp.$$"
@@ -1763,18 +1661,8 @@ download_miaospeed() {
 		rm -rf "$tmp"
 		return 1
 	fi
-	miao_actual="$(sha256_of "$tmp/miaospeed.tar.gz" || true)"
-	if [ -z "$miao_actual" ]; then
-		warn "未找到可用的 SHA-256 工具，已跳过 miaospeed 自动安装"
-		rm -rf "$tmp"
-		return 1
-	fi
-	if [ "$miao_actual" != "$miao_expected" ]; then
-		warn "miaospeed SHA-256 校验失败：期望 ${miao_expected}，实际 ${miao_actual}（已丢弃下载文件）"
-		rm -rf "$tmp"
-		return 1
-	fi
-	log "miaospeed SHA-256 校验通过"
+	# 依赖不再做 SHA-256 校验（上游未发布对应 .sha256）：仅经 HTTPS 下载，
+	# 由 mnagent 安装后的 -V/-version 自检确认可执行与版本。
 
 	tar -xzf "$tmp/miaospeed.tar.gz" -C "$tmp" 2>/dev/null || tar -xz -f "$tmp/miaospeed.tar.gz" -C "$tmp" 2>/dev/null || true
 	# 按确切文件名取二进制：常规 release 为 miaospeed-<os>-<arch>，

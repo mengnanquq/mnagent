@@ -567,9 +567,6 @@ func TestInstallScriptKeepsKeySafeguards(t *testing.T) {
 		{"SHA-256 回退 shasum -a 256", "shasum -a 256"},
 		{"SHA-256 回退 openssl dgst -sha256", "openssl dgst -sha256"},
 		{"缺失时自动安装 nexttrace", "download_nexttrace"},
-		{"nexttrace 摘要取自 GitHub 附件或 API", "fetch_github_asset_digest"},
-		{"优先下载 Release 的 .sha256 附件", "${digest_asset}.sha256"},
-		{"nexttrace 下载后比对 SHA-256", `[ "$nt_actual" != "$nt_expected" ]`},
 		{"通用二进制查找 find_binary", "find_binary()"},
 		{"GitHub Releases 直连下载", "download_nexttrace"},
 		{"OpenWrt 优先 opkg 安装 nexttrace", "opkg install nexttrace"},
@@ -595,7 +592,7 @@ func TestInstallScriptKeepsKeySafeguards(t *testing.T) {
 
 // TestInstallScriptDoesNotRunRemoteNexttraceScript 守护：不能再以 root 执行
 // 未固定版本的远端一键脚本（curl https://nxtrace.org/nt | bash），
-// nexttrace 必须走 GitHub Releases 下载并校验摘要。
+// nexttrace 必须走 GitHub Releases 下载（依赖不再校验摘要）。
 func TestInstallScriptDoesNotRunRemoteNexttraceScript(t *testing.T) {
 	script := string(readInstallScript(t))
 	for _, bad := range []string{"nxtrace.org", "NTrace-core/install.sh"} {
@@ -606,23 +603,30 @@ func TestInstallScriptDoesNotRunRemoteNexttraceScript(t *testing.T) {
 	if !containsActiveLine(script, "download_nexttrace") {
 		t.Error("install.sh 应通过 download_nexttrace 从 GitHub Releases 安装 nexttrace")
 	}
+	for _, bad := range []string{"fetch_github_asset_digest", "nt_expected", "nt_actual"} {
+		if containsActiveLine(script, bad) {
+			t.Errorf("依赖不再做 SHA-256 校验，install.sh 不应再包含 %q", bad)
+		}
+	}
 }
 
-// TestInstallScriptVerifiesMiaospeed 守护 miaospeed 自动安装：必须先取 GitHub API 摘要并强制校验，
-// 解压后按确切文件名取二进制，禁止再以“第一个类似文件”安装未校验的压缩包。
-func TestInstallScriptVerifiesMiaospeed(t *testing.T) {
+// TestInstallScriptMiaospeedWithoutDigest 守护 miaospeed 自动安装不再获取 SHA-256：
+// 直接经 HTTPS 下载，解压后按确切文件名取二进制，禁止再以“第一个类似文件”安装。
+func TestInstallScriptMiaospeedWithoutDigest(t *testing.T) {
 	script := string(readInstallScript(t))
 
 	for _, want := range []struct{ name, needle string }{
-		{"按指定 tag 取上游摘要", `fetch_github_asset_digest "AirportR/miaospeed" "$tar_name" "$miao_tag"`},
-		{"优先下载 Release 的 .sha256 附件", "${digest_asset}.sha256"},
-		{"摘要缺失即跳过安装", "无法获取 miaospeed"},
-		{"下载后比对 SHA-256", `[ "$miao_actual" != "$miao_expected" ]`},
+		{"直接下载 Release 压缩包", `url="https://github.com/AirportR/miaospeed/releases/download/${miao_tag}/${tar_name}"`},
 		{"按确切文件名取二进制", `miao_bin_name="miaospeed-${OS}-${miao_arch}"`},
 		{"兼容 runner/runner 归档", `"$tmp/runner/runner"`},
 	} {
 		if !containsActiveLine(script, want.needle) {
 			t.Errorf("install.sh 缺少“%s”（非注释行应包含 %q）", want.name, want.needle)
+		}
+	}
+	for _, bad := range []string{"fetch_github_asset_digest", "miao_expected", "miao_actual"} {
+		if containsActiveLine(script, bad) {
+			t.Errorf("依赖不再做 SHA-256 校验，install.sh 不应再包含 %q", bad)
 		}
 	}
 	if containsActiveLine(script, `-name "miaospeed*"`) {
@@ -678,10 +682,6 @@ func TestWindowsInstallScript(t *testing.T) {
 		{"Windows 使用 Get-FileHash", "Get-FileHash"},
 		{"下载同名 .sha256", "{mnagentUrl}.sha256"},
 		{"MiaoSpeed zip 提取", "Expand-Archive"},
-		{"NextTrace 摘要取自 GitHub API", `Get-GitHubAssetDigest "nxtrace/NTrace-core"`},
-		{"NextTrace 下载后校验摘要", "Assert-AssetSha256 $tmpNt"},
-		{"MiaoSpeed 摘要取自 GitHub API", `Get-GitHubAssetDigest "AirportR/miaospeed"`},
-		{"MiaoSpeed 下载后校验摘要", "Assert-AssetSha256 $tmpZip"},
 		{"MiaoSpeed 按确切文件名取二进制", `$expectedExe = "miaospeed-windows-$arch.exe"`},
 		{"参数定义 -Bot", "[string]$Bot"},
 		{"参数定义 -Token", "[string]$Token"},
@@ -707,6 +707,9 @@ func TestWindowsInstallScript(t *testing.T) {
 	}
 	if strings.Contains(script, `"*miaospeed*.exe"`) {
 		t.Error("install.ps1 不应再用通配符取 miaospeed 压缩包内“第一个匹配”文件")
+	}
+	if strings.Contains(script, "Get-GitHubAssetDigest") || strings.Contains(script, "Assert-AssetSha256") {
+		t.Error("依赖不再做 SHA-256 校验，install.ps1 不应再包含依赖摘要获取/比对逻辑")
 	}
 }
 
@@ -1484,66 +1487,6 @@ func TestInstallScriptReportsRestartFailure(t *testing.T) {
 		if !strings.Contains(out, want) {
 			t.Fatalf("缺少排错提示 %q：\n%s", want, out)
 		}
-	}
-}
-
-// TestInstallScriptAssetDigestScopedToAsset 验证 GitHub API 的 digest 解析被限制在当前
-// 资产对象内：目标资产 digest 为 null 时不得借用相邻 -v3 资产的值。
-func TestInstallScriptAssetDigestScopedToAsset(t *testing.T) {
-	script := string(readInstallScript(t))
-	lines := strings.Split(script, "\n")
-	start, end := -1, -1
-	for i, line := range lines {
-		if line == "fetch_github_asset_digest() {" {
-			start = i
-			continue
-		}
-		if start >= 0 && line == "}" {
-			end = i
-			break
-		}
-	}
-	if start < 0 || end <= start {
-		t.Fatal("未能在 install.sh 中定位 fetch_github_asset_digest 函数")
-	}
-	fn := strings.Join(lines[start:end+1], "\n")
-
-	v3Digest := "sha256:" + strings.Repeat("a", 64)
-	fixture := `{"assets":[` +
-		`{"url":"https://example/amd64","name":"mnagent_linux_amd64","digest":null},` +
-		`{"url":"https://example/amd64-v3","name":"mnagent_linux_amd64-v3","digest":"` + v3Digest + `"}` +
-		`]}`
-	harness := `GH_PROXY=""
-INSECURE_PROXY_CHECKSUM=no
-apply_gh_proxy() { printf '%s' "$1"; }
-download_stdout() {
-	case "$1" in
-		*".sha256") return 1;;
-		*api.github.com*) printf '%s' "$DIGEST_FIXTURE"; return 0;;
-	esac
-	return 1
-}
-` + fn + `
-fetch_github_asset_digest "owner/repo" "$1" "latest"
-`
-	harnessPath := filepath.Join(t.TempDir(), "digest.sh")
-	if err := os.WriteFile(harnessPath, []byte(harness), 0o700); err != nil {
-		t.Fatal(err)
-	}
-	run := func(asset string) (string, error) {
-		cmd := exec.Command("sh", harnessPath, asset)
-		cmd.Env = append(os.Environ(), "DIGEST_FIXTURE="+fixture)
-		out, err := cmd.CombinedOutput()
-		return strings.TrimSpace(string(out)), err
-	}
-
-	out, err := run("mnagent_linux_amd64")
-	if err == nil || out != "" {
-		t.Fatalf("目标资产 digest=null 时不得返回相邻资产摘要，out=%q err=%v", out, err)
-	}
-	out, err = run("mnagent_linux_amd64-v3")
-	if err != nil || out != v3Digest {
-		t.Fatalf("目标资产自身 digest 应正常返回 %q，实际 out=%q err=%v", v3Digest, out, err)
 	}
 }
 
