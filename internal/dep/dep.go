@@ -13,6 +13,7 @@ import (
 	"fmt"
 	"io"
 	"math/rand/v2"
+	"net"
 	"net/http"
 	"net/url"
 	"os"
@@ -22,6 +23,7 @@ import (
 	"runtime"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 	"unicode/utf8"
 
@@ -48,6 +50,29 @@ const (
 // selfCheckTimeout 是替换前执行依赖 -version/-V 自检的独立超时。
 // 依赖卡死或挂起时不能把整个更新流程一起拖住；测试会缩短该值。
 var selfCheckTimeout = 10 * time.Second
+
+// dependencyUpdateBudget 是非升级路径（启动补齐、定期检查、运行时安装、CLI）
+// 中单个依赖安装/更新的宽松整体预算（含服务端代取、直连摘要、下载、解压与自检）。
+// 弱网下 60MB 归档可能需要几分钟，过紧会把正常安装误杀；升级任务路径由
+// handleUpgradeJob 传入更紧凑的预算（见 UpdateDependencyWithin）。
+// 变量而非常量，便于测试缩短。
+var dependencyUpdateBudget = 5 * time.Minute
+
+// errDependencyBudgetExceeded 表示依赖安装因自身整体预算耗尽而中止
+// （区别于调用方 ctx 被取消）。这类失败说明本轮安装已无望完成，
+// 应写入失败冷却，避免每轮任务都重新下载一遍。
+var errDependencyBudgetExceeded = errors.New("依赖安装整体预算已用尽")
+
+// 依赖归档下载的超时拆分：归档可能几十 MB，弱网下传输时间不可预估，
+// 不能像摘要/API 小请求那样用 http.Client.Timeout 一刀切（它包含读响应体的时间）。
+// 这里改为连接/TLS/响应头超时 + 连续无数据的空闲读超时，并以 ctx 作为总上限。
+// 变量而非常量，便于测试缩短。
+var (
+	dependencyDialTimeout           = 10 * time.Second
+	dependencyTLSTimeout            = 10 * time.Second
+	dependencyResponseHeaderTimeout = 20 * time.Second
+	dependencyDownloadIdleTimeout   = 30 * time.Second
+)
 
 // maxExtractBytes 限制从依赖归档中解压出的单个可执行文件大小（防 zip bomb 占满磁盘）。
 // 变量而非常量，便于测试缩短；生产环境为 256MB。
@@ -130,9 +155,17 @@ type DependencyManager struct {
 	httpClient    *http.Client
 	apiBaseURL    string // 默认 "https://api.github.com"
 	githubBaseURL string // 默认 "https://github.com"
-	cmdRunner     func(ctx context.Context, name string, args ...string) ([]byte, error)
-	goos          string
-	goarch        string
+	// botDigest 是服务端代取校验值的客户端；nil 表示不启用。
+	// 依赖不做交叉校验（上游未发布 .sha256），只把代取结果作为首选来源。
+	botDigest *updater.BotDigestClient
+	// downloadClient 是归档/二进制下载专用客户端：不设整体 Timeout，
+	// 使用连接/响应头超时 + 空闲读超时，并以 ctx 作为总上限。
+	// 零值时按当前超时变量惰性构建，测试可注入自定义客户端。
+	downloadClient     *http.Client
+	downloadClientOnce sync.Once
+	cmdRunner          func(ctx context.Context, name string, args ...string) ([]byte, error)
+	goos               string
+	goarch             string
 }
 
 // newDependencyManager 创建依赖管理器实例。
@@ -164,6 +197,107 @@ func NewDependencyManager(ghProxy string) *DependencyManager {
 func (dm *DependencyManager) SetGitHubEndpoints(apiBaseURL, githubBaseURL string) {
 	dm.apiBaseURL = apiBaseURL
 	dm.githubBaseURL = githubBaseURL
+}
+
+// SetBotDigest 注入服务端代取校验值的客户端；nil 表示不启用。
+func (dm *DependencyManager) SetBotDigest(c *updater.BotDigestClient) {
+	if dm == nil {
+		return
+	}
+	dm.botDigest = c
+}
+
+// downloadHTTPClient 返回归档/二进制下载专用客户端。
+// 与摘要/API 使用的 20s httpClient 不同：不设整体 Timeout，避免弱网下大文件
+// 因传输超过 20s 被强制中断；连接/响应头超时与空闲读超时共同兜底，
+// 总时长仍受调用方 ctx 约束。
+func (dm *DependencyManager) downloadHTTPClient() *http.Client {
+	if dm == nil {
+		return newDependencyDownloadClient()
+	}
+	dm.downloadClientOnce.Do(func() {
+		if dm.downloadClient == nil {
+			dm.downloadClient = newDependencyDownloadClient()
+		}
+	})
+	if client := dm.downloadClient; client != nil {
+		return client
+	}
+	// 极端情况：Once 已完成但客户端被外部置空，退回一次性客户端，避免 nil panic。
+	return newDependencyDownloadClient()
+}
+
+// newDependencyDownloadClient 构建不设整体超时的下载客户端。
+// 超时变量在构建时读取，测试可在首次下载前缩短。
+func newDependencyDownloadClient() *http.Client {
+	dialer := &net.Dialer{Timeout: dependencyDialTimeout, KeepAlive: 30 * time.Second}
+	return &http.Client{
+		Transport: &http.Transport{
+			Proxy:                 http.ProxyFromEnvironment,
+			DialContext:           dialer.DialContext,
+			ForceAttemptHTTP2:     true,
+			MaxIdleConns:          8,
+			IdleConnTimeout:       90 * time.Second,
+			TLSHandshakeTimeout:   dependencyTLSTimeout,
+			ExpectContinueTimeout: time.Second,
+			ResponseHeaderTimeout: dependencyResponseHeaderTimeout,
+		},
+	}
+}
+
+// idleReadMonitor 监控下载响应体的空闲间隔：连续 timeout 没有收到任何数据就取消请求。
+// http.Client.Timeout 包含读响应体的时间，无法表达“慢但一直有数据”的语义，
+// 因此归档下载改用这个读空闲监控。
+type idleReadMonitor struct {
+	timeout time.Duration
+	timer   *time.Timer
+	fired   atomic.Bool
+	cancel  context.CancelFunc
+}
+
+func newIdleReadMonitor(timeout time.Duration, cancel context.CancelFunc) *idleReadMonitor {
+	if timeout <= 0 || cancel == nil {
+		return nil
+	}
+	m := &idleReadMonitor{timeout: timeout, cancel: cancel}
+	m.timer = time.AfterFunc(timeout, func() {
+		m.fired.Store(true)
+		cancel()
+	})
+	return m
+}
+
+// refresh 在每次读到数据后重置空闲计时。
+func (m *idleReadMonitor) refresh() {
+	if m == nil || m.timer == nil {
+		return
+	}
+	m.timer.Reset(m.timeout)
+}
+
+func (m *idleReadMonitor) stop() {
+	if m == nil || m.timer == nil {
+		return
+	}
+	m.timer.Stop()
+}
+
+func (m *idleReadMonitor) expired() bool {
+	return m != nil && m.fired.Load()
+}
+
+// idleMonitoredReader 在每次成功读到数据后刷新空闲计时。
+type idleMonitoredReader struct {
+	r io.Reader
+	m *idleReadMonitor
+}
+
+func (r idleMonitoredReader) Read(p []byte) (int, error) {
+	n, err := r.r.Read(p)
+	if n > 0 {
+		r.m.refresh()
+	}
+	return n, err
 }
 
 // resolveBinaryPath 解析可执行文件的具体绝对/环境路径。
@@ -263,8 +397,18 @@ func isContextError(err error) bool {
 }
 
 // EnsureDependency 确保依赖可用：同一依赖的并发安装只执行一次，失败后短时间内
-// 不再重复下载。返回值与 UpdateDependency 一致。
+// 不再重复下载。使用默认宽松预算（dependencyUpdateBudget），返回值与 UpdateDependency 一致。
 func (dm *DependencyManager) EnsureDependency(ctx context.Context, name, targetPath, version string, log Logger) (string, error) {
+	return dm.ensureDependency(ctx, dependencyUpdateBudget, name, targetPath, version, log)
+}
+
+// EnsureDependencyWithin 使用调用方指定的预算执行 EnsureDependency。
+// 只有升级任务路径需要传紧凑预算（40s），其他路径应直接用 EnsureDependency。
+func (dm *DependencyManager) EnsureDependencyWithin(ctx context.Context, budget time.Duration, name, targetPath, version string, log Logger) (string, error) {
+	return dm.ensureDependency(ctx, budget, name, targetPath, version, log)
+}
+
+func (dm *DependencyManager) ensureDependency(ctx context.Context, budget time.Duration, name, targetPath, version string, log Logger) (string, error) {
 	normalized := strings.ToLower(strings.TrimSpace(name))
 	var defaultName string
 	switch normalized {
@@ -308,7 +452,7 @@ func (dm *DependencyManager) EnsureDependency(ctx context.Context, name, targetP
 		depEnsureCalls[key] = call
 		depEnsureMu.Unlock()
 
-		path, err := dm.UpdateDependency(ctx, normalized, targetPath, version, log)
+		path, err := dm.UpdateDependencyWithin(ctx, budget, normalized, targetPath, version, log)
 		if err != nil && ctx.Err() != nil && !isContextError(err) {
 			// 底层可能把取消错误包成了普通文本（重试摘要会压缩错误），
 			// 这里补回 ctx 错误链，供等待者判断“leader 因 ctx 失败”并自行重试。
@@ -318,11 +462,16 @@ func (dm *DependencyManager) EnsureDependency(ctx context.Context, name, targetP
 		depEnsureMu.Lock()
 		call.path, call.err = path, err
 		if err != nil {
-			if isContextError(err) {
+			switch {
+			case errors.Is(err, errDependencyBudgetExceeded):
+				// 自身预算用尽（不是调用方取消）：本轮安装已无望完成，
+				// 必须写入冷却，否则弱网下每轮任务都会重新下载一遍。
+				depEnsureFailures[key] = depEnsureFailure{err: err, until: time.Now().Add(depInstallFailureCooldown)}
+			case isContextError(err):
 				// ctx 取消/超时只影响本次调用，不能冷却 5 分钟：
 				// 否则一次短超时会让后续任务都拿不到依赖。
 				delete(depEnsureFailures, key)
-			} else {
+			default:
 				depEnsureFailures[key] = depEnsureFailure{err: err, until: time.Now().Add(depInstallFailureCooldown)}
 			}
 		} else {
@@ -790,13 +939,25 @@ func retryDigest(ctx context.Context, source string, fn func(context.Context) (s
 
 // fetchAssetDigest 获取指定 Release 附件的 SHA-256 摘要。
 //
-// 两个来源都只会直连 GitHub（githubBaseURL / apiBaseURL，均不拼接 gh-proxy），
-// 先尝试 "<资产>.sha256"，失败后回退到 api.github.com 的 assets[].digest；
-// 每个来源独立重试，互为兜底。
+// 首选服务端代取（mengnanbot 代访问 GitHub，只尝试一次）；失败后回退到
+// "<资产>.sha256" 与 api.github.com 的 assets[].digest，两个直连来源各自重试、
+// 互为兜底。缓存与直连来源都不拼接 gh-proxy。
+// 依赖这条路径不做交叉校验：上游（nexttrace / miaospeed）未发布 .sha256，
+// 没有可对照的第二个来源。
 // 拿不到有效摘要（上游未发布 .sha256、API 不可达、限流、附件不存在或未提供 digest）
 // 一律返回错误：这些依赖以 root 运行，宁可拒绝安装也不能跳过完整性校验。
 func (dm *DependencyManager) fetchAssetDigest(ctx context.Context, repo, tag, assetName string) (string, error) {
 	var attempted []string
+	if dm.botDigest != nil {
+		sum, err := dm.botDigest.Fetch(ctx, repo, tag, assetName)
+		if err == nil && sum != "" {
+			return sum, nil
+		}
+		if err == nil {
+			err = errors.New("返回空摘要")
+		}
+		attempted = append(attempted, fmt.Sprintf("服务端代取（1次：%s）", compactErrorText(err, summaryErrorLimit)))
+	}
 	sum, err := retryDigest(ctx, "同源 .sha256", func(ctx context.Context) (string, error) {
 		return dm.fetchAssetDigestFile(ctx, repo, tag, assetName)
 	})
@@ -927,16 +1088,16 @@ func (dm *DependencyManager) downloadVerified(ctx context.Context, repo, tag, as
 	if log != nil {
 		log.Debug("已获取依赖的上游 SHA-256 摘要", "asset", assetName, "digest", digest)
 	}
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, downloadURL, nil)
+	// 归档/二进制下载用独立客户端：不设整体 Timeout（弱网下大文件可能传很久），
+	// 改为连接/响应头超时 + 空闲读超时，并以 ctx 作为总上限。
+	downloadCtx, cancelDownload := context.WithCancel(ctx)
+	defer cancelDownload()
+	req, err := http.NewRequestWithContext(downloadCtx, http.MethodGet, downloadURL, nil)
 	if err != nil {
 		return 0, err
 	}
 	req.Header.Set("User-Agent", "mnagent")
-	client := dm.httpClient
-	if client == nil {
-		client = http.DefaultClient
-	}
-	resp, err := client.Do(req)
+	resp, err := dm.downloadHTTPClient().Do(req)
 	if err != nil {
 		return 0, fmt.Errorf("下载 %s 失败：%w", assetName, err)
 	}
@@ -953,12 +1114,21 @@ func (dm *DependencyManager) downloadVerified(ctx context.Context, repo, tag, as
 	}
 	limit := dependencyDownloadLimit(assetName)
 	hasher := sha256.New()
-	written, err := io.Copy(io.MultiWriter(f, hasher), io.LimitReader(resp.Body, limit+1))
+	body := io.Reader(resp.Body)
+	idle := newIdleReadMonitor(dependencyDownloadIdleTimeout, cancelDownload)
+	if idle != nil {
+		defer idle.stop()
+		body = idleMonitoredReader{r: resp.Body, m: idle}
+	}
+	written, err := io.Copy(io.MultiWriter(f, hasher), io.LimitReader(body, limit+1))
 	if closeErr := f.Close(); err == nil {
 		err = closeErr
 	}
 	if err != nil {
 		_ = os.Remove(tmpPath)
+		if idle.expired() && ctx.Err() == nil {
+			return 0, fmt.Errorf("下载 %s 连续 %s 未收到数据，已中止：%w", assetName, dependencyDownloadIdleTimeout, err)
+		}
 		return 0, fmt.Errorf("写入 %s 失败：%w", assetName, err)
 	}
 	if written > limit {
@@ -1069,6 +1239,9 @@ func (dm *DependencyManager) UpdateNextTrace(ctx context.Context, targetPath, ve
 	if err := dm.selfCheckDependency(ctx, "nexttrace", tmpFile, tag); err != nil {
 		return "", fmt.Errorf("nexttrace 自检失败，已中止替换：%w", err)
 	}
+	if err := ctx.Err(); err != nil {
+		return "", fmt.Errorf("nexttrace 更新已取消；如新二进制已落盘将在下次重启生效（本次未替换运行中的二进制）：%w", err)
+	}
 
 	if err := updater.ReplaceExecutable(tmpFile, destPath); err != nil {
 		return "", fmt.Errorf("替换 nexttrace 失败：%w", err)
@@ -1157,6 +1330,9 @@ func (dm *DependencyManager) UpdateMiaospeed(ctx context.Context, targetPath, ve
 	}
 	if err := dm.selfCheckDependency(ctx, "miaospeed", tmpFile, tag); err != nil {
 		return "", fmt.Errorf("miaospeed 自检失败，已中止替换：%w", err)
+	}
+	if err := ctx.Err(); err != nil {
+		return "", fmt.Errorf("miaospeed 更新已取消；如新二进制已落盘将在下次重启生效（本次未替换运行中的二进制）：%w", err)
 	}
 
 	if err := updater.ReplaceExecutable(tmpFile, destPath); err != nil {
@@ -1297,16 +1473,56 @@ func ExtractTarGzFile(r io.Reader, destFile string) error {
 	return errors.New("压缩包内未找到可执行文件")
 }
 
-// UpdateDependency 根据名称更新指定依赖。
+// UpdateDependency 使用默认宽松预算（dependencyUpdateBudget，5 分钟）更新指定依赖。
+// 启动补齐、定期检查、运行时自动安装与 CLI 都走这里；升级任务路径请用
+// UpdateDependencyWithin 传紧凑预算。
 func (dm *DependencyManager) UpdateDependency(ctx context.Context, name, targetPath, version string, log Logger) (string, error) {
+	return dm.UpdateDependencyWithin(ctx, dependencyUpdateBudget, name, targetPath, version, log)
+}
+
+// UpdateDependencyWithin 在指定预算内更新指定依赖（budget <= 0 表示使用默认宽松预算）。
+// 预算覆盖整个流程（代取/直连摘要、下载、解压、自检）。
+//
+// 区分两种失败：
+//   - 调用方 ctx 取消/超时：保留 context 错误，不写失败冷却；
+//   - 自身预算耗尽（调用方 ctx 仍有效）：返回包装了 errDependencyBudgetExceeded
+//     的错误，由 EnsureDependency 写入冷却，避免弱网下每轮任务无限重复下载。
+func (dm *DependencyManager) UpdateDependencyWithin(ctx context.Context, budget time.Duration, name, targetPath, version string, log Logger) (string, error) {
+	if budget <= 0 {
+		budget = dependencyUpdateBudget
+	}
+	installCtx, cancel := context.WithTimeout(ctx, budget)
+	defer cancel()
+
+	path, err := dm.updateDependency(installCtx, name, targetPath, version, log)
+	if err != nil && installCtx.Err() != nil && ctx.Err() == nil {
+		// 自身预算用尽，不是调用方放弃。这里刻意用 %v 包装底层错误：
+		// 错误链里的 DeadlineExceeded 不应被误判为“调用方取消”而不写冷却。
+		return path, fmt.Errorf("%w（%s）：%v", errDependencyBudgetExceeded, budget, err)
+	}
+	return path, err
+}
+
+// updateDependency 按名称执行一次依赖更新，不做整体预算包装。
+func (dm *DependencyManager) updateDependency(ctx context.Context, name, targetPath, version string, log Logger) (string, error) {
+	var (
+		path string
+		err  error
+	)
 	switch strings.ToLower(name) {
 	case "nexttrace":
-		return dm.UpdateNextTrace(ctx, targetPath, version, log)
+		path, err = dm.UpdateNextTrace(ctx, targetPath, version, log)
 	case "miaospeed":
-		return dm.UpdateMiaospeed(ctx, targetPath, version, log)
+		path, err = dm.UpdateMiaospeed(ctx, targetPath, version, log)
 	default:
 		return "", fmt.Errorf("未知的依赖：%q", name)
 	}
+	if err != nil && ctx.Err() != nil && !isContextError(err) {
+		// 底层重试摘要可能把 deadline 包成普通文本，这里补回错误链，
+		// 让调用方能正确区分调用方 ctx 取消与真实失败。
+		err = fmt.Errorf("%w：%v", ctx.Err(), err)
+	}
+	return path, err
 }
 
 // Logger 是本包用到的最小日志接口。

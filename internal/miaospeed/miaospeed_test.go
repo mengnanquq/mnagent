@@ -453,6 +453,94 @@ func TestBuildMiaospeedTestPlan(t *testing.T) {
 	}
 }
 
+// testMiaospeedBotToken 是服务端代取客户端所需的固定令牌。
+type testMiaospeedBotToken struct{}
+
+func (testMiaospeedBotToken) Get() (string, error) { return "tok", nil }
+
+// TestAutoInstallMiaospeedUsesBotDigest 验证运行时自动安装 miaospeed 时，
+// 会把服务端代取客户端注入依赖管理器，优先使用代取的摘要。
+func TestAutoInstallMiaospeedUsesBotDigest(t *testing.T) {
+	var buf bytes.Buffer
+	gw := gzip.NewWriter(&buf)
+	tw := tar.NewWriter(gw)
+	content := []byte("#!/bin/sh\necho \"version: 4.7.7\"\n")
+	hdr := &tar.Header{
+		Name:     "miaospeed-linux-amd64",
+		Mode:     0755,
+		Size:     int64(len(content)),
+		Typeflag: tar.TypeReg,
+	}
+	if err := tw.WriteHeader(hdr); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := tw.Write(content); err != nil {
+		t.Fatal(err)
+	}
+	tw.Close()
+	gw.Close()
+	tarBytes := buf.Bytes()
+	tarDigest := sha256.Sum256(tarBytes)
+
+	var botHits, sumHits, apiHits atomic.Int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.URL.Path == "/agent/release-digest":
+			botHits.Add(1)
+			if got := r.Header.Get("Authorization"); got != "Bearer tok" {
+				t.Errorf("代取请求 Authorization = %q", got)
+			}
+			fmt.Fprintf(w, `{"ok":true,"sha256":"%x"}`, tarDigest)
+		case strings.HasSuffix(r.URL.Path, ".sha256"):
+			sumHits.Add(1)
+			http.Error(w, "should not be called", http.StatusInternalServerError)
+		case strings.Contains(r.URL.Path, "/releases/tags/"):
+			apiHits.Add(1)
+			http.Error(w, "should not be called", http.StatusInternalServerError)
+		case strings.Contains(r.URL.Path, "releases/latest"):
+			_, _ = w.Write([]byte(`{"tag_name":"4.7.7"}`))
+		case strings.Contains(r.URL.Path, ".tar.gz"):
+			_, _ = w.Write(tarBytes)
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer srv.Close()
+
+	oldNew := newDependencyManager
+	newDependencyManager = func(ghProxy string) *dep.DependencyManager {
+		dm := oldNew(ghProxy)
+		dm.SetGitHubEndpoints(srv.URL, srv.URL)
+		return dm
+	}
+	defer func() { newDependencyManager = oldNew }()
+
+	dest := filepath.Join(t.TempDir(), "bin", "miaospeed")
+	path, err := autoInstallMiaospeed(context.Background(), dest, srv.URL, &updater.BotDigestClient{
+		BaseURL: srv.URL + "/agent",
+		Token:   testMiaospeedBotToken{},
+		Client:  srv.Client(),
+	}, nil)
+	if err != nil {
+		t.Fatalf("autoInstallMiaospeed 失败: %v", err)
+	}
+	if path != dest {
+		t.Fatalf("安装路径异常: got=%q, want=%q", path, dest)
+	}
+	if got := botHits.Load(); got != 1 {
+		t.Fatalf("自动安装应走服务端代取且只请求 1 次，实际 %d 次", got)
+	}
+	if got := sumHits.Load(); got != 0 {
+		t.Fatalf("代取命中时不应回退直连 .sha256，实际 %d 次", got)
+	}
+	if got := apiHits.Load(); got != 0 {
+		t.Fatalf("代取命中时不应回退 GitHub API，实际 %d 次", got)
+	}
+	if fi, err := os.Stat(path); err != nil || (fi.Mode()&0111) == 0 {
+		t.Fatalf("安装产物不存在或不可执行: %v", err)
+	}
+}
+
 // TestRunMiaospeedMissingBinary 验证当 miaospeed 不存在时的明确报错。
 func TestRunMiaospeedMissingBinary(t *testing.T) {
 	job := model.Job{
@@ -542,7 +630,7 @@ func TestAutoInstallMiaospeedWithProxy(t *testing.T) {
 	defer func() { newDependencyManager = oldNew }()
 
 	dest := filepath.Join(t.TempDir(), "bin", "miaospeed")
-	path, err := autoInstallMiaospeed(context.Background(), dest, srv.URL, nil)
+	path, err := autoInstallMiaospeed(context.Background(), dest, srv.URL, nil, nil)
 	if err != nil {
 		t.Fatalf("autoInstallMiaospeed 失败: %v", err)
 	}

@@ -45,7 +45,10 @@ type Runner struct {
 	binary          string
 	miaospeedBinary string
 	ghProxy         string
-	jsonOutput      atomic.Bool // 是否附加 -j（旧版本 nexttrace 不支持时自动关闭）。
+	// botDigest 是服务端代取校验值的客户端；nil 表示只走直连来源。
+	// 运行时自动安装 nexttrace/miaospeed 时注入依赖管理器。
+	botDigest  *updater.BotDigestClient
+	jsonOutput atomic.Bool // 是否附加 -j（旧版本 nexttrace 不支持时自动关闭）。
 	// waitDelay 限制“进程已被杀掉、但仍有子进程占着输出管道”时的额外等待，
 	// 避免超时任务因为派生的孙进程而把 agent 卡死。
 	waitDelay          time.Duration
@@ -62,6 +65,15 @@ type Runner struct {
 // setProgressReporter 注入实时进度回调。
 func (r *Runner) SetProgressReporter(fn func(model.Progress)) {
 	r.onProgress = fn
+}
+
+// SetBotDigest 注入服务端代取校验值的客户端（供运行时自动安装依赖使用）。
+// nil 表示禁用，退回只走直连来源。
+func (r *Runner) SetBotDigest(c *updater.BotDigestClient) {
+	if r == nil {
+		return
+	}
+	r.botDigest = c
 }
 
 // NewRunnerFull 构建执行器，可指定 miaospeed 路径与 GitHub 代理前缀。
@@ -118,6 +130,7 @@ func (r *Runner) runMiaospeed(ctx context.Context, job model.Job) runResult {
 
 	output, data, err := miaospeed.RunJobWithOptions(runCtx, r.miaospeedBinary, r.ghProxy, job, r.logger, r.onProgress, miaospeed.RunOptions{
 		AllowPrivate: r.allowPrivateProbes,
+		BotDigest:    r.botDigest,
 	})
 	if err != nil {
 		return buildMiaospeedResult(output, data, err.Error(), -1)
@@ -227,10 +240,16 @@ func (r *Runner) nexttraceBinary(ctx context.Context) (string, error) {
 
 // newDependencyManager 创建依赖管理器；测试可注入工厂返回 nil 跳过真实下载。
 func (r *Runner) newDependencyManager() *dep.DependencyManager {
+	var dm *dep.DependencyManager
 	if r.depManagerFactory != nil {
-		return r.depManagerFactory(r.ghProxy)
+		dm = r.depManagerFactory(r.ghProxy)
+	} else {
+		dm = dep.NewDependencyManager(r.ghProxy)
 	}
-	return dep.NewDependencyManager(r.ghProxy)
+	if dm != nil {
+		dm.SetBotDigest(r.botDigest)
+	}
+	return dm
 }
 
 // runNexttrace 组装 argv、执行并处理 -j 兼容回退。

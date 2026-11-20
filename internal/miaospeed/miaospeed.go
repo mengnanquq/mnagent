@@ -24,6 +24,7 @@ import (
 	"github.com/mengnanquq/mnagent/internal/dep"
 	"github.com/mengnanquq/mnagent/internal/model"
 	"github.com/mengnanquq/mnagent/internal/process"
+	"github.com/mengnanquq/mnagent/internal/updater"
 )
 
 // 常量定义：MiaoSpeed 任务类型与官方通用构建凭证。
@@ -229,6 +230,9 @@ func CalcMiaospeedTimeout(nodeCount int) time.Duration {
 type RunOptions struct {
 	// AllowPrivate 允许连接私有/保留地址（对应 -allow-private-probes）。
 	AllowPrivate bool
+	// BotDigest 是服务端代取校验值的客户端；运行时自动安装 miaospeed 时使用。
+	// nil 表示只走直连来源。
+	BotDigest *updater.BotDigestClient
 }
 
 // RunJob 执行一次 MiaoSpeed 测速任务（兼容旧调用：仅允许控制 AllowPrivate）。
@@ -257,7 +261,7 @@ func RunJobWithOptions(ctx context.Context, binary, ghProxy string, job model.Jo
 			if log != nil {
 				log.Warn("未找到 miaospeed，正在自动下载安装", "binary", binary)
 			}
-			installed, installErr := autoInstallMiaospeed(ctx, binary, ghProxy, log)
+			installed, installErr := autoInstallMiaospeed(ctx, binary, ghProxy, opts.BotDigest, log)
 			if installErr == nil && installed == "" {
 				installErr = errors.New("安装过程未返回可执行文件路径")
 			}
