@@ -786,7 +786,7 @@ func convertSingBoxOutbound(ob singBoxOutbound) *MiaospeedNode {
 			cipher = "aes-256-gcm"
 		}
 		sb.WriteString(fmt.Sprintf("name: %s\ntype: ss\nserver: %s\nport: %d\ncipher: %s\npassword: %s\nudp: true\n",
-			quoteYAML(name), quoteYAML(cleanServer), port, cipher, quoteYAML(ob.Password)))
+			quoteYAML(name), quoteYAML(cleanServer), port, quoteYAML(cipher), quoteYAML(ob.Password)))
 	case "vmess":
 		cipher := ob.Security
 		if cipher == "" {
@@ -797,7 +797,7 @@ func convertSingBoxOutbound(ob singBoxOutbound) *MiaospeedNode {
 			netType = ob.Transport.Type
 		}
 		sb.WriteString(fmt.Sprintf("name: %s\ntype: vmess\nserver: %s\nport: %d\nuuid: %s\nalterId: %d\ncipher: %s\nudp: true\nnetwork: %s\n",
-			quoteYAML(name), quoteYAML(cleanServer), port, ob.UUID, ob.AlterID, cipher, netType))
+			quoteYAML(name), quoteYAML(cleanServer), port, quoteYAML(ob.UUID), ob.AlterID, quoteYAML(cipher), quoteYAML(netType)))
 		writeSingBoxTLSAndTransport(&sb, ob, "servername")
 	case "vless":
 		netType := "tcp"
@@ -805,7 +805,7 @@ func convertSingBoxOutbound(ob singBoxOutbound) *MiaospeedNode {
 			netType = ob.Transport.Type
 		}
 		sb.WriteString(fmt.Sprintf("name: %s\ntype: vless\nserver: %s\nport: %d\nuuid: %s\nudp: true\nnetwork: %s\n",
-			quoteYAML(name), quoteYAML(cleanServer), port, ob.UUID, netType))
+			quoteYAML(name), quoteYAML(cleanServer), port, quoteYAML(ob.UUID), quoteYAML(netType)))
 		if ob.Flow != "" {
 			sb.WriteString(fmt.Sprintf("flow: %s\n", quoteYAML(ob.Flow)))
 		}
@@ -818,7 +818,7 @@ func convertSingBoxOutbound(ob singBoxOutbound) *MiaospeedNode {
 		sb.WriteString(fmt.Sprintf("name: %s\ntype: trojan\nserver: %s\nport: %d\npassword: %s\nudp: true\n",
 			quoteYAML(name), quoteYAML(cleanServer), port, quoteYAML(ob.Password)))
 		if netType != "tcp" {
-			sb.WriteString(fmt.Sprintf("network: %s\n", netType))
+			sb.WriteString(fmt.Sprintf("network: %s\n", quoteYAML(netType)))
 		}
 		writeSingBoxTLSAndTransport(&sb, ob, "sni")
 	case "hysteria2":
@@ -1056,7 +1056,7 @@ func parseShadowsocksURI(rawURI string, u *url.URL) (*MiaospeedNode, error) {
 	cleanHost := strings.Trim(strings.TrimSpace(host), "[]")
 	var sb strings.Builder
 	sb.WriteString(fmt.Sprintf("name: %s\ntype: ss\nserver: %s\nport: %d\ncipher: %s\npassword: %s\nudp: true\n",
-		quoteYAML(name), quoteYAML(cleanHost), port, method, quoteYAML(password)))
+		quoteYAML(name), quoteYAML(cleanHost), port, quoteYAML(method), quoteYAML(password)))
 	if plugin := u.Query().Get("plugin"); plugin != "" {
 		parts := strings.SplitN(plugin, ";", 2)
 		sb.WriteString(fmt.Sprintf("plugin: %s\n", quoteYAML(parts[0])))
@@ -1128,7 +1128,7 @@ func parseVmessURI(rawURI string) (*MiaospeedNode, error) {
 	cleanServer := strings.Trim(strings.TrimSpace(server), "[]")
 	var sb strings.Builder
 	sb.WriteString(fmt.Sprintf("name: %s\ntype: vmess\nserver: %s\nport: %d\nuuid: %s\nalterId: %d\ncipher: %s\nnetwork: %s\nudp: true\n",
-		quoteYAML(name), quoteYAML(cleanServer), port, uuid, alterID, cipher, netType))
+		quoteYAML(name), quoteYAML(cleanServer), port, quoteYAML(uuid), alterID, quoteYAML(cipher), quoteYAML(netType)))
 	if tls {
 		sb.WriteString("tls: true\n")
 		if sni != "" {
@@ -1263,7 +1263,7 @@ func parseVlessURI(u *url.URL) (*MiaospeedNode, error) {
 	cleanServer := strings.Trim(strings.TrimSpace(server), "[]")
 	var sb strings.Builder
 	sb.WriteString(fmt.Sprintf("name: %s\ntype: vless\nserver: %s\nport: %d\nuuid: %s\nnetwork: %s\nudp: true\n",
-		quoteYAML(name), quoteYAML(cleanServer), port, uuid, netType))
+		quoteYAML(name), quoteYAML(cleanServer), port, quoteYAML(uuid), quoteYAML(netType)))
 	if flow != "" {
 		sb.WriteString(fmt.Sprintf("flow: %s\n", quoteYAML(flow)))
 	}
@@ -1550,7 +1550,7 @@ func parseSSRURI(rawURI string) (*MiaospeedNode, error) {
 	cleanHost := strings.Trim(strings.TrimSpace(host), "[]")
 	var sb strings.Builder
 	sb.WriteString(fmt.Sprintf("name: %s\ntype: ssr\nserver: %s\nport: %d\ncipher: %s\npassword: %s\nprotocol: %s\nobfs: %s\nudp: true\n",
-		quoteYAML(name), quoteYAML(cleanHost), port, method, quoteYAML(password), protocol, obfs))
+		quoteYAML(name), quoteYAML(cleanHost), port, quoteYAML(method), quoteYAML(password), quoteYAML(protocol), quoteYAML(obfs)))
 	if obfsParam != "" {
 		sb.WriteString(fmt.Sprintf("obfs-param: %s\n", quoteYAML(obfsParam)))
 	}
@@ -1611,7 +1611,7 @@ func parseHysteria1URI(u *url.URL) (*MiaospeedNode, error) {
 	cleanServer := strings.Trim(strings.TrimSpace(server), "[]")
 	var sb strings.Builder
 	sb.WriteString(fmt.Sprintf("name: %s\ntype: hysteria\nserver: %s\nport: %d\nprotocol: %s\n",
-		quoteYAML(name), quoteYAML(cleanServer), port, protocol))
+		quoteYAML(name), quoteYAML(cleanServer), port, quoteYAML(protocol)))
 	if auth != "" {
 		sb.WriteString(fmt.Sprintf("auth-str: %s\n", quoteYAML(auth)))
 	}
@@ -1697,13 +1697,20 @@ func parseSnellURI(u *url.URL) (*MiaospeedNode, error) {
 	if version == "" {
 		version = "4"
 	}
+	// snell 的 version 在 Clash 配置里是整数；从 URI 取到的值先做数字校验，
+	// 非法（如带引号/换行/非数字）时丢弃整个节点，避免把注入内容写进 YAML，
+	// 也避免 quoteYAML 把合法版本号写成字符串 "4"。
+	versionNum, err := strconv.Atoi(version)
+	if err != nil || versionNum < 1 {
+		return nil, fmt.Errorf("snell version 非法：%q（只允许正整数）", version)
+	}
 	obfs := q.Get("obfs")
 	obfsHost := q.Get("host")
 
 	cleanServer := strings.Trim(strings.TrimSpace(server), "[]")
 	var sb strings.Builder
-	sb.WriteString(fmt.Sprintf("name: %s\ntype: snell\nserver: %s\nport: %d\npsk: %s\nversion: %s\nudp: true\n",
-		quoteYAML(name), quoteYAML(cleanServer), port, quoteYAML(psk), version))
+	sb.WriteString(fmt.Sprintf("name: %s\ntype: snell\nserver: %s\nport: %d\npsk: %s\nversion: %d\nudp: true\n",
+		quoteYAML(name), quoteYAML(cleanServer), port, quoteYAML(psk), versionNum))
 	if obfs != "" || obfsHost != "" {
 		sb.WriteString("obfs-opts:\n")
 		if obfs != "" {
@@ -1824,13 +1831,35 @@ func formatServerPortString(server, portStr string) string {
 	return cleanServer
 }
 
+// quoteYAML 把字符串包装成 YAML 双引号标量并转义特殊字符：
+// 反斜杠/双引号/CR/LF/TAB，以及其余 C0 控制字符与 DEL（\x00-\x1f、\x7f，
+// 用 \xNN 形式）。不转义控制字符会被 YAML 解析器当作非法字符或注入换行。
 func quoteYAML(s string) string {
-	s = strings.ReplaceAll(s, `\`, `\\`)
-	s = strings.ReplaceAll(s, `"`, `\"`)
-	s = strings.ReplaceAll(s, "\r", `\r`)
-	s = strings.ReplaceAll(s, "\n", `\n`)
-	s = strings.ReplaceAll(s, "\t", `\t`)
-	return `"` + s + `"`
+	var b strings.Builder
+	b.Grow(len(s) + 2)
+	b.WriteByte('"')
+	for i := 0; i < len(s); i++ {
+		switch c := s[i]; c {
+		case '\\':
+			b.WriteString(`\\`)
+		case '"':
+			b.WriteString(`\"`)
+		case '\r':
+			b.WriteString(`\r`)
+		case '\n':
+			b.WriteString(`\n`)
+		case '\t':
+			b.WriteString(`\t`)
+		default:
+			if c < 0x20 || c == 0x7f {
+				fmt.Fprintf(&b, `\x%02x`, c)
+			} else {
+				b.WriteByte(c)
+			}
+		}
+	}
+	b.WriteByte('"')
+	return b.String()
 }
 
 func sanitizeYAMLToken(s string) string {

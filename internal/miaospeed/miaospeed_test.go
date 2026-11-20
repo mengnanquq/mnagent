@@ -66,7 +66,7 @@ func TestParseProxyURIs(t *testing.T) {
 		if node.Protocol != "ss" || node.Server != "1.2.3.4:8388" || node.Name != "HK-SS" {
 			t.Fatalf("节点信息不符合预期: %+v", node)
 		}
-		if !strings.Contains(node.Payload, "type: ss") || !strings.Contains(node.Payload, "cipher: aes-128-gcm") {
+		if !strings.Contains(node.Payload, "type: ss") || !strings.Contains(node.Payload, `cipher: "aes-128-gcm"`) {
 			t.Fatalf("Payload YAML 错误: %s", node.Payload)
 		}
 	})
@@ -108,7 +108,7 @@ func TestParseProxyURIs(t *testing.T) {
 		if node.Protocol != "vmess" || node.Server != "jp.node.example:443" || node.Name != "JP-VMess" {
 			t.Fatalf("节点信息不符合预期: %+v", node)
 		}
-		if !strings.Contains(node.Payload, "type: vmess") || !strings.Contains(node.Payload, "network: ws") {
+		if !strings.Contains(node.Payload, "type: vmess") || !strings.Contains(node.Payload, `network: "ws"`) {
 			t.Fatalf("Payload YAML 错误: %s", node.Payload)
 		}
 	})
@@ -136,7 +136,7 @@ func TestParseProxyURIs(t *testing.T) {
 		if node.Protocol != "vless" || node.Server != "vless.example:443" || node.Name != "SG-VLESS" {
 			t.Fatalf("节点信息不符合预期: %+v", node)
 		}
-		if !strings.Contains(node.Payload, "type: vless") || !strings.Contains(node.Payload, "uuid: uuid-vless-123") {
+		if !strings.Contains(node.Payload, "type: vless") || !strings.Contains(node.Payload, `uuid: "uuid-vless-123"`) {
 			t.Fatalf("Payload YAML 错误: %s", node.Payload)
 		}
 	})
@@ -783,7 +783,7 @@ func TestParseVlessURIComprehensive(t *testing.T) {
 			t.Fatalf("基础信息不符合预期: %+v", node)
 		}
 		p := node.Payload
-		if !strings.Contains(p, `uuid: 3725dcb7-5767-472d-93be-872cdd4a7e0f`) {
+		if !strings.Contains(p, `uuid: "3725dcb7-5767-472d-93be-872cdd4a7e0f"`) {
 			t.Fatalf("缺少 uuid: %s", p)
 		}
 		if !strings.Contains(p, `flow: "xtls-rprx-vision"`) {
@@ -1024,10 +1024,10 @@ func TestParseSSRURI(t *testing.T) {
 		t.Fatalf("基础信息不符合预期: %+v", node)
 	}
 	p := node.Payload
-	if !strings.Contains(p, "type: ssr") || !strings.Contains(p, "cipher: aes-128-cfb") || !strings.Contains(p, `password: "pass123"`) {
+	if !strings.Contains(p, "type: ssr") || !strings.Contains(p, `cipher: "aes-128-cfb"`) || !strings.Contains(p, `password: "pass123"`) {
 		t.Fatalf("Payload 缺少核心字段: %s", p)
 	}
-	if !strings.Contains(p, "protocol: auth_aes128_md5") || !strings.Contains(p, "obfs: tls1.2_ticket_auth") {
+	if !strings.Contains(p, `protocol: "auth_aes128_md5"`) || !strings.Contains(p, `obfs: "tls1.2_ticket_auth"`) {
 		t.Fatalf("Payload 缺少协议或混淆: %s", p)
 	}
 	if !strings.Contains(p, `obfs-param: "bing.com"`) || !strings.Contains(p, `protocol-param: "123456"`) {
@@ -1049,7 +1049,7 @@ func TestParseHysteria1URI(t *testing.T) {
 		t.Fatalf("基础信息不符合预期: %+v", node)
 	}
 	p := node.Payload
-	if !strings.Contains(p, "type: hysteria") || !strings.Contains(p, "protocol: udp") {
+	if !strings.Contains(p, "type: hysteria") || !strings.Contains(p, `protocol: "udp"`) {
 		t.Fatalf("Payload 缺少协议信息: %s", p)
 	}
 	if !strings.Contains(p, `auth-str: "secret123"`) || !strings.Contains(p, `up: "100"`) || !strings.Contains(p, `down: "200"`) {
