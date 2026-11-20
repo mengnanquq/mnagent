@@ -19,6 +19,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -2031,8 +2032,244 @@ func TestFetchSubscriptionRedactsURLOnError(t *testing.T) {
 	if strings.Contains(err.Error(), token) {
 		t.Fatalf("严重安全漏洞：fetchAndParseSubscription 错误返回了敏感 Token %q，实际: %v", token, err)
 	}
-	if !strings.Contains(err.Error(), "https://nonexistent-airport-sub-domain.xyz/***") {
-		t.Fatalf("期望错误中包含脱敏域名 https://nonexistent-airport-sub-domain.xyz/***，实际: %v", err)
+	if !strings.Contains(err.Error(), "https://nonexistent-airport-sub-domain.example/***") {
+		t.Fatalf("期望错误中包含脱敏域名 https://nonexistent-airport-sub-domain.example/***，实际: %v", err)
+	}
+}
+
+// TestParseProxyTargetRejectsOversizedInlineTarget 验证内联配置在入口处即被拒绝，
+// 避免单个任务把低内存探针（32–64MB OpenWrt）撑到 OOM；错误必须明确而不是截断后
+// 解析出半截节点。
+func TestParseProxyTargetRejectsOversizedInlineTarget(t *testing.T) {
+	orig := maxInlineProxyTargetBytes
+	maxInlineProxyTargetBytes = 1024
+	defer func() { maxInlineProxyTargetBytes = orig }()
+
+	target := strings.Repeat("a", maxInlineProxyTargetBytes+1)
+	if _, err := parseProxyTarget(context.Background(), target); err == nil {
+		t.Fatal("超过内联配置上限时应返回错误")
+	} else if !strings.Contains(err.Error(), "内联代理配置过大") || !strings.Contains(err.Error(), "当前设备上限") {
+		t.Fatalf("错误信息应明确指出配置过大并带上当前设备上限，实际: %v", err)
+	}
+}
+
+// TestProxyContentLimitsFromMeminfo 验证内联/订阅上限按 MemTotal 收紧并保底 2MB，
+// 非 Linux 或读取失败时保持默认值。
+func TestProxyContentLimitsFromMeminfo(t *testing.T) {
+	origInline, origSub, origReader := maxInlineProxyTargetBytes, maxSubscriptionBytes, readMemTotalKB
+	defer func() {
+		maxInlineProxyTargetBytes, maxSubscriptionBytes, readMemTotalKB = origInline, origSub, origReader
+	}()
+	if runtime.GOOS != "linux" {
+		t.Skip("MemTotal 计算只在 Linux 生效")
+	}
+
+	readMemTotalKB = func() (int64, bool) { return 32 << 10, true } // 32MB
+	refreshProxyContentLimits()
+	if want := int(int64(32<<20) / 8); maxInlineProxyTargetBytes != want {
+		t.Fatalf("32MB 设备内联上限应为 %d，实际 %d", want, maxInlineProxyTargetBytes)
+	}
+	if want := int64(32<<20) / 6; maxSubscriptionBytes != want {
+		t.Fatalf("32MB 设备订阅上限应为 %d，实际 %d", want, maxSubscriptionBytes)
+	}
+
+	readMemTotalKB = func() (int64, bool) { return 4 << 10, true } // 4MB
+	refreshProxyContentLimits()
+	if maxInlineProxyTargetBytes != minProxyContentLimitBytes || maxSubscriptionBytes != minProxyContentLimitBytes {
+		t.Fatalf("极小内存设备应保底 %d 字节，实际 inline=%d sub=%d", minProxyContentLimitBytes, maxInlineProxyTargetBytes, maxSubscriptionBytes)
+	}
+
+	readMemTotalKB = func() (int64, bool) { return 0, false }
+	refreshProxyContentLimits()
+	if maxInlineProxyTargetBytes != defaultMaxInlineProxyTargetBytes || maxSubscriptionBytes != defaultMaxSubscriptionBytes {
+		t.Fatalf("读取 MemTotal 失败时应使用默认上限，实际 inline=%d sub=%d", maxInlineProxyTargetBytes, maxSubscriptionBytes)
+	}
+}
+
+// TestParseClashYAMLProxiesCapsCandidateNodes 验证 Clash 解析在候选上限处停止保留节点，
+// 避免超大配置把全部节点与 payload 同时驻留内存。
+func TestParseClashYAMLProxiesCapsCandidateNodes(t *testing.T) {
+	orig := maxNodeFilterCandidates
+	maxNodeFilterCandidates = 3
+	defer func() { maxNodeFilterCandidates = orig }()
+
+	var b strings.Builder
+	b.WriteString("proxies:\n")
+	for i := 0; i < 10; i++ {
+		fmt.Fprintf(&b, "  - name: node-%d\n    type: ss\n    server: 192.0.2.%d\n    port: 443\n    cipher: aes-256-gcm\n    password: p\n", i, i+1)
+	}
+	nodes, err := parseProxyContent(b.String())
+	if err != nil {
+		t.Fatalf("解析 Clash 配置失败: %v", err)
+	}
+	if len(nodes) != maxNodeFilterCandidates {
+		t.Fatalf("应只保留 %d 个候选节点，实际 %d", maxNodeFilterCandidates, len(nodes))
+	}
+	for _, n := range nodes {
+		if n.URL != "" {
+			t.Fatalf("解析阶段不应为节点生成 URL: %+v", n)
+		}
+	}
+}
+
+// TestParseProxyContentURIListCapsCandidateNodes 验证裸 URI 列表路径同样受
+// maxNodeFilterCandidates 约束，超出部分不再构造节点。
+func TestParseProxyContentURIListCapsCandidateNodes(t *testing.T) {
+	orig := maxNodeFilterCandidates
+	maxNodeFilterCandidates = 3
+	defer func() { maxNodeFilterCandidates = orig }()
+
+	var b strings.Builder
+	for i := 0; i < 10; i++ {
+		fmt.Fprintf(&b, "trojan://pass@192.0.2.%d:443#node-%d\n", i+1, i)
+	}
+	nodes, err := parseProxyContent(b.String())
+	if err != nil {
+		t.Fatalf("解析 URI 列表失败: %v", err)
+	}
+	if len(nodes) != maxNodeFilterCandidates {
+		t.Fatalf("应只保留 %d 个候选节点，实际 %d", maxNodeFilterCandidates, len(nodes))
+	}
+}
+
+// TestSubscriptionRejectsOversizedBody 验证订阅超过上限时明确报错，而不是静默截断。
+func TestSubscriptionRejectsOversizedBody(t *testing.T) {
+	orig := maxSubscriptionBytes
+	maxSubscriptionBytes = 1024
+	defer func() { maxSubscriptionBytes = orig }()
+
+	body := strings.Repeat("a", int(maxSubscriptionBytes)+1)
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = w.Write([]byte(body))
+	}))
+	defer srv.Close()
+
+	_, err := fetchAndParseSubscription(context.Background(), srv.URL, true)
+	if err == nil || !strings.Contains(err.Error(), "订阅内容超过当前设备上限") {
+		t.Fatalf("超限订阅应返回明确错误，实际: %v", err)
+	}
+}
+
+// TestSubscriptionRejectsOversizedContentLengthBeforeRead 验证响应带超限
+// Content-Length 时在读取 body 之前就拒绝，避免先把超限内容读进内存。
+func TestSubscriptionRejectsOversizedContentLengthBeforeRead(t *testing.T) {
+	orig := maxSubscriptionBytes
+	maxSubscriptionBytes = 1024
+	defer func() { maxSubscriptionBytes = orig }()
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Length", fmt.Sprintf("%d", maxSubscriptionBytes+1))
+		w.WriteHeader(http.StatusOK)
+		if f, ok := w.(http.Flusher); ok {
+			f.Flush()
+		}
+		// 不发送 body：若客户端仍尝试 ReadAll，会一直等到 ctx 超时；
+		// 按 Content-Length 提前拒绝时则立即关闭 body 并返回。
+		<-r.Context().Done()
+	}))
+	defer srv.Close()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	start := time.Now()
+	_, err := fetchAndParseSubscription(ctx, srv.URL, true)
+	elapsed := time.Since(start)
+	if err == nil || !strings.Contains(err.Error(), "订阅内容超过当前设备上限") {
+		t.Fatalf("超限 Content-Length 应返回明确错误，实际: %v", err)
+	}
+	if elapsed >= time.Second {
+		t.Fatalf("超限 Content-Length 应在读取 body 之前拒绝，实际耗时 %v", elapsed)
+	}
+}
+
+// TestReportNodeURLKeepsOriginalDomain 验证 pinNodeServerIP 把 payload 的 server
+// 钉死为 IP 后，报告里的节点链接仍使用原始域名。
+func TestReportNodeURLKeepsOriginalDomain(t *testing.T) {
+	node := MiaospeedNode{
+		Name:     "domain-node",
+		Protocol: "ss",
+		Server:   "edge.example:443",
+		Payload:  "name: domain-node\ntype: ss\nserver: edge.example\nport: 443\ncipher: aes-256-gcm\npassword: p\n",
+	}
+	pinned, err := pinNodeServerIP(node, net.ParseIP("1.1.1.1"))
+	if err != nil {
+		t.Fatalf("钉死节点失败: %v", err)
+	}
+	rep := parseSingleSlot(slaveEntrySlot{}, &pinned, miaospeedTestPlan{})
+	if !strings.Contains(rep.URL, "@edge.example:443") {
+		t.Fatalf("报告节点链接应保留原始域名，实际: %q", rep.URL)
+	}
+	if strings.Contains(rep.URL, "1.1.1.1") {
+		t.Fatalf("报告节点链接不应退化为钉死 IP，实际: %q", rep.URL)
+	}
+}
+
+// TestParseSingBoxJSONCapsCandidateNodes 验证 Sing-box JSON 同样受候选上限约束。
+func TestParseSingBoxJSONCapsCandidateNodes(t *testing.T) {
+	orig := maxNodeFilterCandidates
+	maxNodeFilterCandidates = 2
+	defer func() { maxNodeFilterCandidates = orig }()
+
+	outbounds := make([]string, 0, 8)
+	for i := 0; i < 8; i++ {
+		outbounds = append(outbounds, fmt.Sprintf(`{"type":"ss","tag":"node-%d","server":"192.0.2.%d","server_port":443,"method":"aes-256-gcm","password":"p"}`, i, i+1))
+	}
+	nodes := parseSingBoxJSON(`{"outbounds":[` + strings.Join(outbounds, ",") + `]}`)
+	if len(nodes) != maxNodeFilterCandidates {
+		t.Fatalf("应只保留 %d 个候选节点，实际 %d", maxNodeFilterCandidates, len(nodes))
+	}
+}
+
+// TestParseSingBoxJSONHandlesKeyOrder 验证流式解析同时支持 outbounds/proxies
+// 两种顶层键，且不依赖它们在 JSON 中出现的先后顺序。
+func TestParseSingBoxJSONHandlesKeyOrder(t *testing.T) {
+	node := func(name, server string) string {
+		return fmt.Sprintf(`{"type":"ss","tag":"%s","server":"%s","server_port":443,"method":"aes-256-gcm","password":"p"}`, name, server)
+	}
+	cases := []struct {
+		name    string
+		content string
+		want    string
+	}{
+		{
+			name:    "proxies 在 outbounds 之前时仍优先 outbounds",
+			content: `{"proxies":[` + node("proxy", "192.0.2.1") + `],"padding":"` + strings.Repeat("x", 1024) + `","outbounds":[` + node("outbound", "192.0.2.2") + `]}`,
+			want:    "outbound",
+		},
+		{
+			name:    "outbounds 为空时回退 proxies",
+			content: `{"outbounds":[],"padding":"` + strings.Repeat("x", 1024) + `","proxies":[` + node("proxy", "192.0.2.3") + `]}`,
+			want:    "proxy",
+		},
+		{
+			name:    "outbounds 在 proxies 之前时忽略 proxies",
+			content: `{"outbounds":[` + node("first", "192.0.2.4") + `],"proxies":[` + node("second", "192.0.2.5") + `]}`,
+			want:    "first",
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			nodes := parseSingBoxJSON(tc.content)
+			if len(nodes) != 1 || nodes[0].Name != tc.want {
+				t.Fatalf("应解析出节点 %q，实际: %+v", tc.want, nodes)
+			}
+		})
+	}
+}
+
+// TestReportNodeURLGeneratedOnDemand 验证 Clash 解析阶段不再生成 URL，但产出报告时
+// 仍按原语义补齐，避免报告字段静默丢失。
+func TestReportNodeURLGeneratedOnDemand(t *testing.T) {
+	nodes := parseClashYAMLProxies("proxies:\n  - name: lazy-url\n    type: ss\n    server: 192.0.2.10\n    port: 443\n    cipher: aes-256-gcm\n    password: p\n")
+	if len(nodes) != 1 {
+		t.Fatalf("解析节点数异常: %d", len(nodes))
+	}
+	if nodes[0].URL != "" {
+		t.Fatalf("解析阶段不应生成 URL，实际: %s", nodes[0].URL)
+	}
+	rep := parseSingleSlot(slaveEntrySlot{}, &nodes[0], miaospeedTestPlan{})
+	if !strings.HasPrefix(rep.URL, "ss://") {
+		t.Fatalf("报告应在需要时生成节点 URL，实际: %q", rep.URL)
 	}
 }
 

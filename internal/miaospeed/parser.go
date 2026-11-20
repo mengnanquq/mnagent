@@ -7,10 +7,13 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log/slog"
 	"net"
 	"net/http"
 	"net/url"
+	"os"
 	"regexp"
+	"runtime"
 	"strconv"
 	"strings"
 	"time"
@@ -30,8 +33,84 @@ type MiaospeedNode struct {
 	URL      string // 节点原始或生成的代理 URL
 }
 
+// 代理配置大小上限默认值。服务端会对 ≤12MB 的配置正文做内联下发
+// （mengnanbot subscription.go），订阅下载默认 16MB；低内存设备还要按物理内存收紧。
+// 超限直接报错而不是截断：截断后的 YAML/JSON 往往还能解析出半截节点，容易把
+// “配置过大”误报成“没有有效节点”，也会让用户以为任务已按原样执行。
+const (
+	defaultMaxInlineProxyTargetBytes = 12 << 20
+	defaultMaxSubscriptionBytes      = 16 << 20
+	minProxyContentLimitBytes        = 2 << 20
+)
+
+var (
+	// maxInlineProxyTargetBytes / maxSubscriptionBytes 是当前设备实际生效的上限，
+	// 启动时按 /proc/meminfo 的 MemTotal 计算（非 Linux 或读取失败时用默认值）。
+	maxInlineProxyTargetBytes       = defaultMaxInlineProxyTargetBytes
+	maxSubscriptionBytes      int64 = defaultMaxSubscriptionBytes
+	// readMemTotalKB 可在测试中注入，返回物理内存总量（KB）。
+	readMemTotalKB = readLinuxMemTotalKB
+)
+
+func init() {
+	refreshProxyContentLimits()
+}
+
+// refreshProxyContentLimits 按设备内存重算内联配置与订阅上限：
+// 内联 min(12MB, MemTotal/8)，订阅 min(16MB, MemTotal/6)，两者下限均为 2MB。
+// 32–64MB 的 OpenWrt 设备据此把上限压到 4–10MB，避免“上限没到但内存先耗尽”。
+func refreshProxyContentLimits() {
+	maxInlineProxyTargetBytes = defaultMaxInlineProxyTargetBytes
+	maxSubscriptionBytes = defaultMaxSubscriptionBytes
+	if runtime.GOOS != "linux" {
+		return
+	}
+	memKB, ok := readMemTotalKB()
+	if !ok || memKB <= 0 {
+		return
+	}
+	memBytes := memKB * 1024
+	maxInlineProxyTargetBytes = int(capProxyContentLimit(defaultMaxInlineProxyTargetBytes, memBytes/8))
+	maxSubscriptionBytes = capProxyContentLimit(defaultMaxSubscriptionBytes, memBytes/6)
+}
+
+func capProxyContentLimit(def, byMemory int64) int64 {
+	limit := def
+	if byMemory > 0 && byMemory < limit {
+		limit = byMemory
+	}
+	if limit < minProxyContentLimitBytes {
+		limit = minProxyContentLimitBytes
+	}
+	return limit
+}
+
+// readLinuxMemTotalKB 读取 /proc/meminfo 的 MemTotal（KB）。
+func readLinuxMemTotalKB() (int64, bool) {
+	data, err := os.ReadFile("/proc/meminfo")
+	if err != nil {
+		return 0, false
+	}
+	for _, line := range strings.Split(string(data), "\n") {
+		fields := strings.Fields(line)
+		if len(fields) < 2 || fields[0] != "MemTotal:" {
+			continue
+		}
+		kb, err := strconv.ParseInt(fields[1], 10, 64)
+		if err != nil || kb <= 0 {
+			return 0, false
+		}
+		return kb, true
+	}
+	return 0, false
+}
+
 // parseProxyTarget 将任务 Target（单节点链接、订阅 URL 或代理配置文件内容）解析为节点列表。
 func parseProxyTarget(ctx context.Context, target string, allowPrivate ...bool) ([]MiaospeedNode, error) {
+	if len(target) > maxInlineProxyTargetBytes {
+		return nil, fmt.Errorf("内联代理配置过大：%d 字节，超过当前设备上限 %d MB（请改用订阅 URL，或减少配置中的节点数量）",
+			len(target), maxInlineProxyTargetBytes>>20)
+	}
 	target = strings.TrimSpace(target)
 	if target == "" {
 		return nil, errors.New("目标地址不能为空")
@@ -107,16 +186,30 @@ func parseProxyContent(content string) ([]MiaospeedNode, error) {
 		}
 	}
 
-	// 5. 多行代理 URI 列表扫描
+	// 5. 多行代理 URI 列表扫描：同样受候选节点上限约束，超出部分只计数、
+	// 不再构造 MiaospeedNode（不保留 URL/凭据）并停止继续累积。
 	var uriNodes []MiaospeedNode
+	uriOverflow := 0
 	for _, line := range trimmedLines {
 		line = strings.TrimSpace(line)
 		if line == "" || strings.HasPrefix(line, "#") || strings.HasPrefix(line, "//") {
 			continue
 		}
-		if n, err := parseProxyURI(line); err == nil && n != nil {
-			uriNodes = append(uriNodes, *n)
+		// 先判断上限再解析：超限行只计数，避免对 12MB 列表逐行构造节点/URL
+		// 后又立刻丢弃，造成数倍于输入的内存峰值。
+		if len(uriNodes) >= maxNodeFilterCandidates {
+			uriOverflow++
+			continue
 		}
+		n, err := parseProxyURI(line)
+		if err != nil || n == nil {
+			continue
+		}
+		uriNodes = append(uriNodes, *n)
+	}
+	if uriOverflow > 0 {
+		slog.Warn("URI 列表节点数超过单次安全检查上限，超出部分未参与测速",
+			"limit", maxNodeFilterCandidates, "overflow", uriOverflow)
 	}
 	if len(uriNodes) > 0 {
 		return uriNodes, nil
@@ -242,12 +335,22 @@ func fetchAndParseSubscription(ctx context.Context, subURL string, allowPrivate 
 			lastErr = fmt.Errorf("拉取订阅返回 HTTP %d", resp.StatusCode)
 			continue
 		}
+		// 响应声明了 Content-Length 且已超限时，读取 body 之前就拒绝，
+		// 避免先把超限内容读入内存再报错。
+		if resp.ContentLength > maxSubscriptionBytes {
+			resp.Body.Close()
+			return nil, fmt.Errorf("订阅内容超过当前设备上限（%d MB），已拒绝解析；请精简订阅或改用较小的配置", maxSubscriptionBytes>>20)
+		}
 
-		body, err := io.ReadAll(io.LimitReader(resp.Body, 8<<20)) // 限制 8MB
+		// 多读 1 字节用于判断是否超限：超限必须明确报错，不能静默截断成半截配置。
+		body, err := io.ReadAll(io.LimitReader(resp.Body, maxSubscriptionBytes+1))
 		resp.Body.Close()
 		if err != nil {
 			lastErr = err
 			continue
+		}
+		if int64(len(body)) > maxSubscriptionBytes {
+			return nil, fmt.Errorf("订阅内容超过当前设备上限（%d MB），已拒绝解析；请精简订阅或改用较小的配置", maxSubscriptionBytes>>20)
 		}
 
 		content := strings.TrimSpace(string(body))
@@ -427,8 +530,10 @@ func parseClashYAMLProxies(content string) []MiaospeedNode {
 	content = strings.ReplaceAll(content, "\r\n", "\n")
 	lines := strings.Split(content, "\n")
 	var nodes []MiaospeedNode
+	overflow := 0
 	inProxies := false
 	baseIndent := -1
+	stopBuilding := false
 
 	var currentItem strings.Builder
 	currentName := ""
@@ -441,15 +546,18 @@ func parseClashYAMLProxies(content string) []MiaospeedNode {
 		if inItem && currentItem.Len() > 0 {
 			payload := strings.TrimSpace(currentItem.String())
 			if currentName != "" && payload != "" {
-				srv := formatServerPortString(currentServer, currentPort)
-				nodeURL := formatClashPayloadToURI(payload, currentName, currentType, currentServer, currentPort)
-				nodes = append(nodes, MiaospeedNode{
-					Name:     currentName,
-					Protocol: currentType,
-					Server:   srv,
-					Payload:  payload,
-					URL:      nodeURL,
-				})
+				if len(nodes) >= maxNodeFilterCandidates {
+					// 超出候选上限的节点不再构造 MiaospeedNode（不保留 payload、不生成 URL），
+					// 但仍计数并写日志，保持 fail-closed 的可观测性。
+					overflow++
+				} else {
+					nodes = append(nodes, MiaospeedNode{
+						Name:     currentName,
+						Protocol: currentType,
+						Server:   formatServerPortString(currentServer, currentPort),
+						Payload:  payload,
+					})
+				}
 			}
 		}
 		currentItem.Reset()
@@ -483,10 +591,24 @@ func parseClashYAMLProxies(content string) []MiaospeedNode {
 			// 计算当前行前置空白缩进
 			indent := len(line) - len(strings.TrimLeft(line, " \t"))
 
+			// 已达到候选上限：不再构造 currentItem / 解析字段，只用轻量的
+			// 顶层列表项计数说明还有多少节点被丢弃。
+			if stopBuilding {
+				if strings.HasPrefix(trimmed, "-") && (baseIndent == -1 || indent == baseIndent) {
+					overflow++
+				}
+				continue
+			}
+
 			// 单行格式: - {name: ..., server: ..., ...}
 			if strings.HasPrefix(trimmed, "- {") || strings.HasPrefix(trimmed, "-{") {
 				flushItem()
 				baseIndent = indent
+				if len(nodes) >= maxNodeFilterCandidates {
+					stopBuilding = true
+					overflow++
+					continue
+				}
 				rawItem := strings.TrimSpace(strings.TrimPrefix(trimmed, "-"))
 				if closeIdx := strings.LastIndex(rawItem, "}"); closeIdx != -1 {
 					rawItem = rawItem[:closeIdx+1]
@@ -496,15 +618,16 @@ func parseClashYAMLProxies(content string) []MiaospeedNode {
 				server := extractField(rawItem, "server")
 				port := extractField(rawItem, "port")
 				if name != "" {
-					srv := formatServerPortString(server, port)
-					nodeURL := formatClashPayloadToURI(rawItem, name, pType, server, port)
-					nodes = append(nodes, MiaospeedNode{
-						Name:     name,
-						Protocol: pType,
-						Server:   srv,
-						Payload:  rawItem,
-						URL:      nodeURL,
-					})
+					if len(nodes) >= maxNodeFilterCandidates {
+						overflow++
+					} else {
+						nodes = append(nodes, MiaospeedNode{
+							Name:     name,
+							Protocol: pType,
+							Server:   formatServerPortString(server, port),
+							Payload:  rawItem,
+						})
+					}
 				}
 				continue
 			}
@@ -522,6 +645,11 @@ func parseClashYAMLProxies(content string) []MiaospeedNode {
 
 			if isNewItem {
 				flushItem()
+				if len(nodes) >= maxNodeFilterCandidates {
+					stopBuilding = true
+					overflow++
+					continue
+				}
 				inItem = true
 				contentAfterDash := strings.TrimSpace(strings.TrimPrefix(trimmed, "-"))
 				if contentAfterDash != "" {
@@ -542,6 +670,10 @@ func parseClashYAMLProxies(content string) []MiaospeedNode {
 		}
 	}
 	flushItem()
+	if overflow > 0 {
+		slog.Warn("Clash 配置节点数超过单次安全检查上限，超出部分未参与测速",
+			"limit", maxNodeFilterCandidates, "overflow", overflow)
+	}
 	return nodes
 }
 
@@ -698,39 +830,182 @@ func (o *singBoxObfs) UnmarshalJSON(data []byte) error {
 }
 
 // parseSingBoxJSON 从 Sing-box JSON 配置文件（或节点数组/单节点 JSON）中提取代理节点。
+// 使用 json.Decoder 流式读取，只物化前 maxNodeFilterCandidates 个 outbounds/proxies
+// 的 RawMessage：避免 []byte(content) 的整份拷贝，也不把超大数组一次解成全字段结构体。
+// outbounds 与 proxies 两种顶层键都支持，且不依赖它们在 JSON 中出现的先后顺序。
 func parseSingBoxJSON(content string) []MiaospeedNode {
 	content = strings.TrimSpace(content)
-	var outbounds []singBoxOutbound
+	var (
+		rawOutbounds []json.RawMessage
+		overflow     int
+	)
 
-	if strings.HasPrefix(content, "[") {
-		_ = json.Unmarshal([]byte(content), &outbounds)
-	} else if strings.HasPrefix(content, "{") {
-		var wrapper struct {
-			Outbounds []singBoxOutbound `json:"outbounds"`
-			Proxies   []singBoxOutbound `json:"proxies"`
+	switch {
+	case strings.HasPrefix(content, "["):
+		dec := json.NewDecoder(strings.NewReader(content))
+		raws, over, err := decodeSingBoxArrayLimited(dec, maxNodeFilterCandidates)
+		if err == nil {
+			rawOutbounds, overflow = raws, over
 		}
-		if err := json.Unmarshal([]byte(content), &wrapper); err == nil {
-			if len(wrapper.Outbounds) > 0 {
-				outbounds = wrapper.Outbounds
-			} else if len(wrapper.Proxies) > 0 {
-				outbounds = wrapper.Proxies
+	case strings.HasPrefix(content, "{"):
+		var outbounds, proxies []json.RawMessage
+		var outboundOverflow, proxyOverflow int
+		objectOK := true
+		dec := json.NewDecoder(strings.NewReader(content))
+		if tok, err := dec.Token(); err == nil && tok == json.Delim('{') {
+		objectLoop:
+			for dec.More() {
+				keyTok, err := dec.Token()
+				if err != nil {
+					objectOK = false
+					break
+				}
+				key, ok := keyTok.(string)
+				if !ok {
+					objectOK = false
+					break
+				}
+				switch key {
+				case "outbounds":
+					raws, over, err := decodeSingBoxArrayLimited(dec, maxNodeFilterCandidates)
+					if err != nil {
+						objectOK = false
+						break objectLoop
+					}
+					outbounds, outboundOverflow = raws, over
+					if len(outbounds) > 0 {
+						// outbounds 优先于 proxies，与原有语义一致；已被 outbounds 取代的
+						// proxies 立即释放，避免两份候选同时驻留。
+						proxies, proxyOverflow = nil, 0
+					}
+				case "proxies":
+					raws, over, err := decodeSingBoxArrayLimited(dec, maxNodeFilterCandidates)
+					if err != nil {
+						objectOK = false
+						break objectLoop
+					}
+					proxies, proxyOverflow = raws, over
+					if len(outbounds) > 0 {
+						proxies, proxyOverflow = nil, 0
+					}
+				default:
+					if err := skipJSONValue(dec); err != nil {
+						objectOK = false
+						break objectLoop
+					}
+				}
 			}
+			if objectOK {
+				if closing, err := dec.Token(); err != nil || closing != json.Delim('}') {
+					objectOK = false
+				}
+			}
+		} else {
+			objectOK = false
 		}
-		if len(outbounds) == 0 {
-			var single singBoxOutbound
-			if err := json.Unmarshal([]byte(content), &single); err == nil && single.Type != "" && single.Server != "" {
-				outbounds = []singBoxOutbound{single}
+		if objectOK {
+			if len(outbounds) > 0 {
+				rawOutbounds, overflow = outbounds, outboundOverflow
+			} else if len(proxies) > 0 {
+				rawOutbounds, overflow = proxies, proxyOverflow
 			}
 		}
 	}
 
-	var nodes []MiaospeedNode
-	for _, ob := range outbounds {
+	if len(rawOutbounds) == 0 {
+		// 单节点 JSON：只在没有 outbounds/proxies 数组时回退，避免把配置对象误当节点。
+		var single singBoxOutbound
+		if err := json.Unmarshal([]byte(content), &single); err == nil && single.Type != "" && single.Server != "" {
+			if n := convertSingBoxOutbound(single); n != nil {
+				return []MiaospeedNode{*n}
+			}
+			return nil
+		}
+		return nil
+	}
+	if overflow > 0 {
+		slog.Warn("Sing-box 配置节点数超过单次安全检查上限，超出部分未参与测速",
+			"limit", maxNodeFilterCandidates, "overflow", overflow)
+	}
+
+	nodes := make([]MiaospeedNode, 0, len(rawOutbounds))
+	for _, raw := range rawOutbounds {
+		var ob singBoxOutbound
+		if err := json.Unmarshal(raw, &ob); err != nil {
+			continue
+		}
 		if n := convertSingBoxOutbound(ob); n != nil {
 			nodes = append(nodes, *n)
 		}
 	}
 	return nodes
+}
+
+// decodeSingBoxArrayLimited 流式读取一个 JSON 数组，只保留前 limit 个元素的
+// RawMessage；超出的元素用 Token 递归跳过并计数，不再整段物化。
+func decodeSingBoxArrayLimited(dec *json.Decoder, limit int) ([]json.RawMessage, int, error) {
+	tok, err := dec.Token()
+	if err != nil {
+		return nil, 0, err
+	}
+	if tok != json.Delim('[') {
+		return nil, 0, fmt.Errorf("期望 JSON 数组，实际为 %v", tok)
+	}
+	raws := make([]json.RawMessage, 0, min(limit, 16))
+	overflow := 0
+	for dec.More() {
+		if len(raws) < limit {
+			var raw json.RawMessage
+			if err := dec.Decode(&raw); err != nil {
+				return nil, overflow, err
+			}
+			raws = append(raws, raw)
+			continue
+		}
+		if err := skipJSONValue(dec); err != nil {
+			return nil, overflow, err
+		}
+		overflow++
+	}
+	if _, err := dec.Token(); err != nil { // 消费 ']'
+		return nil, overflow, err
+	}
+	return raws, overflow, nil
+}
+
+// skipJSONValue 用 Decoder.Token 递归跳过一个 JSON 值，不保留任何内容。
+func skipJSONValue(dec *json.Decoder) error {
+	tok, err := dec.Token()
+	if err != nil {
+		return err
+	}
+	delim, ok := tok.(json.Delim)
+	if !ok {
+		return nil
+	}
+	switch delim {
+	case '{':
+		for dec.More() {
+			if _, err := dec.Token(); err != nil { // key
+				return err
+			}
+			if err := skipJSONValue(dec); err != nil {
+				return err
+			}
+		}
+		_, err = dec.Token()
+		return err
+	case '[':
+		for dec.More() {
+			if err := skipJSONValue(dec); err != nil {
+				return err
+			}
+		}
+		_, err = dec.Token()
+		return err
+	default:
+		return nil
+	}
 }
 
 func convertSingBoxOutbound(ob singBoxOutbound) *MiaospeedNode {

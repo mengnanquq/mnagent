@@ -281,6 +281,9 @@ func RunJobWithOptions(ctx context.Context, binary, ghProxy string, job model.Jo
 	if removed > 0 && log != nil {
 		log.Warn("已剔除存在安全风险的节点（私有/保留/元数据地址、域名无法解析、协议不在白名单或节点配置无法安全改写）", "removed", removed, "kept", len(allNodes), "allow_private", allowPriv)
 	}
+	if err := ctx.Err(); err != nil {
+		return "", nil, fmt.Errorf("任务已取消：%w", err)
+	}
 	if len(allNodes) == 0 {
 		if allowPriv {
 			return "", nil, fmt.Errorf("安全拦截：全部 %d 个节点均未通过节点安全检查（协议不在白名单、节点配置无法安全改写，或服务器地址无法解析），已拒绝测速（已剔除 %d 个）", removed, removed)
@@ -359,8 +362,10 @@ func RunJobWithOptions(ctx context.Context, binary, ghProxy string, job model.Jo
 		return "", nil, fmt.Errorf("序列化结果数据失败: %w", err)
 	}
 
-	// 数据直接返回 JSON 供机器人端解析与排版展示
-	return string(data), data, nil
+	// 数据直接返回 JSON 供机器人端解析与排版展示。
+	// output 不再重复返回同一份 JSON 字符串：结果可达数 MB，多复制一份会直接翻倍
+	// 内存占用与回传体积；runner 在 Data 非空时也只使用 Data。
+	return "", data, nil
 }
 
 type miaospeedTestPlan struct {
@@ -934,9 +939,4 @@ type Logger interface {
 	Info(msg string, args ...any)
 	Warn(msg string, args ...any)
 	Debug(msg string, args ...any)
-}
-
-// runMiaospeedJob 为兼容内部测试提供的别名。
-func runMiaospeedJob(ctx context.Context, binary, ghProxy string, job model.Job, log Logger, onProgress func(model.Progress), allowPrivate ...bool) (string, json.RawMessage, error) {
-	return RunJob(ctx, binary, ghProxy, job, log, onProgress, allowPrivate...)
 }

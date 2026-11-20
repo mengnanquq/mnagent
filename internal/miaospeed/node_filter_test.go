@@ -10,6 +10,7 @@ import (
 	"strings"
 	"sync/atomic"
 	"testing"
+	"time"
 
 	yaml2 "gopkg.in/yaml.v2"
 )
@@ -163,8 +164,8 @@ func TestPinNodeServerIPPinsPayloadAndKeepsSNI(t *testing.T) {
 			node: MiaospeedNode{
 				Name:     "v6",
 				Protocol: "ss",
-				Server:   "[2409:8a71::1]:8388",
-				Payload:  "name: v6\ntype: ss\nserver: 2409:8a71::1\nport: 8388\n",
+				Server:   "[2001:db8::1]:8388",
+				Payload:  "name: v6\ntype: ss\nserver: 2001:db8::1\nport: 8388\n",
 			},
 			wantIn: []string{"server: \"1.1.1.1\""},
 		},
@@ -831,6 +832,127 @@ func TestFilterBlockedNodesCapsCandidateResolution(t *testing.T) {
 	}
 }
 
+// TestFilterBlockedNodesUsesFixedWorkerPool 验证 DNS 解析使用固定 worker 池，
+// 并发数不超过 nodeResolveConcurrency，不会为每个主机名常驻一个协程。
+func TestFilterBlockedNodesUsesFixedWorkerPool(t *testing.T) {
+	origLookup := lookupNodeIPs
+	defer func() { lookupNodeIPs = origLookup }()
+
+	var active, maxActive atomic.Int32
+	lookupNodeIPs = func(_ context.Context, host string) ([]net.IP, error) {
+		cur := active.Add(1)
+		for {
+			prev := maxActive.Load()
+			if cur <= prev || maxActive.CompareAndSwap(prev, cur) {
+				break
+			}
+		}
+		time.Sleep(2 * time.Millisecond)
+		active.Add(-1)
+		return []net.IP{net.ParseIP("1.1.1.1")}, nil
+	}
+
+	const total = nodeResolveConcurrency * 8
+	nodes := make([]MiaospeedNode, 0, total)
+	for i := 0; i < total; i++ {
+		host := fmt.Sprintf("pool-%03d.example", i)
+		nodes = append(nodes, MiaospeedNode{
+			Name:     host,
+			Server:   host + ":443",
+			Protocol: "ss",
+			Payload:  "name: p\ntype: ss\nserver: " + host + "\nport: 443\ncipher: aes-256-gcm\npassword: p\n",
+		})
+	}
+	kept, _ := filterBlockedNodes(context.Background(), nodes, nil)
+	if len(kept) != total {
+		t.Fatalf("固定 worker 池应处理全部主机名，kept=%d want=%d", len(kept), total)
+	}
+	if got := maxActive.Load(); got > nodeResolveConcurrency {
+		t.Fatalf("DNS 解析并发 %d 超过上限 %d", got, nodeResolveConcurrency)
+	}
+}
+
+// TestFilterBlockedNodesResolveBudgetFailClosed 验证 DNS 解析阶段有独立总预算：
+// 到点后未解析完成的候选全部按 fail-closed 剔除，并计入剔除统计，而不是继续
+// 等待每个域名的 3s 超时（大量候选时最坏可拖到数分钟）。
+func TestFilterBlockedNodesResolveBudgetFailClosed(t *testing.T) {
+	origLookup := lookupNodeIPs
+	origBudget := nodeResolveBudget
+	defer func() {
+		lookupNodeIPs = origLookup
+		nodeResolveBudget = origBudget
+	}()
+
+	nodeResolveBudget = 50 * time.Millisecond
+	lookupNodeIPs = func(ctx context.Context, host string) ([]net.IP, error) {
+		<-ctx.Done()
+		return nil, ctx.Err()
+	}
+
+	const total = 32
+	nodes := make([]MiaospeedNode, 0, total)
+	for i := 0; i < total; i++ {
+		host := fmt.Sprintf("slow-node-%02d.example", i)
+		nodes = append(nodes, MiaospeedNode{
+			Name:     host,
+			Server:   host + ":443",
+			Protocol: "ss",
+			Payload:  "name: p\ntype: ss\nserver: " + host + "\nport: 443\ncipher: aes-256-gcm\npassword: p\n",
+		})
+	}
+
+	var buf bytes.Buffer
+	logger := slog.New(slog.NewTextHandler(&buf, &slog.HandlerOptions{Level: slog.LevelDebug}))
+	start := time.Now()
+	kept, removed := filterBlockedNodes(context.Background(), nodes, logger)
+	if elapsed := time.Since(start); elapsed > 2*time.Second {
+		t.Fatalf("DNS 解析阶段未按总预算及时结束，耗时 %s", elapsed)
+	}
+	if len(kept) != 0 || removed != total {
+		t.Fatalf("预算耗尽后应 fail-closed 剔除全部候选，kept=%d removed=%d", len(kept), removed)
+	}
+	if !strings.Contains(buf.String(), nodeResolveBudgetReason) {
+		t.Fatalf("预算超时应计入剔除原因统计，日志：%s", buf.String())
+	}
+}
+
+// TestFilterBlockedNodesParentCancelReason 验证父 ctx 被取消时，剔除原因记为
+// “任务已取消”，而不是误导性的 DNS 总预算超时。
+func TestFilterBlockedNodesParentCancelReason(t *testing.T) {
+	origLookup := lookupNodeIPs
+	defer func() { lookupNodeIPs = origLookup }()
+	lookupNodeIPs = func(ctx context.Context, host string) ([]net.IP, error) {
+		<-ctx.Done()
+		return nil, ctx.Err()
+	}
+
+	nodes := []MiaospeedNode{{
+		Name:     "slow.example",
+		Server:   "slow.example:443",
+		Protocol: "ss",
+		Payload:  "name: slow\ntype: ss\nserver: slow.example\nport: 443\ncipher: aes-256-gcm\npassword: p\n",
+	}}
+	var buf bytes.Buffer
+	logger := slog.New(slog.NewTextHandler(&buf, &slog.HandlerOptions{Level: slog.LevelDebug}))
+
+	ctx, cancel := context.WithCancel(context.Background())
+	go func() {
+		time.Sleep(20 * time.Millisecond)
+		cancel()
+	}()
+	kept, removed := filterBlockedNodes(ctx, nodes, logger)
+	if len(kept) != 0 || removed != 1 {
+		t.Fatalf("取消后应 fail-closed 剔除，kept=%d removed=%d", len(kept), removed)
+	}
+	logged := buf.String()
+	if !strings.Contains(logged, nodeResolveCancelledReason) {
+		t.Fatalf("取消原因应记录为“任务已取消”，日志：%s", logged)
+	}
+	if strings.Contains(logged, nodeResolveBudgetReason) {
+		t.Fatalf("父 ctx 取消不应记为 DNS 总预算超时，日志：%s", logged)
+	}
+}
+
 // TestSanitizeNodeNameForLogRemovesInvisibleRunes 覆盖 L3：除了控制字符，
 // 日志里还必须去掉 Cf（U+202E 双向覆盖、U+200B 零宽空格）与 Co（私用区）字符，
 // 否则节点名可以翻转/隐藏日志内容。
@@ -1191,11 +1313,11 @@ func topLevelPayloadServer(t *testing.T, payload string) string {
 }
 
 func TestPickNodeIPPrefersIPv4(t *testing.T) {
-	got := pickNodeIP([]net.IP{net.ParseIP("2409:8a71::1"), net.ParseIP("1.1.1.1")})
+	got := pickNodeIP([]net.IP{net.ParseIP("2001:db8::1"), net.ParseIP("1.1.1.1")})
 	if got == nil || got.To4() == nil {
 		t.Fatalf("应优先选择 IPv4：%v", got)
 	}
-	got = pickNodeIP([]net.IP{net.ParseIP("2409:8a71::1")})
+	got = pickNodeIP([]net.IP{net.ParseIP("2001:db8::1")})
 	if got == nil || got.To4() != nil {
 		t.Fatalf("只有 IPv6 时应返回 IPv6：%v", got)
 	}

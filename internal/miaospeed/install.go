@@ -48,7 +48,11 @@ func getMiaospeedVersion(ctx context.Context, binPath string, serverOutput strin
 	cmd := exec.CommandContext(detCtx, binPath, "-version")
 	out, err := cmd.CombinedOutput()
 	if err != nil {
-		cmd2 := exec.CommandContext(detCtx, binPath, "version")
+		// 第一次调用可能已耗尽 detCtx 的 1.5s 预算；第二次探测必须使用新的
+		// ctx，否则命令一启动就被取消，永远拿不到版本。
+		retryCtx, retryCancel := context.WithTimeout(ctx, 1500*time.Millisecond)
+		defer retryCancel()
+		cmd2 := exec.CommandContext(retryCtx, binPath, "version")
 		if out2, err2 := cmd2.CombinedOutput(); err2 == nil {
 			out = out2
 			err = nil

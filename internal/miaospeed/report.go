@@ -172,6 +172,36 @@ func parseSingleSlot(slot slaveEntrySlot, node *MiaospeedNode, plan miaospeedTes
 	return parseSingleSlotContext(context.Background(), slot, node, plan)
 }
 
+// reportNodeURL 返回报告里的节点代理 URL。
+// Clash/Sing-box 解析阶段不再为每个候选节点生成 NodeURL（几千个节点时 URL 拼接
+// 会额外复制大量字符串），只在实际产出报告时按需生成；原生 URI 节点已经带 URL。
+func reportNodeURL(node *MiaospeedNode) string {
+	if node == nil {
+		return ""
+	}
+	if node.URL != "" {
+		return node.URL
+	}
+	// node.Server 保留的是解析时的原始主机名（域名节点不会被 pinNodeServerIP 改写），
+	// payload 里的 server 则已被钉死为校验过的 IP；生成链接必须优先用原始域名。
+	server := extractHost(node.Server)
+	port := extractField(node.Payload, "port")
+	if port == "" {
+		if _, p, err := net.SplitHostPort(node.Server); err == nil {
+			port = p
+		}
+	}
+	if server == "" || port == "" {
+		if payloadServer := extractField(node.Payload, "server"); payloadServer != "" {
+			server = payloadServer
+		}
+		if payloadPort := extractField(node.Payload, "port"); payloadPort != "" {
+			port = payloadPort
+		}
+	}
+	return formatClashPayloadToURI(node.Payload, node.Name, node.Protocol, server, port)
+}
+
 // parseSingleSlotContext 带 ctx 解析节点结果，GeoIP 查询可随任务取消立即返回。
 func parseSingleSlotContext(ctx context.Context, slot slaveEntrySlot, node *MiaospeedNode, plan miaospeedTestPlan) MiaospeedReport {
 	rep := MiaospeedReport{
@@ -183,7 +213,7 @@ func parseSingleSlotContext(ctx context.Context, slot slaveEntrySlot, node *Miao
 		rep.NodeName = node.Name
 		rep.Protocol = node.Protocol
 		rep.Server = node.Server
-		rep.URL = node.URL
+		rep.URL = reportNodeURL(node)
 	}
 	for _, m := range slot.Matrices {
 		switch m.Type {

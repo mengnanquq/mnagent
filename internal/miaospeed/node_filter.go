@@ -24,6 +24,14 @@ const (
 	nodeResolveTimeout     = 3 * time.Second
 	nodeResolveConcurrency = 16
 
+	// nodeResolveBudgetReason 是 DNS 解析总预算耗尽后记入剔除统计的原因。
+	// 单个域名 3s、2560+ 个候选在 16 并发下最坏可拖到 8 分钟，远超任务动态超时；
+	// 总预算到点后，尚未解析完成的候选必须按 fail-closed 剔除，绝不能把未经校验的
+	// 域名交给 miaospeed 去解析。
+	nodeResolveBudgetReason = "节点安全检查 DNS 解析总预算超时，按安全策略剔除"
+	// nodeResolveCancelledReason 表示父任务被取消，不能误记为 DNS 预算超时。
+	nodeResolveCancelledReason = "任务已取消"
+
 	// maxNodePayloadBytes 限制单个节点 payload 的大小。语义闸门要对 payload 做
 	// yaml.v3 结构解析 + yaml.v2 解码，64KB 远大于任何正常节点配置，
 	// 同时把超大/恶意 payload 的解析开销钉死在上限内（超出直接剔除）。
@@ -61,11 +69,17 @@ var lookupNodeIPs = func(ctx context.Context, host string) ([]net.IP, error) {
 // 用 var 而非常量：测试可以在更小的上限下验证解析次数与截断语义。
 var maxNodeFilterCandidates = maxMiaospeedNodes * 3
 
+// nodeResolveBudget 是节点安全检查中 DNS 解析阶段的总预算（测试可缩短）。
+var nodeResolveBudget = 30 * time.Second
+
 // nodeHostResult 记录单个主机名的校验结果：是否被拦截；域名主机还会带上已通过校验的 IP，
 // 供 filterBlockedNodes 把 payload 中的 server 钉死到该 IP（防止 DNS 重绑定绕过校验）。
 type nodeHostResult struct {
 	blocked bool
 	ip      net.IP
+	// budgetExceeded 表示解析因总预算到期而失败：用于把这类节点与普通解析失败
+	// 区分开统计，便于定位“订阅过大导致解析被截断”。
+	budgetExceeded bool
 }
 
 // nodeFilterPolicy 是语义闸门的开关。-allow-private-probes 只关闭“IP 是否落在
@@ -75,11 +89,6 @@ type nodeHostResult struct {
 type nodeFilterPolicy struct {
 	// AllowPrivate 允许服务器地址落在私网/保留段（仅跳过 IP 段判定）。
 	AllowPrivate bool
-}
-
-// filterBlockedNodes 按默认策略（禁止私网/保留/元数据地址）过滤节点。
-func filterBlockedNodes(ctx context.Context, nodes []MiaospeedNode, log Logger) ([]MiaospeedNode, int) {
-	return filterBlockedNodesWithPolicy(ctx, nodes, nodeFilterPolicy{}, log)
 }
 
 // filterBlockedNodesWithPolicy 剔除服务器地址指向私有、保留或云元数据地址的节点，
@@ -138,36 +147,63 @@ func filterBlockedNodesWithPolicy(ctx context.Context, nodes []MiaospeedNode, po
 		pending = append(pending, h)
 	}
 
+	// DNS 解析阶段必须有独立总预算：逐域名 3s 的超时只能限制单个查询，
+	// 候选数量大时总耗时仍会随节点数线性增长。
+	resolveCtx, cancelResolve := context.WithTimeout(ctx, nodeResolveBudget)
+	defer cancelResolve()
+
+	// 固定 worker 池：解析并发数沿用 nodeResolveConcurrency，不再为每个主机名
+	// 起一个等待信号量的协程，避免海量唯一主机名把协程栈与调度开销放大。
+	workerCount := nodeResolveConcurrency
+	if workerCount > len(pending) {
+		workerCount = len(pending)
+	}
+	jobs := make(chan string)
 	var wg sync.WaitGroup
-	sem := make(chan struct{}, nodeResolveConcurrency)
-	for _, h := range pending {
+	for i := 0; i < workerCount; i++ {
 		wg.Add(1)
-		go func(h string) {
+		go func() {
 			defer wg.Done()
-			sem <- struct{}{}
-			defer func() { <-sem }()
-			rctx, cancel := context.WithTimeout(ctx, nodeResolveTimeout)
-			defer cancel()
-			ips, err := lookupNodeIPs(rctx, h)
-			// 解析失败或没有返回任何地址：无法验证安全性，按 fail-closed 剔除。
-			res := nodeHostResult{blocked: err != nil || len(ips) == 0}
-			if !res.blocked && !policy.AllowPrivate {
-				for _, ip := range ips {
-					if probe.IsBlockedProbeIP(ip) {
-						res.blocked = true
-						break
+			for h := range jobs {
+				rctx, cancel := context.WithTimeout(resolveCtx, nodeResolveTimeout)
+				ips, err := lookupNodeIPs(rctx, h)
+				cancel()
+				// 解析失败或没有返回任何地址：无法验证安全性，按 fail-closed 剔除。
+				res := nodeHostResult{
+					blocked:        err != nil || len(ips) == 0,
+					budgetExceeded: err != nil && resolveCtx.Err() != nil,
+				}
+				if !res.blocked && !policy.AllowPrivate {
+					for _, ip := range ips {
+						if probe.IsBlockedProbeIP(ip) {
+							res.blocked = true
+							break
+						}
 					}
 				}
+				if !res.blocked {
+					res.ip = pickNodeIP(ips)
+				}
+				mu.Lock()
+				results[h] = res
+				mu.Unlock()
 			}
-			if !res.blocked {
-				res.ip = pickNodeIP(ips)
-			}
-			mu.Lock()
-			results[h] = res
-			mu.Unlock()
-		}(h)
+		}()
 	}
+feed:
+	for _, h := range pending {
+		select {
+		case jobs <- h:
+		case <-resolveCtx.Done():
+			// 总预算/父 ctx 已结束：不再投递剩余主机名，它们会在后续统计中
+			// 按“预算超时/任务已取消”fail-closed 剔除。
+			break feed
+		}
+	}
+	close(jobs)
 	wg.Wait()
+	budgetExceeded := resolveCtx.Err() != nil
+	parentCancelled := ctx.Err() != nil
 
 	// AllowPrivate 只是关闭 IP 段判定，解析失败的原因描述要相应区分，
 	// 避免日志把“允许私网”的节点说成“指向私有地址”。
@@ -184,8 +220,26 @@ func filterBlockedNodesWithPolicy(ctx context.Context, nodes []MiaospeedNode, po
 			stats.record(n, "节点缺少服务器地址")
 			continue
 		}
-		if !ok || res.blocked {
-			stats.record(n, addressReason)
+		if !ok {
+			switch {
+			case parentCancelled:
+				stats.record(n, nodeResolveCancelledReason)
+			case budgetExceeded:
+				stats.record(n, nodeResolveBudgetReason)
+			default:
+				stats.record(n, addressReason)
+			}
+			continue
+		}
+		if res.blocked {
+			switch {
+			case parentCancelled && res.budgetExceeded:
+				stats.record(n, nodeResolveCancelledReason)
+			case res.budgetExceeded:
+				stats.record(n, nodeResolveBudgetReason)
+			default:
+				stats.record(n, addressReason)
+			}
 			continue
 		}
 		// 无论 Server 是域名还是字面 IP，都无条件把 payload 顶层 server 钉死为
