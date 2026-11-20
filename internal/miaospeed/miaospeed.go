@@ -205,13 +205,22 @@ func signMiaoSpeedRequest(token, buildToken string, req slaveRequest) (string, e
 
 // CalcMiaospeedTimeout 根据测速节点数量动态计算任务超时：
 // 基础准备时间 60s + 每个节点 12s 预算，单节点保底 90s。
+const (
+	miaospeedBaseTimeout    = 60 * time.Second
+	miaospeedPerNodeTimeout = 12 * time.Second
+	miaospeedMinTimeout     = 90 * time.Second
+	// miaospeedTimeoutReserve 是节点上限计算时预留的余量：订阅下载、启动、
+	// 结果上传等也发生在 3 小时 taskCtx 内，不能把预算全部算给测速节点。
+	miaospeedTimeoutReserve = 120 * time.Second
+)
+
 func CalcMiaospeedTimeout(nodeCount int) time.Duration {
 	if nodeCount <= 0 {
 		nodeCount = 1
 	}
-	timeout := 60*time.Second + time.Duration(nodeCount)*12*time.Second
-	if timeout < 90*time.Second {
-		timeout = 90 * time.Second
+	timeout := miaospeedBaseTimeout + time.Duration(nodeCount)*miaospeedPerNodeTimeout
+	if timeout < miaospeedMinTimeout {
+		timeout = miaospeedMinTimeout
 	}
 	return timeout
 }
@@ -255,6 +264,11 @@ func RunJob(ctx context.Context, binary, ghProxy string, job model.Job, log Logg
 
 	totalNodes := len(allNodes)
 	nodes := selectJobNodes(allNodes, job.Count)
+	// totalNodes 保持截断前的原始总数：报告里 TotalNodes 与实测结果数可不同，
+	// 机器人据此展示“已测 M 个 / 订阅共 N 个”，无需新增协议字段。
+	if totalNodes > maxMiaospeedNodes && log != nil {
+		log.Warn("测速节点数超过上限，已截断", "total", totalNodes, "limit", maxMiaospeedNodes, "selected", len(nodes))
+	}
 
 	// 根据节点数量动态计算本次测速的超时时间限制
 	dynamicTimeout := CalcMiaospeedTimeout(len(nodes))

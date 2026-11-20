@@ -17,6 +17,7 @@ import (
 	"unicode"
 	"unicode/utf8"
 
+	"github.com/mengnanquq/mnagent/internal/model"
 	"github.com/mengnanquq/mnagent/internal/probe"
 )
 
@@ -1865,12 +1866,30 @@ func getInt(m map[string]any, k string) int {
 	return 0
 }
 
-// selectJobNodes 根据任务请求选取测速节点，默认无上限全量测速；仅在明确指定 Count 时截取前 Count 个节点。
+// maxMiaospeedNodes 是单次测速任务的节点数上限。
+// 服务端目前没有节点数上限，agent 侧按 3 小时任务预算反推上限，避免超大订阅
+// 把内存、任务预算与结果体积同时撑爆；超过时截断而不是整单失败，保持与
+// 服务端“有多少测多少”的语义一致，并在日志与报告总节点数中说明。
+//
+// 必须保证 CalcMiaospeedTimeout(maxMiaospeedNodes) + miaospeedTimeoutReserve
+// <= model.JobMiaospeedMaxTimeout，否则订阅下载、启动、结果上传等环节会挤占
+// 测速预算，任务可能在动态预算还没用完时被模型层的 3 小时上限提前截断。
+var maxMiaospeedNodes = int((model.JobMiaospeedMaxTimeout - miaospeedBaseTimeout - miaospeedTimeoutReserve) / miaospeedPerNodeTimeout)
+
+// selectJobNodes 根据任务请求选取测速节点；默认全量测速（受 maxMiaospeedNodes 限制），
+// 明确指定 Count 时截取前 Count 个节点。
 func selectJobNodes(allNodes []MiaospeedNode, count int) []MiaospeedNode {
-	if count > 0 && count < len(allNodes) {
-		return allNodes[:count]
+	limit := len(allNodes)
+	if limit > maxMiaospeedNodes {
+		limit = maxMiaospeedNodes
 	}
-	return allNodes
+	if count > 0 && count < limit {
+		limit = count
+	}
+	if limit == len(allNodes) {
+		return allNodes
+	}
+	return allNodes[:limit]
 }
 
 // formatClashPayloadToURI 将 Clash YAML 节点 payload 还原为标准代理 URI。

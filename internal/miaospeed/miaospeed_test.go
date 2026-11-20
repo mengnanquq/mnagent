@@ -324,14 +324,6 @@ func TestMiaospeedReportJSONSerialization(t *testing.T) {
 		HTTPCode:         204,
 		PingRTTMs:        28.5,
 		UDPType:          "FullCone",
-		RawResults: []slaveEntrySlot{
-			{
-				Grouping: "test",
-				Matrices: []matrixResponse{
-					{Type: "TEST_PING_RTT", Payload: "28.5"},
-				},
-			},
-		},
 	}
 	data, err := json.Marshal(report)
 	if err != nil {
@@ -348,8 +340,8 @@ func TestMiaospeedReportJSONSerialization(t *testing.T) {
 	if parsed["miaospeed_version"] != "v4.7.7" {
 		t.Fatalf("miaospeed_version 序列化失败: got=%v, want=v4.7.7", parsed["miaospeed_version"])
 	}
-	if _, ok := parsed["raw_results"]; !ok {
-		t.Fatalf("未携带原始 raw_results 字段供 bot 高级处理: %+v", parsed)
+	if _, ok := parsed["raw_results"]; ok {
+		t.Fatalf("回传给机器人的报告不应再包含 raw_results（服务端无此字段）: %+v", parsed)
 	}
 }
 
@@ -1202,7 +1194,41 @@ func TestMiaospeedMultiNodeBatchPlanAndTotalNodes(t *testing.T) {
 	}
 }
 
-// TestSelectJobNodesUnlimited 验证节点数量默认无上限，仅在指定 Count 时截取。
+// TestMiaospeedReportTotalNodesPreservedWhenResultsTruncated 验证截断/部分结果时
+// TotalNodes 仍表示原始订阅总数，与 SubReports 的实测结果数不同；机器人侧据此
+// 展示“已测 M 个 / 订阅共 N 个”，因此不能改成实测数。
+func TestMiaospeedReportTotalNodesPreservedWhenResultsTruncated(t *testing.T) {
+	plan := buildMiaospeedTestPlan(model.Job{Query: "full"}, 2)
+	task := &slaveTask{Results: []slaveEntrySlot{{Grouping: "g1"}, {Grouping: "g2"}}}
+	nodes := []MiaospeedNode{{Name: "Node1"}, {Name: "Node2"}}
+	rep := parseSlaveTaskResult(task, nodes, 100, plan, time.Second)
+	if rep.TotalNodes != 100 {
+		t.Fatalf("TotalNodes 应保留原始总数 100，实际: %d", rep.TotalNodes)
+	}
+	if len(rep.SubReports) != 2 {
+		t.Fatalf("实测结果数应为 2，实际: %d", len(rep.SubReports))
+	}
+	if rep.SubReports[1].TotalNodes != 100 {
+		t.Fatalf("SubReport 也应保留原始总数 100，实际: %d", rep.SubReports[1].TotalNodes)
+	}
+}
+
+// TestSelectJobNodesCapsAtLimit 验证超过 maxMiaospeedNodes 时会截断，
+// 但仍尊重更小的显式 Count。
+func TestSelectJobNodesCapsAtLimit(t *testing.T) {
+	nodes := make([]MiaospeedNode, maxMiaospeedNodes+5)
+	for i := range nodes {
+		nodes[i] = MiaospeedNode{Name: fmt.Sprintf("Node-%d", i+1)}
+	}
+	if got := selectJobNodes(nodes, 0); len(got) != maxMiaospeedNodes {
+		t.Fatalf("未指定 Count 时应截断到 %d 个，实际 %d", maxMiaospeedNodes, len(got))
+	}
+	if got := selectJobNodes(nodes, 100); len(got) != 100 {
+		t.Fatalf("显式 Count 应优先于上限，期望 100，实际 %d", len(got))
+	}
+}
+
+// TestRedactTargetForLog 验证日志目标不会泄露订阅 token 或节点凭据。
 func TestRedactTargetForLog(t *testing.T) {
 	cases := []struct {
 		name   string
@@ -1370,6 +1396,21 @@ func TestCalcMiaospeedTimeout(t *testing.T) {
 	// 4. 200 节点: 60s + 200*12s = 2460s (41 分钟)
 	if got := CalcMiaospeedTimeout(200); got != 2460*time.Second {
 		t.Fatalf("200 节点期望 2460s，实际: %v", got)
+	}
+}
+
+// TestCalcMiaospeedTimeoutWithinJobLimit 验证节点上限与模型层 3 小时任务预算自洽：
+// 上限内的动态超时加上预留余量不能超过 JobMiaospeedMaxTimeout，上限 +1 则
+// 即使加余量也会超过，证明上限取到最大且为订阅/启动/上传留出了余量。
+func TestCalcMiaospeedTimeoutWithinJobLimit(t *testing.T) {
+	if maxMiaospeedNodes <= 0 {
+		t.Fatalf("maxMiaospeedNodes 必须为正数，实际: %d", maxMiaospeedNodes)
+	}
+	if got := CalcMiaospeedTimeout(maxMiaospeedNodes) + miaospeedTimeoutReserve; got > model.JobMiaospeedMaxTimeout {
+		t.Fatalf("maxMiaospeedNodes=%d 的动态超时加余量 %v 超过 JobMiaospeedMaxTimeout=%v", maxMiaospeedNodes, got, model.JobMiaospeedMaxTimeout)
+	}
+	if got := CalcMiaospeedTimeout(maxMiaospeedNodes+1) + miaospeedTimeoutReserve; got <= model.JobMiaospeedMaxTimeout {
+		t.Fatalf("maxMiaospeedNodes 应取最大可行值：%d+1 个节点的动态超时加余量 %v 仍不超过 %v", maxMiaospeedNodes, got, model.JobMiaospeedMaxTimeout)
 	}
 }
 

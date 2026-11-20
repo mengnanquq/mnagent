@@ -40,7 +40,6 @@ type MiaospeedReport struct {
 	MediaUnlock      map[string]string `json:"media_unlock,omitempty"`
 	SubReports       []MiaospeedReport `json:"sub_reports,omitempty"`
 	DurationMs       int64             `json:"duration_ms"`
-	RawResults       []slaveEntrySlot  `json:"raw_results,omitempty"`
 }
 
 // Format 格式化排版文本，供 Telegram 机器人展示。
@@ -359,6 +358,9 @@ func parseSlaveTaskResult(task *slaveTask, nodes []MiaospeedNode, totalNodes int
 // parseSlaveTaskResultContext 带 ctx 整理测速结果；逐节点 GeoIP 查询使用受限并发（4），
 // 避免数百个节点串行查询导致报告长时间无法生成。
 func parseSlaveTaskResultContext(ctx context.Context, task *slaveTask, nodes []MiaospeedNode, totalNodes int, plan miaospeedTestPlan, duration time.Duration) *MiaospeedReport {
+	// TotalNodes 保持原始订阅总数，而不是本次实测结果数：机器人侧在
+	// TotalNodes > len(SubReports) 时会显示“已测 M 个 / 订阅共 N 个”，
+	// 能正确表达节点上限截断或部分节点未返回结果，不需要新增协议字段。
 	if totalNodes <= 0 {
 		totalNodes = len(nodes)
 	}
@@ -370,7 +372,6 @@ func parseSlaveTaskResultContext(ctx context.Context, task *slaveTask, nodes []M
 		rep := parseSingleSlotContext(ctx, slaveEntrySlot{}, n, plan)
 		rep.TotalNodes = totalNodes
 		rep.DurationMs = duration.Milliseconds()
-		rep.RawResults = task.Results
 		return &rep
 	}
 
@@ -378,7 +379,6 @@ func parseSlaveTaskResultContext(ctx context.Context, task *slaveTask, nodes []M
 	mainRep := reports[0]
 	mainRep.TotalNodes = totalNodes
 	mainRep.DurationMs = duration.Milliseconds()
-	mainRep.RawResults = task.Results
 
 	// 多节点结果同步封装为 SubReports（保持与 task.Results 相同顺序）。
 	if len(reports) > 1 {
