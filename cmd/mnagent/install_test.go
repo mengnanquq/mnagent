@@ -1366,17 +1366,26 @@ func TestInstallScriptPreservesExtraAgentArgs(t *testing.T) {
 		}
 	}
 
-	// 3. 已存在的 -allow-auto-install-deps 不应重复追加
-	writeUnit(`-allow-auto-install-deps`)
-	if _, err := runInstallScriptTimeout(t, scriptPath, f.args(), f.env(), "", 90*time.Second); err != nil {
-		t.Fatalf("重跑安装失败: %v", err)
-	}
-	generated, err = os.ReadFile(f.unitPath())
-	if err != nil {
-		t.Fatal(err)
-	}
-	if n := strings.Count(string(generated), "-allow-auto-install-deps"); n != 1 {
-		t.Fatalf("-allow-auto-install-deps 应只出现一次，实际 %d 次：\n%s", n, generated)
+	// 3. 已删除的 -allow-auto-install-deps 即使出现在旧服务命令里也必须被丢弃，
+	//    且不能连带丢弃同一命令里的其它自定义参数（包括 =true/false 写法）。
+	for _, removed := range []string{"-allow-auto-install-deps", "-allow-auto-install-deps=true", "-allow-auto-install-deps=false"} {
+		writeUnit(`-log-level "debug" -allow-private-probes -result-timeout "45s" -min-backoff "7s" -log-file "/tmp/custom.log" ` + removed)
+		out, err = runInstallScriptTimeout(t, scriptPath, f.args(), f.env(), "", 90*time.Second)
+		if err != nil {
+			t.Fatalf("旧服务带已删除参数 %s 时重跑安装失败: %v\n%s", removed, err, out)
+		}
+		generated, err = os.ReadFile(f.unitPath())
+		if err != nil {
+			t.Fatal(err)
+		}
+		for _, want := range []string{"-log-level debug", "-allow-private-probes", "-result-timeout 45s", "-min-backoff 7s", "-log-file /tmp/custom.log"} {
+			if !strings.Contains(string(generated), want) {
+				t.Fatalf("已删除参数 %s 不应导致自定义参数 %q 被丢弃：\n%s", removed, want, generated)
+			}
+		}
+		if strings.Contains(string(generated), "-allow-auto-install-deps") {
+			t.Fatalf("旧服务命令中的已删除参数 %s 应被丢弃：\n%s", removed, generated)
+		}
 	}
 }
 
@@ -1562,5 +1571,238 @@ func TestInstallScriptMasksDiscardedTokenArgs(t *testing.T) {
 	}
 	if !strings.Contains(out, "-unknown-flag") {
 		t.Fatalf("普通未知参数仍应列出：\n%s", out)
+	}
+}
+
+// TestInstallScriptRemovedAllowAutoInstallDepsFlag 验证 -allow-auto-install-deps
+// 已彻底删除：脚本帮助不再提及，显式传入会按未知参数拒绝，旧服务命令中的该参数
+// 也会在继承时被丢弃（升级后由 agent 自动补装依赖）。
+func TestInstallScriptRemovedAllowAutoInstallDepsFlag(t *testing.T) {
+	f := newFakeInstall(t, nil)
+	scriptPath := filepath.Join(findRepoRoot(), "install.sh")
+
+	out, err := runInstallScriptTimeout(t, scriptPath, append(f.args(), "--allow-auto-install-deps"), f.env(), "", 30*time.Second)
+	if err == nil || !strings.Contains(out, "未知参数") {
+		t.Fatalf("已删除的 --allow-auto-install-deps 应作为未知参数拒绝，err=%v\n%s", err, out)
+	}
+
+	// 旧服务命令里带着该参数：重跑安装应成功，但生成的服务命令不能再包含它。
+	prefix := filepath.Join(f.tmp, "install")
+	if err := os.MkdirAll(prefix, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	execPath := filepath.Join(prefix, "mnagent")
+	legacy := "[Service]\nUser=root\nGroup=root\nExecStart=\"" + execPath + "\" -bot \"https://bot.example/agent\" -token-file \"" + f.tokenFile + "\" -allow-auto-install-deps\n"
+	if err := os.WriteFile(f.unitPath(), []byte(legacy), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	out, err = runInstallScriptTimeout(t, scriptPath, f.args(), f.env(), "", 90*time.Second)
+	if err != nil {
+		t.Fatalf("旧服务带已删除参数时应能完成升级安装: %v\n%s", err, out)
+	}
+	unit, err := os.ReadFile(f.unitPath())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(unit), "-allow-auto-install-deps") {
+		t.Fatalf("旧服务的 -allow-auto-install-deps 应被丢弃：\n%s", unit)
+	}
+	// agent 侧不保留兼容层；安装脚本只负责在继承旧服务命令时丢弃该参数。
+	script := string(readInstallScript(t))
+	if !strings.Contains(script, `REMOVED_AGENT_FLAGS=" -allow-auto-install-deps "`) {
+		t.Fatal("install.sh 应在参数继承时显式丢弃已删除的 -allow-auto-install-deps")
+	}
+	ps, err := os.ReadFile(filepath.Join(findRepoRoot(), "install.ps1"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(ps), `$removedAgentFlags = @("-allow-auto-install-deps")`) {
+		t.Fatal("install.ps1 应在参数继承时显式丢弃已删除的 -allow-auto-install-deps")
+	}
+}
+
+// TestInstallScriptCleanupPartialInstall 验证退出清理会删除 .nexttrace.new 与
+// $PREFIX 下的 miaospeed 临时目录，避免下载中断残留占用 Flash。
+func TestInstallScriptCleanupPartialInstall(t *testing.T) {
+	script := string(readInstallScript(t))
+	fn := extractShellFunction(t, script, "cleanup_partial_install")
+	dir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(dir, ".nexttrace.new"), []byte("x"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, ".mnagent.new"), []byte("x"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	miaoTmp := filepath.Join(dir, ".miaospeed.tmp.123")
+	if err := os.MkdirAll(miaoTmp, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	harness := "#!/bin/sh\nset -eu\nPREFIX=\"$1\"\nMIAOSPEED_TMP_DIR=\"$PREFIX/.miaospeed.tmp.123\"\n" + fn + "\ncleanup_partial_install\n"
+	harnessPath := filepath.Join(t.TempDir(), "cleanup.sh")
+	if err := os.WriteFile(harnessPath, []byte(harness), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if out, err := exec.Command("sh", harnessPath, dir).CombinedOutput(); err != nil {
+		t.Fatalf("cleanup_partial_install 执行失败: %v\n%s", err, out)
+	}
+	for _, path := range []string{filepath.Join(dir, ".nexttrace.new"), filepath.Join(dir, ".mnagent.new"), miaoTmp} {
+		if _, err := os.Stat(path); !os.IsNotExist(err) {
+			t.Errorf("清理后不应残留 %s: %v", path, err)
+		}
+	}
+}
+
+// TestInstallScriptEndianOverride 验证无法自动判定端序时可用 MNAGENT_ENDIAN=le|be
+// 覆盖，而不必依赖 ELF 探测。
+func TestInstallScriptEndianOverride(t *testing.T) {
+	script := string(readInstallScript(t))
+	fn := extractShellFunction(t, script, "is_little_endian")
+	elf := extractShellFunction(t, script, "elf_ei_data")
+	harness := "#!/bin/sh\nset -eu\nwarn() { :; }\n" + elf + "\n" + fn + "\nif is_little_endian; then echo 0; else echo 1; fi\n"
+	harnessPath := filepath.Join(t.TempDir(), "endian.sh")
+	if err := os.WriteFile(harnessPath, []byte(harness), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	for _, tc := range []struct {
+		value string
+		want  string
+	}{{"le", "0"}, {"be", "1"}} {
+		cmd := exec.Command("sh", harnessPath)
+		cmd.Env = append(os.Environ(), "MNAGENT_ENDIAN="+tc.value)
+		out, err := cmd.CombinedOutput()
+		if err != nil {
+			t.Fatalf("MNAGENT_ENDIAN=%s 执行失败: %v\n%s", tc.value, err, out)
+		}
+		if got := strings.TrimSpace(string(out)); got != tc.want {
+			t.Fatalf("MNAGENT_ENDIAN=%s 返回 %s，期望 %s", tc.value, got, tc.want)
+		}
+	}
+}
+
+// TestInstallScriptHasEnoughSpace 验证 df -k 空间检查：充足时通过，明显不足时拒绝。
+func TestInstallScriptHasEnoughSpace(t *testing.T) {
+	if _, err := exec.LookPath("df"); err != nil {
+		t.Skip("未找到 df，跳过")
+	}
+	script := string(readInstallScript(t))
+	fn := extractShellFunction(t, script, "has_enough_space")
+	harness := "#!/bin/sh\nset -eu\n" + fn + "\nhas_enough_space \"$1\" \"$2\"\n"
+	harnessPath := filepath.Join(t.TempDir(), "space.sh")
+	if err := os.WriteFile(harnessPath, []byte(harness), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	dir := t.TempDir()
+	if out, err := exec.Command("sh", harnessPath, dir, "0").CombinedOutput(); err != nil {
+		t.Fatalf("空间充足时应返回成功: %v\n%s", err, out)
+	}
+	if err := exec.Command("sh", harnessPath, dir, "999999999999").Run(); err == nil {
+		t.Fatal("可用空间明显不足时应返回失败")
+	}
+}
+
+// TestInstallScriptSmokeTestFails 验证安装后的 -version 冒烟测试失败会中止安装，
+// 而不是注册一个必然起不来的服务。
+func TestInstallScriptSmokeTestFails(t *testing.T) {
+	f := newFakeInstall(t, nil)
+	if err := os.WriteFile(f.fakeAgent, []byte("#!/bin/sh\nexit 1\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	prefix := filepath.Join(f.tmp, "install")
+	if err := os.MkdirAll(prefix, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	oldBin := []byte("#!/bin/sh\necho old-mnagent\n")
+	if err := os.WriteFile(filepath.Join(prefix, "mnagent"), oldBin, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	scriptPath := filepath.Join(findRepoRoot(), "install.sh")
+	out, err := runInstallScriptTimeout(t, scriptPath, f.args("--no-install-miaospeed"), f.env(), "", 90*time.Second)
+	if err == nil {
+		t.Fatalf("冒烟测试失败时应中止安装：\n%s", out)
+	}
+	if !strings.Contains(out, "冒烟测试失败") {
+		t.Fatalf("错误信息应包含冒烟测试失败：\n%s", out)
+	}
+	if !strings.Contains(out, "已回滚") {
+		t.Fatalf("冒烟失败时应提示已回滚：\n%s", out)
+	}
+	restored, err := os.ReadFile(filepath.Join(prefix, "mnagent"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(restored, oldBin) {
+		t.Fatalf("冒烟失败后应恢复旧二进制，实际内容 %q", restored)
+	}
+	if _, err := os.Stat(filepath.Join(prefix, "mnagent.prev")); err != nil {
+		t.Fatalf("安装前应保留 mnagent.prev 备份: %v", err)
+	}
+}
+
+// TestInstallScriptSmokeTestWithoutPrevious 验证首次安装（没有 .prev）冒烟失败时
+// 明确提示“未找到可回滚的旧版本”，而不是给出看似可回滚的提示。
+func TestInstallScriptSmokeTestWithoutPrevious(t *testing.T) {
+	f := newFakeInstall(t, nil)
+	if err := os.WriteFile(f.fakeAgent, []byte("#!/bin/sh\nexit 1\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	scriptPath := filepath.Join(findRepoRoot(), "install.sh")
+	out, err := runInstallScriptTimeout(t, scriptPath, f.args("--no-install-miaospeed"), f.env(), "", 90*time.Second)
+	if err == nil {
+		t.Fatalf("冒烟测试失败时应中止安装：\n%s", out)
+	}
+	if !strings.Contains(out, "未找到可回滚的旧版本") {
+		t.Fatalf("首次安装冒烟失败应提示未找到可回滚旧版本：\n%s", out)
+	}
+	if strings.Contains(out, "已回滚") {
+		t.Fatalf("没有旧版本时不应声称已回滚：\n%s", out)
+	}
+}
+
+// TestInstallScriptSmokeTestRollbackStillBroken 验证回滚后会再次执行 -version；
+// 恢复的文件仍无法运行时必须提示需要人工介入。
+func TestInstallScriptSmokeTestRollbackStillBroken(t *testing.T) {
+	f := newFakeInstall(t, nil)
+	if err := os.WriteFile(f.fakeAgent, []byte("#!/bin/sh\nexit 1\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	prefix := filepath.Join(f.tmp, "install")
+	if err := os.MkdirAll(prefix, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(prefix, "mnagent"), []byte("#!/bin/sh\nexit 1\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	scriptPath := filepath.Join(findRepoRoot(), "install.sh")
+	out, err := runInstallScriptTimeout(t, scriptPath, f.args("--no-install-miaospeed"), f.env(), "", 90*time.Second)
+	if err == nil {
+		t.Fatalf("冒烟测试失败时应中止安装：\n%s", out)
+	}
+	if !strings.Contains(out, "已回滚") || !strings.Contains(out, "需要人工介入") {
+		t.Fatalf("回滚后仍无法运行时应提示需要人工介入：\n%s", out)
+	}
+}
+
+// TestInstallScriptUninstallRemovesStaleArtifacts 验证卸载会清理 .prev、更新临时文件
+// 与 .nexttrace.new，避免反复升级后残留占满低容量 Flash。
+func TestInstallScriptUninstallRemovesStaleArtifacts(t *testing.T) {
+	f := newFakeInstall(t, nil)
+	prefix := filepath.Join(f.tmp, "install")
+	if err := os.MkdirAll(prefix, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	files := []string{"mnagent", "mnagent.prev", ".nexttrace.new", "mnagent-upd-123"}
+	for _, name := range files {
+		if err := os.WriteFile(filepath.Join(prefix, name), []byte("x"), 0o755); err != nil {
+			t.Fatal(err)
+		}
+	}
+	scriptPath := filepath.Join(findRepoRoot(), "install.sh")
+	if out, err := runInstallScriptTimeout(t, scriptPath, f.args("--uninstall"), f.env(), "", 60*time.Second); err != nil {
+		t.Fatalf("卸载失败: %v\n%s", err, out)
+	}
+	for _, name := range files {
+		if _, err := os.Stat(filepath.Join(prefix, name)); !os.IsNotExist(err) {
+			t.Errorf("卸载后不应残留 %s: %v", name, err)
+		}
 	}
 }

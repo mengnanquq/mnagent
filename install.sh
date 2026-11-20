@@ -47,6 +47,8 @@ AUTO_UPDATE="yes"   # 默认开启自动更新（可 --auto-update no 关闭）
 UPDATE_INTERVAL="6h"
 INSTALL_NEXTTRACE="yes" # 缺少 nexttrace 时默认自动按照官方脚本/包管理器安装
 INSTALL_MIAOSPEED="yes" # 缺少 miaospeed 时默认自动从 GitHub Releases 下载安装
+# download_miaospeed 的临时目录（位于 $PREFIX 下，避免 OpenWrt 的 /tmp tmpfs 占用内存）。
+MIAOSPEED_TMP_DIR=""
 GH_PROXY="${GH_PROXY:-${MNAGENT_GH_PROXY:-}}" # GitHub 代理前缀，例如 https://gh-proxy.com/
 # 明文 HTTP 的 --bot 只允许回环/内网地址（与 agent 的 -allow-insecure-http 规则一致）；
 # 公网明文 HTTP 必须显式 --allow-insecure-http，否则装完 agent 会拒绝启动、陷入重启循环。
@@ -66,7 +68,10 @@ warn() { printf '\033[1;33m警告:\033[0m %s\n' "$*" >&2; }
 # 残留的 .mnagent.new 可能被误当成已下载的新版本，或被下次安装沿用。
 cleanup_partial_install() {
 	[ -n "${PREFIX:-}" ] || return 0
-	rm -f "$PREFIX/.mnagent.new" "$PREFIX/.mnagent.new.sha256" "$PREFIX/.mnagent.build.$$" 2>/dev/null || true
+	rm -f "$PREFIX/.mnagent.new" "$PREFIX/.mnagent.new.sha256" "$PREFIX/.mnagent.build.$$" "$PREFIX/.nexttrace.new" 2>/dev/null || true
+	if [ -n "${MIAOSPEED_TMP_DIR:-}" ]; then
+		rm -rf "$MIAOSPEED_TMP_DIR" 2>/dev/null || true
+	fi
 }
 die()  {
 	cleanup_partial_install
@@ -226,6 +231,7 @@ usage() {
   MNAGENT_TOKEN=<token>                   接入令牌（避免出现在 argv；与 --token-file 二选一）
   MNAGENT_TOKEN_FILE=<path>              默认令牌文件路径（默认 /etc/mnagent/token；一般无需设置）
   MNAGENT_STATE_DIR=<dir>                 procd/非 systemd 路径使用的状态目录（默认 /var/lib/mnagent）
+  MNAGENT_ENDIAN=le|be                    无法自动判定 MIPS 字节序时显式指定（le=小端，be=大端）
 EOF
 }
 
@@ -384,13 +390,21 @@ elf_ei_data() {
 }
 
 # is_little_endian：借助 busybox/sh 的 ELF 头判断系统字节序。
+# MNAGENT_ENDIAN=le|be 可在无法从现有 ELF 判定（或判定错误）时显式覆盖。
 is_little_endian() {
+	case "${MNAGENT_ENDIAN:-}" in
+		le|LE|little|little-endian) return 0;;
+		be|BE|big|big-endian) return 1;;
+		"") ;;
+		*) warn "MNAGENT_ENDIAN 取值无效：${MNAGENT_ENDIAN}（只支持 le 或 be），将尝试自动探测字节序";;
+	esac
 	for candidate in /bin/busybox "$(command -v sh 2>/dev/null)" /bin/sh; do
 		case "$(elf_ei_data "$candidate" 2>/dev/null || true)" in
 			1) return 0;;
 			2) return 1;;
 		esac
 	done
+	warn "无法从 ELF 头判定系统字节序，默认按大端(mips)处理；若设备实际为小端，请设置 MNAGENT_ENDIAN=le 后重新安装（大端可设 MNAGENT_ENDIAN=be）"
 	return 1
 }
 
@@ -661,7 +675,7 @@ if [ "$UNINSTALL" = "yes" ]; then
 			warn "未识别的 init 系统：请手动停止并删除 $SERVICE_NAME"
 			;;
 	esac
-	rm -f "$PREFIX/mnagent"
+	rm -f "$PREFIX/mnagent" "$PREFIX/mnagent.prev" "$PREFIX/.nexttrace.new" "$PREFIX"/mnagent-upd-*
 	if [ "$RUN_USER" != "root" ]; then
 		log "已卸载（令牌文件 $TOKEN_FILE 与用户 $RUN_USER 保留，如需一并清理请手动删除）"
 	else
@@ -816,7 +830,10 @@ tokenize_cmd() {
 AGENT_VALUE_FLAGS=" -bot -token -token-file -nexttrace -miaospeed -min-backoff -max-backoff -poll-timeout -result-timeout -update-interval -gh-proxy -log-level -log-file "
 AGENT_BOOL_FLAGS=" -allow-private-probes -allow-remote-downgrade "
 # 由本脚本重新生成的参数：跳过它们及其取值，避免旧值覆盖新值或重复追加。
-INSTALLER_REGENERATED_FLAGS=" -bot -token -token-file -nexttrace -miaospeed -auto-update -update-interval -gh-proxy -allow-insecure-http -allow-auto-install-deps "
+INSTALLER_REGENERATED_FLAGS=" -bot -token -token-file -nexttrace -miaospeed -auto-update -update-interval -gh-proxy -allow-insecure-http "
+# 已从 agent 删除的参数：重跑安装时直接忽略，不能让整批自定义参数被连带丢弃。
+# 这里只处理安装脚本的参数继承，agent 侧不保留任何兼容层。
+REMOVED_AGENT_FLAGS=" -allow-auto-install-deps "
 
 # collect_extra_agent_args <旧命令行>：提取旧单元里手工追加的 agent 参数
 # （-log-level、-min-backoff、-result-timeout、-allow-private-probes 等），
@@ -911,6 +928,12 @@ collect_extra_agent_args() {
 							collect_skip_secret="no"
 						fi
 						[ "$collect_inline" = "yes" ] || collect_skip="yes"
+						continue
+						;;
+				esac
+				case "$REMOVED_AGENT_FLAGS" in
+					*" $collect_flag "*)
+						log "已忽略已删除的参数：${collect_flag}" >&2
 						continue
 						;;
 				esac
@@ -1255,11 +1278,18 @@ download_release() {
 	log "下载 mnagent（${VERSION}，${OS}/${ARCH}）"
 	download "$url" "$PREFIX/.mnagent.new" || return 1
 	verify_sha256 "$PREFIX/.mnagent.new" "$raw_url" "$asset"
-	install_file "$PREFIX/.mnagent.new" "$PREFIX/mnagent" 0755
+	install_file "$PREFIX/.mnagent.new" "$PREFIX/mnagent" 0755 \
+		|| die "安装下载的 mnagent 到 $PREFIX/mnagent 失败（请检查磁盘空间与目录权限）"
 	rm -f "$PREFIX/.mnagent.new"
 }
 
 mkdir -p "$PREFIX"
+# 安装前保留现有二进制：冒烟测试失败时回滚，避免把可用的旧版本覆盖成坏文件。
+if [ -f "$PREFIX/mnagent" ]; then
+	cp -p "$PREFIX/mnagent" "$PREFIX/mnagent.prev" \
+		|| die "备份现有 $PREFIX/mnagent 到 $PREFIX/mnagent.prev 失败（请检查磁盘空间与目录权限）"
+	log "已备份现有 mnagent 到 $PREFIX/mnagent.prev"
+fi
 case "$MODE" in
 	binary)
 		if [ -f "$BINARY_SRC" ]; then
@@ -1268,7 +1298,8 @@ case "$MODE" in
 			else
 				warn "--binary 指向本地文件但未提供 --sha256：无法校验完整性，将继续安装；建议补充 --sha256 <hex> 校验来源"
 			fi
-			install_file "$BINARY_SRC" "$PREFIX/mnagent" 0755
+			install_file "$BINARY_SRC" "$PREFIX/mnagent" 0755 \
+				|| die "安装本地 --binary 到 $PREFIX/mnagent 失败（请检查磁盘空间与目录权限）"
 		else
 			log "下载 mnagent：$BINARY_SRC"
 			tmp_bin="$PREFIX/.mnagent.new"
@@ -1300,7 +1331,8 @@ case "$MODE" in
 					die "无法获取 ${BINARY_SRC}.sha256，已中止安装（默认拒绝未校验的 --binary 下载）。请改用 --sha256 <hex> 提供校验值，或确认来源可信后显式加 --insecure-skip-verify"
 				fi
 			fi
-			install_file "$tmp_bin" "$PREFIX/mnagent" 0755
+			install_file "$tmp_bin" "$PREFIX/mnagent" 0755 \
+				|| die "安装下载的 --binary 到 $PREFIX/mnagent 失败（请检查磁盘空间与目录权限）"
 			rm -f "$tmp_bin"
 		fi
 		;;
@@ -1314,7 +1346,23 @@ case "$MODE" in
 		;;
 esac
 [ -x "$PREFIX/mnagent" ] || die "mnagent 安装失败"
-log "已安装 $PREFIX/mnagent（$("$PREFIX/mnagent" -version 2>/dev/null || echo "版本未知")）"
+# 安装后冒烟测试：架构/字节序不匹配、二进制损坏或缺少执行依赖时立即报错，
+# 而不是等注册服务后才发现进程起不来（--from-source/--binary/auto 都覆盖）。
+if ! mnagent_version_out="$("$PREFIX/mnagent" -version 2>&1)"; then
+	smoke_detail="请检查架构/字节序是否匹配，例如 MNAGENT_ENDIAN=le，或二进制是否损坏"
+	if [ ! -f "$PREFIX/mnagent.prev" ]; then
+		die "安装的二进制无法运行（架构/字节序？），未找到可回滚的旧版本：$PREFIX/mnagent -version 执行失败：${mnagent_version_out:-无输出}；${smoke_detail}"
+	fi
+	if install_file "$PREFIX/mnagent.prev" "$PREFIX/mnagent" 0755; then
+		if smoke_recovered_out="$("$PREFIX/mnagent" -version 2>&1)"; then
+			die "安装后冒烟测试失败：$PREFIX/mnagent -version 无法执行（${smoke_detail}）：${mnagent_version_out:-无输出}；已回滚到 $PREFIX/mnagent.prev（恢复后的 -version 输出：${smoke_recovered_out}）"
+		fi
+		die "安装后冒烟测试失败：$PREFIX/mnagent -version 无法执行（${smoke_detail}）：${mnagent_version_out:-无输出}；已回滚到 $PREFIX/mnagent.prev，但恢复后的文件仍无法运行（${smoke_recovered_out:-无输出}），需要人工介入"
+	fi
+	die "安装后冒烟测试失败：$PREFIX/mnagent -version 无法执行（${smoke_detail}）：${mnagent_version_out:-无输出}；且回滚失败，请手动恢复 $PREFIX/mnagent.prev"
+fi
+mnagent_version_out="$(printf '%s' "$mnagent_version_out" | head -n1 | tr -d '\r')"
+log "已安装 $PREFIX/mnagent（${mnagent_version_out:-版本未知}）"
 
 # ---------- 运行用户 ----------
 
@@ -1562,7 +1610,8 @@ download_nexttrace() {
 		return 1
 	fi
 	log "nexttrace SHA-256 校验通过"
-	install_file "$PREFIX/.nexttrace.new" "$PREFIX/nexttrace" 0755
+	install_file "$PREFIX/.nexttrace.new" "$PREFIX/nexttrace" 0755 \
+		|| die "安装 nexttrace 到 $PREFIX/nexttrace 失败（请检查磁盘空间与目录权限）"
 	rm -f "$PREFIX/.nexttrace.new"
 	NEXTTRACE_PATH="$PREFIX/nexttrace"
 }
@@ -1630,6 +1679,18 @@ map_miaospeed_arch() {
 	esac
 }
 
+# has_enough_space <目录> <需要 KB>：用 busybox 可用的 df -k 做粗略空间检查。
+# 无法读取可用空间时返回 0（不因 df 缺字段而阻止安装）。
+has_enough_space() {
+	space_dir="$1"
+	space_need_kb="$2"
+	space_avail_kb="$(df -k "$space_dir" 2>/dev/null | awk 'NR == 2 { print $4; exit }')"
+	case "$space_avail_kb" in
+		""|*[!0-9]*) return 0;;
+	esac
+	[ "$space_avail_kb" -ge "$space_need_kb" ]
+}
+
 download_miaospeed() {
 	miao_arch="$(map_miaospeed_arch "$ARCH")"
 	miao_tag="${MIAOSPEED_VERSION:-latest}"
@@ -1637,7 +1698,7 @@ download_miaospeed() {
 	if [ "$miao_tag" = "latest" ] || [ -z "$miao_tag" ]; then
 		# 1. 优先尝试从 GitHub Releases API 获取最新版本（api.github.com 不走代理）
 		api_url="https://api.github.com/repos/AirportR/miaospeed/releases/latest"
-		tag_query="$(download_stdout "$api_url" 2>/dev/null | grep '"tag_name":' | head -n1 | sed -E 's/.*"tag_name": *"([^"]+)".*/\1/' | tr -d '\r\n' || true)"
+		tag_query="$(download_stdout "$api_url" 2>/dev/null | grep '"tag_name":' | head -n1 | sed -r 's/.*"tag_name": *"([^"]+)".*/\1/' | tr -d '\r\n' || true)"
 		if [ -n "$tag_query" ]; then
 			miao_tag="$tag_query"
 		fi
@@ -1645,7 +1706,7 @@ download_miaospeed() {
 		# 2. 若 API 查询失败，尝试从 releases/latest 重定向 Location 头解析
 		if [ "$miao_tag" = "latest" ] || [ -z "$miao_tag" ]; then
 			if command -v curl >/dev/null 2>&1; then
-				loc_tag="$(curl -sIL "https://github.com/AirportR/miaospeed/releases/latest" 2>/dev/null | grep -i '^location:' | head -n1 | sed -E 's#.*tag/([^/[:space:]]+).*#\1#' | tr -d '\r\n' || true)"
+				loc_tag="$(curl -sIL "https://github.com/AirportR/miaospeed/releases/latest" 2>/dev/null | grep -i '^location:' | head -n1 | sed -r 's#.*tag/([^/[:space:]]+).*#\1#' | tr -d '\r\n' || true)"
 				if [ -n "$loc_tag" ]; then
 					miao_tag="$loc_tag"
 				fi
@@ -1678,7 +1739,20 @@ download_miaospeed() {
 	fi
 	miao_expected="${miao_digest#sha256:}"
 
-	tmp="$(mktemp -d)"
+	# 临时目录放在 $PREFIX 下而不是 /tmp：OpenWrt 的 /tmp 是 tmpfs，压缩包与
+	# 解压后的二进制会直接占用内存。该目录已纳入 cleanup_partial_install 清理。
+	tmp="$PREFIX/.miaospeed.tmp.$$"
+	MIAOSPEED_TMP_DIR="$tmp"
+	if ! has_enough_space "$PREFIX" 40960; then
+		warn "安装目录 $PREFIX 可用空间不足 40MB，已跳过 miaospeed 自动安装（可清理空间后重试，或手动安装 miaospeed）"
+		return 1
+	fi
+	rm -rf "$tmp" 2>/dev/null || true
+	if ! mkdir -p "$tmp"; then
+		warn "无法创建 miaospeed 临时目录：$tmp，已跳过自动安装"
+		MIAOSPEED_TMP_DIR=""
+		return 1
+	fi
 	if [ -n "$GH_PROXY" ]; then
 		log "通过 GitHub 代理下载 miaospeed（版本：${miao_tag}，${OS}/${miao_arch}，代理：${GH_PROXY}）"
 	else
@@ -1714,7 +1788,8 @@ download_miaospeed() {
 		fi
 	done
 	if [ -n "$miao_file" ]; then
-		install_file "$miao_file" "$PREFIX/miaospeed" 0755
+		install_file "$miao_file" "$PREFIX/miaospeed" 0755 \
+			|| die "安装 miaospeed 到 $PREFIX/miaospeed 失败（请检查磁盘空间与目录权限）"
 		chmod 0755 "$PREFIX/miaospeed" 2>/dev/null || true
 	else
 		warn "miaospeed 压缩包内未找到预期二进制（${miao_bin_name}），已跳过安装"
@@ -1763,9 +1838,6 @@ fi
 if [ "$ALLOW_INSECURE_HTTP" = "yes" ]; then
 	AUTO_UPDATE_ARGS="$AUTO_UPDATE_ARGS -allow-insecure-http"
 fi
-# 安装时已自动安装过 miaospeed，运行时再允许一次自动补装以保持既有行为；
-# agent 的该开关默认关闭（远程任务不应单方面触发以 root 下载安装依赖）。
-AUTO_UPDATE_ARGS="$AUTO_UPDATE_ARGS -allow-auto-install-deps"
 if [ -n "$GH_PROXY" ]; then
 	AUTO_UPDATE_ARGS="$AUTO_UPDATE_ARGS -gh-proxy \"$GH_PROXY\""
 fi

@@ -521,7 +521,10 @@ $agentValueFlags = @("-bot", "-token", "-token-file", "-nexttrace", "-miaospeed"
 $agentBoolFlags = @("-allow-private-probes", "-allow-remote-downgrade")
 # 由本脚本重新生成的参数：跳过它们及其取值，避免旧值覆盖新值或重复追加。
 $installerRegeneratedFlags = @("-bot", "-token", "-token-file", "-nexttrace", "-miaospeed", "-auto-update",
-    "-update-interval", "-gh-proxy", "-log-file", "-allow-insecure-http", "-allow-auto-install-deps")
+    "-update-interval", "-gh-proxy", "-log-file", "-allow-insecure-http")
+# 已从 agent 删除的参数：重跑安装时直接忽略，不能让整批自定义参数被连带丢弃。
+# 这里只处理安装脚本的参数继承，agent 侧不保留任何兼容层。
+$removedAgentFlags = @("-allow-auto-install-deps")
 
 # 读取旧服务 ImagePath，取出本脚本不重新生成的 agent 参数（如手工追加的 -log-level、
 # -allow-private-probes、-min-backoff），重跑安装时原样保留，避免升级静默丢弃用户配置。
@@ -573,6 +576,10 @@ function Get-InheritedServiceArgs([string]$commandLine) {
         if ($flag.StartsWith("--")) { $flag = "-" + $flag.Substring(2) }
         if ($installerRegeneratedFlags -contains $flag) {
             if (-not $hasInlineValue) { $skipValue = $true }
+            continue
+        }
+        if ($removedAgentFlags -contains $flag) {
+            Write-Host "已忽略已删除的参数：$flag" -ForegroundColor Gray
             continue
         }
         if ($tok -notmatch $safePattern) { $bad.Add($tok); continue }
@@ -784,9 +791,6 @@ if (-not [string]::IsNullOrWhiteSpace($GhProxy)) {
 if ($enableInsecureHttp) {
     $serviceArgs += "-allow-insecure-http"
 }
-# 安装时已自动安装过 miaospeed，运行时再允许一次自动补装以保持既有行为；
-# agent 的该开关默认关闭（远程任务不应单方面触发以 root 下载安装依赖）。
-$serviceArgs += "-allow-auto-install-deps"
 if ($inheritedArgs.Count -gt 0) {
     $serviceArgs += $inheritedArgs
     Write-Host "已从现有服务配置继承附加参数: $($inheritedArgs -join ' ')" -ForegroundColor Gray
