@@ -27,6 +27,7 @@ func newUpdater(cfg *config.Config, log Logger) *updater.Updater {
 		Arch:           arch,
 		Executable:     exe,
 		GHProxy:        cfg.GHProxy,
+		Logger:         log,
 		Restart: func() error {
 			if log != nil {
 				log.Info("正在重启服务以应用新版本", "Version", Version)

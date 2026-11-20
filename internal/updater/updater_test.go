@@ -1,19 +1,19 @@
 package updater
 
 import (
+	"bytes"
 	"context"
-	"crypto/ed25519"
-	"crypto/rand"
 	"crypto/sha256"
-	"encoding/base64"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"os"
 	"path/filepath"
 	"regexp"
 	"runtime"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -128,116 +128,6 @@ func TestUpdaterCheck(t *testing.T) {
 	}
 	if _, ok, _ := u.Check(); ok {
 		t.Fatal("跳过版本后不应再提示更新")
-	}
-}
-
-// TestUpdaterEd25519Signature 覆盖内置公钥后的强制验签：
-// 有效签名放行；签名缺失、清单被篡改、密钥不匹配一律中止且不替换二进制。
-func TestUpdaterEd25519Signature(t *testing.T) {
-	bin := []byte("#!/bin/sh\necho \"mnagent v0.1.8 (linux/amd64, go1.26.0)\"\n")
-	for len(bin) < 2048 {
-		bin = append(bin, '#', '\n')
-	}
-	checksum := fmt.Sprintf("%x  mnagent_linux_amd64\n", sha256.Sum256(bin))
-	pub, priv, err := ed25519.GenerateKey(rand.Reader)
-	if err != nil {
-		t.Fatal(err)
-	}
-	sig := base64.StdEncoding.EncodeToString(ed25519.Sign(priv, []byte(checksum)))
-	otherPub, _, err := ed25519.GenerateKey(rand.Reader)
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	const (
-		modeValid = iota
-		modeMissingSig
-		modeTamperedChecksum
-	)
-	var mode atomic.Int32
-	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		switch {
-		case strings.HasSuffix(r.URL.Path, ".sha256.sig"):
-			if mode.Load() == modeMissingSig {
-				http.NotFound(w, r)
-				return
-			}
-			_, _ = w.Write([]byte(sig + "\n"))
-		case strings.HasSuffix(r.URL.Path, ".sha256"):
-			body := checksum
-			if mode.Load() == modeTamperedChecksum {
-				body = strings.Repeat("0", 64) + "  mnagent_linux_amd64\n"
-			}
-			_, _ = w.Write([]byte(body))
-		default:
-			_, _ = w.Write(bin)
-		}
-	}))
-	defer ts.Close()
-
-	run := func(t *testing.T, key ed25519.PublicKey, m int) (string, error) {
-		t.Helper()
-		mode.Store(int32(m))
-		exe := filepath.Join(t.TempDir(), "mnagent")
-		if err := os.WriteFile(exe, []byte("old-bin"), 0o755); err != nil {
-			t.Fatal(err)
-		}
-		u := New(Config{
-			CurrentVersion:   "v0.1.7",
-			Repo:             "owner/repo",
-			Platform:         "linux",
-			Arch:             "amd64",
-			DownloadClient:   ts.Client(),
-			Executable:       exe,
-			SigningPublicKey: key,
-		})
-		u.URLForFunc = func(version string) string { return ts.URL + "/d/" + version + "/" + u.AssetName() }
-		u.ChecksumURLFunc = func(version string) string { return ts.URL + "/d/" + version + "/" + u.AssetName() + ".sha256" }
-		u.verifyBinary = func(string, string) error { return nil }
-		_, err := u.DownloadAndReplace("v0.1.8")
-		got, _ := os.ReadFile(exe)
-		return string(got), err
-	}
-
-	got, err := run(t, pub, modeValid)
-	if err != nil {
-		t.Fatalf("有效签名应放行: %v", err)
-	}
-	if got == "old-bin" {
-		t.Fatal("有效签名时应替换二进制")
-	}
-
-	if got, err := run(t, pub, modeMissingSig); err == nil || !strings.Contains(err.Error(), "签名") {
-		t.Fatalf("签名缺失应中止，实际 err=%v", err)
-	} else if got != "old-bin" {
-		t.Fatal("签名缺失时不应替换二进制")
-	}
-
-	if got, err := run(t, pub, modeTamperedChecksum); err == nil || !strings.Contains(err.Error(), "签名验证失败") {
-		t.Fatalf("清单被篡改应签名验证失败，实际 err=%v", err)
-	} else if got != "old-bin" {
-		t.Fatal("签名验证失败时不应替换二进制")
-	}
-
-	if _, err := run(t, otherPub, modeValid); err == nil || !strings.Contains(err.Error(), "签名验证失败") {
-		t.Fatalf("密钥不匹配应验证失败，实际 err=%v", err)
-	}
-}
-
-func TestParseSigningPublicKey(t *testing.T) {
-	if key, err := parseSigningPublicKey(""); err != nil || key != nil {
-		t.Fatalf("空公钥应表示未内置: key=%v err=%v", key, err)
-	}
-	if _, err := parseSigningPublicKey("not-base64"); err == nil {
-		t.Fatal("非法 base64 应报错")
-	}
-	if _, err := parseSigningPublicKey(base64.StdEncoding.EncodeToString([]byte("short"))); err == nil {
-		t.Fatal("长度错误的公钥应报错")
-	}
-	pub, _, _ := ed25519.GenerateKey(rand.Reader)
-	key, err := parseSigningPublicKey(base64.StdEncoding.EncodeToString(pub))
-	if err != nil || !key.Equal(pub) {
-		t.Fatalf("合法公钥解析失败: %v", err)
 	}
 }
 
@@ -377,6 +267,18 @@ func TestUpdaterProxyURL(t *testing.T) {
 		{
 			name:    "代理不带末尾斜杠",
 			proxy:   "https://gh-proxy.com",
+			raw:     "https://github.com/foo/bar/releases/download/v1.0.0/asset",
+			wantURL: "https://gh-proxy.com/https://github.com/foo/bar/releases/download/v1.0.0/asset",
+		},
+		{
+			name:    "纯空白代理视为未配置",
+			proxy:   " \t\n",
+			raw:     "https://github.com/foo/bar/releases/download/v1.0.0/asset",
+			wantURL: "https://github.com/foo/bar/releases/download/v1.0.0/asset",
+		},
+		{
+			name:    "代理前后空白会被去除",
+			proxy:   "  https://gh-proxy.com/  ",
 			raw:     "https://github.com/foo/bar/releases/download/v1.0.0/asset",
 			wantURL: "https://gh-proxy.com/https://github.com/foo/bar/releases/download/v1.0.0/asset",
 		},
@@ -530,9 +432,9 @@ func TestReleaseWorkflowAssetsMatchUpdater(t *testing.T) {
 	}
 }
 
-// TestReleaseWorkflowProvidesArmv7Alias 验证 release.yml 在生成校验和与签名之前为旧版
-// ARM 节点补了 mnagent_linux_armv7 别名：线上 v0.3.102 的 ARM 节点只会请求这个资产名，
-// 缺少它就无法自动升级。别名必须早于签名步骤，否则它的 .sha256 不会被签名，verify 会失败。
+// TestReleaseWorkflowProvidesArmv7Alias 验证 release.yml 在发布校验之前为旧版 ARM 节点
+// 补了 mnagent_linux_armv7 别名：线上 v0.3.102 的 ARM 节点只会请求这个资产名，
+// 缺少它就无法自动升级。别名必须早于校验步骤，否则它的 .sha256 不会被校验。
 func TestReleaseWorkflowProvidesArmv7Alias(t *testing.T) {
 	raw, err := os.ReadFile(filepath.Join("..", "..", ".github", "workflows", "release.yml"))
 	if err != nil {
@@ -549,13 +451,16 @@ func TestReleaseWorkflowProvidesArmv7Alias(t *testing.T) {
 		t.Error("release.yml 未为 mnagent_linux_armv7 生成同名 .sha256")
 	}
 
-	signIdx := strings.Index(workflow, "Sign checksum files")
 	verifyIdx := strings.Index(workflow, "Verify release assets")
-	if signIdx < 0 || verifyIdx < 0 {
-		t.Fatalf("release.yml 缺少签名/校验步骤（sign=%d verify=%d）", signIdx, verifyIdx)
+	if verifyIdx < 0 {
+		t.Fatal("release.yml 缺少 Verify release assets 校验步骤")
 	}
-	if !(cpIdx < signIdx && signIdx < verifyIdx) {
-		t.Fatalf("别名产物必须在签名与校验之前生成（alias=%d sign=%d verify=%d）", cpIdx, signIdx, verifyIdx)
+	if cpIdx > verifyIdx {
+		t.Fatalf("别名产物必须在发布校验之前生成（alias=%d verify=%d）", cpIdx, verifyIdx)
+	}
+
+	if !strings.Contains(workflow, "sha256sum -c --strict") {
+		t.Error("release.yml 的发布校验应实际比对 .sha256 哈希")
 	}
 
 	// 别名是临时兼容措施，必须留下带版本号的删除提醒。
@@ -797,3 +702,370 @@ func TestReplaceExecutableKeepsPrev(t *testing.T) {
 		}
 	}
 }
+
+// recordingLogger 记录 Updater 输出的安全告警。
+type recordingLogger struct {
+	mu       sync.Mutex
+	warnings []string
+}
+
+func (l *recordingLogger) Warn(msg string, args ...any) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	l.warnings = append(l.warnings, msg)
+}
+
+func (l *recordingLogger) snapshot() []string {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return append([]string(nil), l.warnings...)
+}
+
+// hostRewriteTransport 把对真实 GitHub/代理域名的请求改写到本地 httptest 服务器，
+// 用于验证 updater 在不同信任模式下分别访问了直连地址还是代理地址。
+type hostRewriteTransport struct {
+	routes map[string]string // 原始 host -> 目标 base URL
+}
+
+func (t *hostRewriteTransport) RoundTrip(req *http.Request) (*http.Response, error) {
+	clone := req.Clone(req.Context())
+	if target, ok := t.routes[clone.URL.Host]; ok {
+		parsed, err := url.Parse(target)
+		if err != nil {
+			return nil, err
+		}
+		clone.URL.Scheme = parsed.Scheme
+		clone.URL.Host = parsed.Host
+	}
+	return noProxyTransport.RoundTrip(clone)
+}
+
+var noProxyTransport = &http.Transport{Proxy: nil}
+
+// timeoutTransport 记录请求 host，并阻塞到请求 context 结束后返回其错误，
+// 用于验证校验文件请求确实受独立超时约束且失败后 fail-closed。
+type timeoutTransport struct {
+	mu    sync.Mutex
+	hosts []string
+}
+
+func (t *timeoutTransport) RoundTrip(req *http.Request) (*http.Response, error) {
+	t.mu.Lock()
+	t.hosts = append(t.hosts, req.URL.Host)
+	t.mu.Unlock()
+	<-req.Context().Done()
+	return nil, req.Context().Err()
+}
+
+func (t *timeoutTransport) requestedHosts() []string {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	return append([]string(nil), t.hosts...)
+}
+
+// newRewriteClient 构造一个不读取环境代理、按 host 改写到本地测试服务器的客户端。
+func newRewriteClient(direct, proxy *httptest.Server) *http.Client {
+	return &http.Client{
+		Transport: &hostRewriteTransport{routes: map[string]string{
+			"github.com":       direct.URL,
+			"gh-proxy.example": proxy.URL,
+		}},
+	}
+}
+
+// TestUpdaterProxyFetchesChecksumDirect 验证配置代理时：
+// .sha256 校验文件走直连 github.com，二进制仍走代理，且更新成功。
+func TestUpdaterProxyFetchesChecksumDirect(t *testing.T) {
+	bin := []byte("#!/bin/sh\necho \"mnagent v0.1.8 (linux/amd64, go1.26.0)\"\n")
+	for len(bin) < 2048 {
+		bin = append(bin, '#', '\n')
+	}
+	checksum := fmt.Sprintf("%x  mnagent_linux_amd64\n", sha256.Sum256(bin))
+
+	var directChecksumHits, directBinaryHits, proxyChecksumHits, proxyBinaryHits atomic.Int32
+	direct := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case strings.HasSuffix(r.URL.Path, ".sha256"):
+			directChecksumHits.Add(1)
+			_, _ = w.Write([]byte(checksum))
+		case strings.HasSuffix(r.URL.Path, "/mnagent_linux_amd64"):
+			directBinaryHits.Add(1)
+			_, _ = w.Write(bin)
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer direct.Close()
+	proxy := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case strings.HasSuffix(r.URL.Path, ".sha256"):
+			proxyChecksumHits.Add(1)
+			_, _ = w.Write([]byte("0000000000000000000000000000000000000000000000000000000000000000  mnagent_linux_amd64\n"))
+		case strings.HasSuffix(r.URL.Path, "/mnagent_linux_amd64"):
+			proxyBinaryHits.Add(1)
+			_, _ = w.Write(bin)
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer proxy.Close()
+
+	exe := filepath.Join(t.TempDir(), "mnagent")
+	if err := os.WriteFile(exe, []byte("old-bin"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	u := New(Config{
+		CurrentVersion: "v0.1.7",
+		Repo:           "owner/repo",
+		Platform:       "linux",
+		Arch:           "amd64",
+		Executable:     exe,
+		GHProxy:        "https://gh-proxy.example/",
+		DownloadClient: newRewriteClient(direct, proxy),
+	})
+	u.verifyBinary = func(string, string) error { return nil }
+
+	if _, err := u.DownloadAndReplace("v0.1.8"); err != nil {
+		t.Fatalf("校验文件直连、二进制走代理时应允许更新: %v", err)
+	}
+	if got := directChecksumHits.Load(); got != 1 {
+		t.Fatalf("校验文件应直连 github.com 请求 1 次，实际 %d 次", got)
+	}
+	if got := proxyChecksumHits.Load(); got != 0 {
+		t.Fatalf("校验文件不得经代理获取，实际代理请求 %d 次", got)
+	}
+	if got := proxyBinaryHits.Load(); got != 1 {
+		t.Fatalf("二进制应经代理下载 1 次，实际 %d 次", got)
+	}
+	if got := directBinaryHits.Load(); got != 0 {
+		t.Fatalf("二进制不应直连下载，实际直连请求 %d 次", got)
+	}
+	if got, _ := os.ReadFile(exe); !bytes.Equal(got, bin) {
+		t.Fatal("更新成功后二进制内容应为代理下载的新版本")
+	}
+}
+
+// TestUpdaterProxyDirectChecksumFailureFailsClosed 验证直连获取
+// .sha256 失败时拒绝更新：即使代理能提供看似有效的校验文件与二进制也不得回退。
+func TestUpdaterProxyDirectChecksumFailureFailsClosed(t *testing.T) {
+	bin := []byte("#!/bin/sh\necho \"mnagent v0.1.8 (linux/amd64, go1.26.0)\"\n")
+	checksum := fmt.Sprintf("%x  mnagent_linux_amd64\n", sha256.Sum256(bin))
+
+	var directChecksumHits, proxyChecksumHits, proxyBinaryHits atomic.Int32
+	direct := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if strings.HasSuffix(r.URL.Path, ".sha256") {
+			directChecksumHits.Add(1)
+			http.NotFound(w, r)
+			return
+		}
+		_, _ = w.Write(bin)
+	}))
+	defer direct.Close()
+	proxy := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case strings.HasSuffix(r.URL.Path, ".sha256"):
+			proxyChecksumHits.Add(1)
+			_, _ = w.Write([]byte(checksum))
+		case strings.HasSuffix(r.URL.Path, "/mnagent_linux_amd64"):
+			proxyBinaryHits.Add(1)
+			_, _ = w.Write(bin)
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer proxy.Close()
+
+	exe := filepath.Join(t.TempDir(), "mnagent")
+	if err := os.WriteFile(exe, []byte("old-bin"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	u := New(Config{
+		CurrentVersion: "v0.1.7",
+		Repo:           "owner/repo",
+		Platform:       "linux",
+		Arch:           "amd64",
+		Executable:     exe,
+		GHProxy:        "https://gh-proxy.example/",
+		DownloadClient: newRewriteClient(direct, proxy),
+	})
+	u.verifyBinary = func(string, string) error { return nil }
+
+	_, err := u.DownloadAndReplace("v0.1.8")
+	if err == nil {
+		t.Fatal("直连获取校验文件失败时应拒绝更新")
+	}
+	for _, want := range []string{"不经 gh-proxy 镜像", "HTTPS_PROXY", "已中止更新"} {
+		if !strings.Contains(err.Error(), want) {
+			t.Fatalf("错误信息应包含 %q，实际：%v", want, err)
+		}
+	}
+	if got := directChecksumHits.Load(); got != 1 {
+		t.Fatalf("应尝试直连获取校验文件 1 次，实际 %d 次", got)
+	}
+	if got := proxyChecksumHits.Load(); got != 0 {
+		t.Fatalf("直连失败时不得回退到代理获取校验文件，实际代理请求 %d 次", got)
+	}
+	if got := proxyBinaryHits.Load(); got != 0 {
+		t.Fatalf("校验未通过时不得下载二进制，实际代理二进制请求 %d 次", got)
+	}
+	if got, _ := os.ReadFile(exe); string(got) != "old-bin" {
+		t.Fatalf("拒绝更新时不得替换二进制: %q", string(got))
+	}
+}
+
+// TestUpdaterDirectChecksumTimeoutFailsClosed 验证直连获取 .sha256 使用独立短超时：
+// 请求超过超时后更新失败且 fail-closed（不下载二进制、不替换现有文件）。
+func TestUpdaterDirectChecksumTimeoutFailsClosed(t *testing.T) {
+	dir := t.TempDir()
+	exe := filepath.Join(dir, "mnagent")
+	if err := os.WriteFile(exe, []byte("old-bin"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	transport := &timeoutTransport{}
+	u := New(Config{
+		CurrentVersion: "v0.1.7",
+		Repo:           "owner/repo",
+		Platform:       "linux",
+		Arch:           "amd64",
+		Executable:     exe,
+		SkipFile:       filepath.Join(t.TempDir(), "skip"),
+		GHProxy:        "https://gh-proxy.example/",
+		DownloadClient: &http.Client{Transport: transport, Timeout: 5 * time.Second},
+	})
+	u.checksumTimeout = 50 * time.Millisecond
+	u.verifyBinary = func(string, string) error { return nil }
+
+	start := time.Now()
+	_, err := u.DownloadAndReplace("v0.1.8")
+	elapsed := time.Since(start)
+	if err == nil {
+		t.Fatal("直连获取校验文件超时时应拒绝更新")
+	}
+	for _, want := range []string{"不经 gh-proxy 镜像", "HTTPS_PROXY", "已中止更新"} {
+		if !strings.Contains(err.Error(), want) {
+			t.Fatalf("错误信息应包含 %q，实际：%v", want, err)
+		}
+	}
+	if elapsed >= time.Second {
+		t.Fatalf("校验文件请求应在短超时内失败，实际耗时 %v", elapsed)
+	}
+	if hosts := transport.requestedHosts(); len(hosts) != 1 || hosts[0] != "github.com" {
+		t.Fatalf("超时前应只向直连 github.com 发起 1 次请求，实际 hosts=%v", hosts)
+	}
+	if got, _ := os.ReadFile(exe); string(got) != "old-bin" {
+		t.Fatalf("超时失败时不得替换二进制: %q", string(got))
+	}
+	if leftovers, _ := filepath.Glob(filepath.Join(dir, "mnagent-upd-*")); len(leftovers) != 0 {
+		t.Fatalf("超时失败后不应创建/残留临时文件: %v", leftovers)
+	}
+}
+
+// TestUpdaterChecksumURLSelectsDirectWithProxy 验证默认校验文件 URL：
+// 配置代理时直连 GitHub；未配置（或仅空白）时保持原始地址。
+func TestUpdaterChecksumURLSelectsDirectWithProxy(t *testing.T) {
+	const (
+		directURL = "https://github.com/owner/repo/releases/download/v0.1.8/mnagent_linux_amd64.sha256"
+	)
+	cases := []struct {
+		name  string
+		proxy string
+		want  string
+	}{
+		{name: "代理", proxy: "https://gh-proxy.example/", want: directURL},
+		{name: "纯空白代理视同未配置", proxy: " \t\n", want: directURL},
+		{name: "无代理", want: directURL},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			u := &Updater{Repo: "owner/repo", Platform: "linux", Arch: "amd64", GHProxy: tc.proxy}
+			if got := u.checksumURLFor("v0.1.8"); got != tc.want {
+				t.Fatalf("checksumURLFor = %q，期望 %q", got, tc.want)
+			}
+		})
+	}
+}
+
+// TestUpdaterNoProxyWarnsSHA256Only 验证无代理时保留 SHA-256 校验，
+// 并通过注入的 logger 提示同源校验的局限（不直接写 stderr）。
+func TestUpdaterNoProxyWarnsSHA256Only(t *testing.T) {
+	bin := []byte("#!/bin/sh\necho \"mnagent v0.1.8 (linux/amd64, go1.26.0)\"\n")
+	for len(bin) < 2048 {
+		bin = append(bin, '#', '\n')
+	}
+	checksum := fmt.Sprintf("%x  mnagent_linux_amd64\n", sha256.Sum256(bin))
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case strings.HasSuffix(r.URL.Path, ".sha256"):
+			_, _ = w.Write([]byte(checksum))
+		default:
+			_, _ = w.Write(bin)
+		}
+	}))
+	defer ts.Close()
+
+	exe := filepath.Join(t.TempDir(), "mnagent")
+	if err := os.WriteFile(exe, []byte("old-bin"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	logger := &recordingLogger{}
+	u := New(Config{
+		CurrentVersion: "v0.1.7",
+		Repo:           "owner/repo",
+		Platform:       "linux",
+		Arch:           "amd64",
+		DownloadClient: ts.Client(),
+		Executable:     exe,
+		Logger:         logger,
+	})
+	u.URLForFunc = func(version string) string { return ts.URL + "/d/" + version + "/" + u.AssetName() }
+	u.ChecksumURLFunc = func(version string) string { return ts.URL + "/d/" + version + "/" + u.AssetName() + ".sha256" }
+	u.verifyBinary = func(string, string) error { return nil }
+
+	if _, err := u.DownloadAndReplace("v0.1.8"); err != nil {
+		t.Fatalf("无代理时应允许更新: %v", err)
+	}
+	warnings := logger.snapshot()
+	if len(warnings) != 1 || !strings.Contains(warnings[0], "仅校验 SHA-256") {
+		t.Fatalf("应通过 logger 输出一次安全告警，实际 %v", warnings)
+	}
+}
+
+// TestDownloadAndReplaceRejectsOversizedBinary 验证下载体积超过上限时中止更新，
+// 原二进制不变，且临时文件被清理。
+func TestUpdaterCheckAllowsProxy(t *testing.T) {
+	var hits atomic.Int32
+	proxy := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		hits.Add(1)
+		http.Redirect(w, r, "/https://github.com/owner/repo/releases/download/v0.1.8/mnagent_linux_amd64", http.StatusFound)
+	}))
+	defer proxy.Close()
+	direct := httptest.NewServer(http.NotFoundHandler())
+	defer direct.Close()
+
+	u := New(Config{
+		CurrentVersion: "v0.1.0",
+		Repo:           "owner/repo",
+		Platform:       "linux",
+		Arch:           "amd64",
+		GHProxy:        "https://gh-proxy.example/",
+		Client: &http.Client{
+			Transport: &hostRewriteTransport{routes: map[string]string{
+				"github.com":       direct.URL,
+				"gh-proxy.example": proxy.URL,
+			}},
+			CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse },
+		},
+		Executable: filepath.Join(t.TempDir(), "mnagent"),
+		SkipFile:   filepath.Join(t.TempDir(), "skip"),
+	})
+
+	latest, ok, err := u.Check()
+	if err != nil || !ok || latest != "v0.1.8" {
+		t.Fatalf("代理配置下 Check 应正常返回版本: latest=%q ok=%v err=%v", latest, ok, err)
+	}
+	if got := hits.Load(); got != 1 {
+		t.Fatalf("版本检查应经代理请求 1 次，实际 %d 次", got)
+	}
+}
+
+// TestSkipTightensExistingStateDir 验证 MkdirAll 遇到已存在的宽权限目录时会收紧到 0700。

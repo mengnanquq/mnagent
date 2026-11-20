@@ -46,6 +46,14 @@ UPDATE_INTERVAL="6h"
 INSTALL_NEXTTRACE="yes" # 缺少 nexttrace 时默认自动按照官方脚本/包管理器安装
 INSTALL_MIAOSPEED="yes" # 缺少 miaospeed 时默认自动从 GitHub Releases 下载安装
 GH_PROXY="${GH_PROXY:-${MNAGENT_GH_PROXY:-}}" # GitHub 代理前缀，例如 https://gh-proxy.com/
+# 使用 gh-proxy 时默认只允许直连 github.com 获取 .sha256；显式 --insecure-proxy-checksum
+# 才允许经代理获取校验文件（代理可同时替换二进制与同源校验文件）。
+INSECURE_PROXY_CHECKSUM="no"
+# *_SET 记录用户是否显式传入对应参数：升级继承只补未显式指定的值。
+AUTO_UPDATE_SET="no"
+UPDATE_INTERVAL_SET="no"
+RUN_USER_SET="no"
+PREFIX_SET="no"
 
 log()  { printf '\033[1;32m==>\033[0m %s\n' "$*"; }
 warn() { printf '\033[1;33m警告:\033[0m %s\n' "$*" >&2; }
@@ -99,6 +107,8 @@ usage() {
   --install-miaospeed [yes|no] 缺少 miaospeed 时是否自动安装（默认 yes）
   --no-install-miaospeed 缺少 miaospeed 时不自动安装（等同于 --install-miaospeed no）
   --gh-proxy <url>     GitHub 代理前缀，例如 https://gh-proxy.com/
+  --insecure-proxy-checksum  使用 --gh-proxy 时允许经代理获取 .sha256 校验文件
+                       （默认必须直连 github.com；确认代理可信时才使用）
   --uninstall          卸载：停止并删除服务与二进制（保留令牌与用户）
   -h, --help           显示本帮助
 
@@ -287,29 +297,54 @@ esac
 
 # ---------- 基础工具（OpenWrt 的 BusyBox 可能缺少 install/curl） ----------
 
-# download <url> <输出文件>
+# download <url> <输出文件> [fast]
+# fast 用于校验文件等小体积文件的直连尝试：限制连接与总耗时，避免网络不
+# 通时卡住很久（OpenWrt 上的 wget 默认可能无限重试）。
 download() {
+	dl_url="$1"
+	dl_dest="$2"
+	dl_mode="${3:-}"
 	if command -v curl >/dev/null 2>&1; then
-		curl -# -fSL --retry 3 -o "$2" "$1" || { rm -f "$2"; return 1; }
+		if [ "$dl_mode" = "fast" ]; then
+			curl -# -fSL --connect-timeout 5 --max-time 30 --retry 2 -o "$dl_dest" "$dl_url" || { rm -f "$dl_dest"; return 1; }
+		else
+			curl -# -fSL --retry 3 -o "$dl_dest" "$dl_url" || { rm -f "$dl_dest"; return 1; }
+		fi
 	elif command -v wget >/dev/null 2>&1; then
 		if wget --help 2>&1 | grep -q -- '--show-progress'; then
-			wget -q --show-progress -O "$2" "$1" || { rm -f "$2"; return 1; }
+			if [ "$dl_mode" = "fast" ]; then
+				wget -q --show-progress --timeout=30 --tries=2 -O "$dl_dest" "$dl_url" || { rm -f "$dl_dest"; return 1; }
+			else
+				wget -q --show-progress -O "$dl_dest" "$dl_url" || { rm -f "$dl_dest"; return 1; }
+			fi
+		elif [ "$dl_mode" = "fast" ]; then
+			# BusyBox wget 不一定支持长选项，这里用等价的短选项。
+			wget -T 30 -t 2 -O "$dl_dest" "$dl_url" || { rm -f "$dl_dest"; return 1; }
 		else
-			wget -O "$2" "$1" || { rm -f "$2"; return 1; }
+			wget -O "$dl_dest" "$dl_url" || { rm -f "$dl_dest"; return 1; }
 		fi
 	elif command -v uclient-fetch >/dev/null 2>&1; then
-		uclient-fetch -O "$2" "$1" || { rm -f "$2"; return 1; }
+		uclient-fetch -O "$dl_dest" "$dl_url" || { rm -f "$dl_dest"; return 1; }
 	else
 		die "未找到下载工具：请安装 curl（OpenWrt：opkg install curl），或使用 uclient-fetch/wget"
 	fi
 }
 
-# download_stdout <url>
+# download_stdout <url> [fast]
+# fast 用于 GitHub 校验文件的直连尝试：与 download 的 fast 模式同样限时，避免挂死。
 download_stdout() {
 	if command -v curl >/dev/null 2>&1; then
-		curl -fsSL --retry 3 "$1"
+		if [ "${2:-}" = "fast" ]; then
+			curl -fsSL --connect-timeout 5 --max-time 30 --retry 2 "$1"
+		else
+			curl -fsSL --retry 3 "$1"
+		fi
 	elif command -v wget >/dev/null 2>&1; then
-		wget -qO- "$1"
+		if [ "${2:-}" = "fast" ]; then
+			wget -qO- -T 30 -t 2 "$1"
+		else
+			wget -qO- "$1"
+		fi
 	elif command -v uclient-fetch >/dev/null 2>&1; then
 		uclient-fetch -q -O - "$1"
 	else
@@ -350,20 +385,63 @@ sha256_of() {
 	fi
 }
 
-# verify_sha256 <文件> <校验文件 URL> <资产名>
+# download_trusted_artifact <原始 URL> <代理 URL> <目标文件> <说明>
+# 使用 gh-proxy 时，校验文件必须优先直连 github.com：否则代理可以同时替换
+# 二进制与同源 .sha256，校验无法提供任何防篡改能力。直连失败时只有显式
+# --insecure-proxy-checksum 才允许退回代理。直连尝试统一限时，避免离线时挂死。
+download_trusted_artifact() {
+	trusted_raw="$1"
+	trusted_proxied="$2"
+	trusted_dest="$3"
+	trusted_label="$4"
+	if [ -z "$GH_PROXY" ]; then
+		download "$trusted_raw" "$trusted_dest" fast
+		return
+	fi
+	if download "$trusted_raw" "$trusted_dest" fast; then
+		log "已直连 GitHub 获取${trusted_label}（未经 gh-proxy）"
+		return 0
+	fi
+	if [ "$INSECURE_PROXY_CHECKSUM" = "yes" ]; then
+		warn "无法直连 GitHub 获取${trusted_label}，按 --insecure-proxy-checksum 改为经代理获取；代理仍可同时替换二进制与校验文件"
+		download "$trusted_proxied" "$trusted_dest"
+		return
+	fi
+	return 1
+}
+
+# describe_direct_failure <原始 URL>：直连失败时尽量区分 404 与网络错误，仅用于提示。
+describe_direct_failure() {
+	direct_url="$1"
+	if command -v curl >/dev/null 2>&1; then
+		direct_code="$(curl -sS -o /dev/null -w '%{http_code}' --connect-timeout 5 --max-time 15 "$direct_url" 2>/dev/null || true)"
+		case "$direct_code" in
+			404) printf 'GitHub 返回 404（该版本可能未发布此文件或资产名不匹配）';;
+			000|'') printf '无法连接 github.com（DNS 解析失败或网络被阻断）';;
+			2??) printf '直连可访问但下载中断（HTTP %s）' "$direct_code";;
+			*) printf '直连返回 HTTP %s' "$direct_code";;
+		esac
+		return
+	fi
+	printf '直连失败（无法区分 404 与网络错误）'
+}
+
+# verify_sha256 <文件> <原始校验文件 URL> <资产名>
+# 第二个参数是未经 gh-proxy 的原始 URL，由本函数按信任策略决定校验文件从哪里获取。
 # 校验文件内容为 "<hash>  <文件名>"（release 工作流生成）。任何一步失败都中止安装，
 # 且校验发生在 install_file 之前，失败不会覆盖已有二进制。
 verify_sha256() {
 	verify_file="$1"
-	verify_url="$2"
+	verify_raw_url="$2"
 	verify_asset="$3"
+	verify_url="$(apply_gh_proxy "$verify_raw_url")"
 	verify_sum_file="${verify_file}.sha256"
 
 	verify_actual="$(sha256_of "$verify_file")" \
 		|| die "未找到可用的 SHA-256 工具（sha256sum / shasum / openssl），已中止安装"
-	if ! download "$verify_url" "$verify_sum_file"; then
+	if ! download_trusted_artifact "${verify_raw_url}.sha256" "${verify_url}.sha256" "$verify_sum_file" " SHA-256 校验文件"; then
 		rm -f "$verify_sum_file"
-		die "下载 SHA-256 校验文件失败：${verify_url}（已中止安装）"
+		die "无法直连 GitHub 获取 SHA-256 校验文件（$(describe_direct_failure "${verify_raw_url}.sha256")）：${verify_raw_url}.sha256；使用 --gh-proxy 时默认禁止经代理获取校验文件（代理可同时替换二进制与校验文件）。请检查 github.com 连通性，或确认代理可信后加 --insecure-proxy-checksum 重试"
 	fi
 	verify_expected="$(awk 'NF >= 1 { print $1; exit }' "$verify_sum_file")"
 	verify_name="$(awk 'NF >= 2 { print $2; exit }' "$verify_sum_file")"
@@ -372,10 +450,10 @@ verify_sha256() {
 		\**) verify_name="${verify_name#?}";;
 	esac
 	if [ "${#verify_expected}" -ne 64 ]; then
-		die "SHA-256 校验文件格式非法：${verify_url}（已中止安装）"
+		die "SHA-256 校验文件格式非法：${verify_raw_url}.sha256（已中止安装）"
 	fi
 	if printf '%s' "$verify_expected" | grep -q '[^0-9a-fA-F]'; then
-		die "SHA-256 校验文件格式非法：${verify_url}（已中止安装）"
+		die "SHA-256 校验文件格式非法：${verify_raw_url}.sha256（已中止安装）"
 	fi
 	if [ -n "$verify_name" ] && [ "$(basename "$verify_name")" != "$verify_asset" ]; then
 		die "SHA-256 校验文件与资产不匹配：期望 ${verify_asset}，实际 ${verify_name}（已中止安装）"
@@ -557,15 +635,14 @@ build_from_source() {
 
 download_release() {
 	asset="mnagent_${OS}_${ARCH}"
-	url="https://github.com/$REPO/releases/latest/download/${asset}"
+	raw_url="https://github.com/$REPO/releases/latest/download/${asset}"
 	if [ "$VERSION" != "latest" ]; then
-		url="https://github.com/$REPO/releases/download/${VERSION}/${asset}"
+		raw_url="https://github.com/$REPO/releases/download/${VERSION}/${asset}"
 	fi
-	url="$(apply_gh_proxy "$url")"
-	sum_url="${url}.sha256"
+	url="$(apply_gh_proxy "$raw_url")"
 	log "下载 mnagent（${VERSION}，${OS}/${ARCH}）"
 	download "$url" "$PREFIX/.mnagent.new" || return 1
-	verify_sha256 "$PREFIX/.mnagent.new" "$sum_url" "$asset"
+	verify_sha256 "$PREFIX/.mnagent.new" "$raw_url" "$asset"
 	install_file "$PREFIX/.mnagent.new" "$PREFIX/mnagent" 0755
 	rm -f "$PREFIX/.mnagent.new"
 }
@@ -735,9 +812,15 @@ fetch_github_asset_digest() {
 	fi
 
 	# 优先下载 Release 附件中的 "<资产>.sha256"：直接、稳定，不依赖 GitHub API 的
-	# JSON 结构，也不消耗 API 限额。解析失败再回退到 API digest 字段。
-	digest_sum_url="$(apply_gh_proxy "${digest_base}/${digest_asset}.sha256")"
-	digest_sum="$(download_stdout "$digest_sum_url" 2>/dev/null || true)"
+	# JSON 结构，也不消耗 API 限额。使用 gh-proxy 时必须直连 github.com 获取校验
+	# 文件，否则代理可以同时替换压缩包与同源 .sha256；只有显式
+	# --insecure-proxy-checksum 才退化为经代理获取。直连失败时还会回退到
+	# api.github.com 的 digest 字段（API 始终直连）。
+	digest_sum_url="${digest_base}/${digest_asset}.sha256"
+	if [ -n "$GH_PROXY" ] && [ "$INSECURE_PROXY_CHECKSUM" = "yes" ]; then
+		digest_sum_url="$(apply_gh_proxy "$digest_sum_url")"
+	fi
+	digest_sum="$(download_stdout "$digest_sum_url" fast 2>/dev/null || true)"
 	if [ -n "$digest_sum" ]; then
 		digest_value="$(printf '%s\n' "$digest_sum" | awk 'NF >= 1 { print $1; exit }' | tr 'A-F' 'a-f')"
 		case "$digest_value" in

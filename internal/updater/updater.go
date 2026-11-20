@@ -4,15 +4,14 @@ import (
 	"bufio"
 	"bytes"
 	"context"
-	"crypto/ed25519"
 	"crypto/sha256"
 	"crypto/subtle"
-	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
+	"log/slog"
 	"net/http"
 	"os"
 	"os/exec"
@@ -32,16 +31,14 @@ const (
 	DefaultJitter          = 10 * time.Minute
 	DefaultCheckTimeout    = 10 * time.Second
 	DefaultDownloadTimeout = 5 * time.Minute
+	// DefaultChecksumTimeout 是获取 .sha256 校验文件的独立短超时：
+	// 校验文件很小，不应沿用 5 分钟的二进制下载超时，避免离线/被墙时长时间挂起。
+	DefaultChecksumTimeout = 30 * time.Second
 	minBinaryBytes         = 1024 // 校验下载内容不是 404 HTML 或空文件。
 )
 
 // Version 是默认版本号（未指定时使用）。
 var Version = "dev"
-
-// SigningPublicKeyBase64 是可选的 Ed25519 更新签名公钥（base64，32 字节）。
-// 发布构建通过 -ldflags "-X github.com/mengnanquq/mnagent/internal/updater.SigningPublicKeyBase64=<key>"
-// 内置公钥；内置后更新会强制验证 <资产>.sha256 对应的 .sig 签名，未内置则保持旧的 SHA-256 校验行为。
-var SigningPublicKeyBase64 = ""
 
 var releaseVersionPattern = regexp.MustCompile(`/releases/download/([^/]+)/`)
 
@@ -203,9 +200,8 @@ type Config struct {
 	Client         *http.Client
 	DownloadClient *http.Client
 
-	// SigningPublicKey 可直接注入 Ed25519 公钥（测试或自定义构建）；
-	// 未设置时使用包级 SigningPublicKeyBase64。
-	SigningPublicKey ed25519.PublicKey
+	// Logger 用于输出来源信任相关的安全告警；未设置时使用 slog 默认 logger。
+	Logger Logger
 }
 
 // Updater 负责检查并应用自身的新版本。
@@ -230,9 +226,10 @@ type Updater struct {
 	// 测试可注入空实现；生产环境使用 verifyDownloadedBinary。
 	verifyBinary func(path, version string) error
 
-	// signingKey 非空时强制验证校验清单签名；signingKeyErr 记录内置公钥配置错误。
-	signingKey    ed25519.PublicKey
-	signingKeyErr error
+	logger Logger
+
+	// checksumTimeout 仅用于测试缩短校验文件请求超时；0 表示 DefaultChecksumTimeout。
+	checksumTimeout time.Duration
 }
 
 // New 创建一个新的 Updater 实例。
@@ -276,11 +273,6 @@ func New(cfg Config) *Updater {
 	if curVer == "" {
 		curVer = Version
 	}
-	signingKey := cfg.SigningPublicKey
-	var signingKeyErr error
-	if len(signingKey) == 0 {
-		signingKey, signingKeyErr = parseSigningPublicKey(SigningPublicKeyBase64)
-	}
 	return &Updater{
 		CurrentVersion: curVer,
 		Repo:           repo,
@@ -293,8 +285,7 @@ func New(cfg Config) *Updater {
 		GHProxy:        cfg.GHProxy,
 		RestartFunc:    cfg.Restart,
 		verifyBinary:   verifyDownloadedBinary,
-		signingKey:     signingKey,
-		signingKeyErr:  signingKeyErr,
+		logger:         cfg.Logger,
 	}
 }
 
@@ -309,10 +300,11 @@ func (u *Updater) AssetName() string {
 
 // ProxyURL 将 GitHub 目标地址应用 GHProxy 代理前缀（如果已配置）。
 func (u *Updater) ProxyURL(rawURL string) string {
-	if u.GHProxy == "" {
+	proxy := strings.TrimSpace(u.GHProxy)
+	if proxy == "" {
 		return rawURL
 	}
-	prefix := strings.TrimRight(strings.TrimSpace(u.GHProxy), "/") + "/"
+	prefix := strings.TrimRight(proxy, "/") + "/"
 	if strings.HasPrefix(rawURL, prefix) {
 		return rawURL
 	}
@@ -418,6 +410,8 @@ func (u *Updater) latestVersion() (string, string, error) {
 
 // Check 返回是否有可应用的新版本。
 func (u *Updater) Check() (string, bool, error) {
+	// 版本号经代理获取可以接受：它只决定“是否有新版本”，最终能否更新仍由
+	// 直连获取的 .sha256 与下载后二进制的 -version 自检兜底。
 	latest, _, err := u.latestVersion()
 	if err != nil {
 		return "", false, err
@@ -449,31 +443,45 @@ func (u *Updater) checksumURLFor(version string) string {
 	}
 	// Release 工作流为每个资产生成同名的 "<资产>.sha256"（内容为 "<hash>  <文件名>"）。
 	raw := "https://github.com/" + u.Repo + "/releases/download/" + version + "/" + u.AssetName() + ".sha256"
+	// 配置 GHProxy 时，代理可以同时替换二进制与同源 .sha256，
+	// 因此校验文件必须不经 gh-proxy 镜像获取（仍遵循系统 HTTPS_PROXY 环境变量）；
+	// 二进制仍可经代理下载。
+	if u.usesDirectChecksum() {
+		return raw
+	}
 	return u.ProxyURL(raw)
+}
+
+// usesDirectChecksum 表示校验文件必须绕过 GHProxy（不经 gh-proxy 镜像）：
+// 只要配置了 GHProxy，二进制与校验文件就可能来自同一代理，必须直连校验文件。
+// 注意这只跳过 gh-proxy 前缀，请求仍由 http.DefaultTransport 发出，
+// 因此继续遵循 HTTPS_PROXY/HTTP_PROXY 等宿主环境变量（受 TLS 校验保护）。
+func (u *Updater) usesDirectChecksum() bool {
+	return strings.TrimSpace(u.GHProxy) != ""
+}
+
+// directChecksumHint 为直连校验文件失败补充原因，避免用户误以为是普通网络抖动。
+func (u *Updater) directChecksumHint(err error) error {
+	if err == nil || !u.usesDirectChecksum() {
+		return err
+	}
+	return fmt.Errorf("为防止 GitHub 代理 %q 同时替换二进制与同源 .sha256，校验文件不经 gh-proxy 镜像获取（仍遵循系统 HTTPS_PROXY 环境变量），但请求失败：%w（已中止更新）", strings.TrimSpace(u.GHProxy), err)
 }
 
 var sha256HexPattern = regexp.MustCompile(`^[0-9a-fA-F]{64}$`)
 
-// parseSigningPublicKey 解析 base64 公钥；空值表示未内置（保持旧行为）。
-func parseSigningPublicKey(encoded string) (ed25519.PublicKey, error) {
-	encoded = strings.TrimSpace(encoded)
-	if encoded == "" {
-		return nil, nil
-	}
-	raw, err := base64.StdEncoding.DecodeString(encoded)
-	if err != nil {
-		return nil, fmt.Errorf("内置更新签名公钥不是合法 base64：%w", err)
-	}
-	if len(raw) != ed25519.PublicKeySize {
-		return nil, fmt.Errorf("内置更新签名公钥长度非法：期望 %d 字节，实际 %d", ed25519.PublicKeySize, len(raw))
-	}
-	return ed25519.PublicKey(raw), nil
-}
-
-// fetchChecksumBody 下载目标资产的 sha256 校验文件原始内容（签名验证必须针对原始字节）。
+// fetchChecksumBody 下载目标资产的 sha256 校验文件原始内容。
 func (u *Updater) fetchChecksumBody(version string) ([]byte, error) {
 	targetURL := u.checksumURLFor(version)
-	req, err := http.NewRequest(http.MethodGet, targetURL, nil)
+	// 校验文件很小，使用独立短超时；这里只绕过 gh-proxy 前缀，不修改 Transport，
+	// 默认 Transport 仍会遵循 HTTPS_PROXY/HTTP_PROXY 等宿主环境变量。
+	timeout := u.checksumTimeout
+	if timeout <= 0 {
+		timeout = DefaultChecksumTimeout
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), timeout)
+	defer cancel()
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, targetURL, nil)
 	if err != nil {
 		return nil, err
 	}
@@ -485,90 +493,34 @@ func (u *Updater) fetchChecksumBody(version string) ([]byte, error) {
 	}
 	resp, err := cli.Do(req)
 	if err != nil {
-		return nil, err
+		return nil, u.directChecksumHint(err)
 	}
 	defer resp.Body.Close()
 
 	if resp.StatusCode == http.StatusNotFound {
-		return nil, fmt.Errorf("该版本未发布校验文件 %s.sha256（HTTP 404）", u.AssetName())
+		return nil, u.directChecksumHint(fmt.Errorf("该版本未发布校验文件 %s.sha256（HTTP 404）", u.AssetName()))
 	}
 	if resp.StatusCode != http.StatusOK {
-		return nil, fmt.Errorf("获取校验文件返回 HTTP %d", resp.StatusCode)
+		return nil, u.directChecksumHint(fmt.Errorf("获取校验文件返回 HTTP %d", resp.StatusCode))
 	}
 
 	body, err := io.ReadAll(io.LimitReader(resp.Body, 1<<18)) // 256 KiB
 	if err != nil {
-		return nil, err
+		return nil, u.directChecksumHint(err)
 	}
 	if len(bytes.TrimSpace(body)) == 0 {
-		return nil, fmt.Errorf("校验文件 %s.sha256 为空", u.AssetName())
+		return nil, u.directChecksumHint(fmt.Errorf("校验文件 %s.sha256 为空", u.AssetName()))
 	}
 	return body, nil
 }
 
-// signatureURLFor 返回校验清单对应签名文件的地址（默认与 .sha256 同目录的 .sha256.sig）。
-func (u *Updater) signatureURLFor(version string) string {
-	return u.checksumURLFor(version) + ".sig"
-}
-
-// fetchChecksumSignature 下载并解析 .sha256.sig；支持 base64 文本或 64 字节原始签名。
-func (u *Updater) fetchChecksumSignature(version string) ([]byte, error) {
-	targetURL := u.signatureURLFor(version)
-	req, err := http.NewRequest(http.MethodGet, targetURL, nil)
-	if err != nil {
-		return nil, err
+// warn 输出安全告警：优先使用注入的 logger，未注入时退化到 slog 默认 logger。
+func (u *Updater) warn(msg string, args ...any) {
+	if u.logger != nil {
+		u.logger.Warn(msg, args...)
+		return
 	}
-	req.Header.Set("User-Agent", "mnagent-updater")
-	cli := u.DownloadClient
-	if cli == nil {
-		cli = &http.Client{Timeout: DefaultDownloadTimeout}
-	}
-	resp, err := cli.Do(req)
-	if err != nil {
-		return nil, err
-	}
-	defer resp.Body.Close()
-	if resp.StatusCode == http.StatusNotFound {
-		return nil, fmt.Errorf("该版本未发布更新签名 %s.sha256.sig（HTTP 404）", u.AssetName())
-	}
-	if resp.StatusCode != http.StatusOK {
-		return nil, fmt.Errorf("获取更新签名返回 HTTP %d", resp.StatusCode)
-	}
-	body, err := io.ReadAll(io.LimitReader(resp.Body, 1<<16))
-	if err != nil {
-		return nil, err
-	}
-	trimmed := bytes.TrimSpace(body)
-	if len(trimmed) == ed25519.SignatureSize {
-		return trimmed, nil
-	}
-	sig, err := base64.StdEncoding.DecodeString(string(trimmed))
-	if err != nil {
-		return nil, fmt.Errorf("更新签名格式非法（应为 base64 或 %d 字节原始签名）：%w", ed25519.SignatureSize, err)
-	}
-	if len(sig) != ed25519.SignatureSize {
-		return nil, fmt.Errorf("更新签名长度非法：期望 %d 字节，实际 %d", ed25519.SignatureSize, len(sig))
-	}
-	return sig, nil
-}
-
-// verifyChecksumSignature 在内置公钥时强制验证校验清单签名；未内置时保持旧行为并打印警告。
-func (u *Updater) verifyChecksumSignature(version string, body []byte) error {
-	if u.signingKeyErr != nil {
-		return fmt.Errorf("内置更新签名公钥无效，已中止更新：%w", u.signingKeyErr)
-	}
-	if len(u.signingKey) == 0 {
-		fmt.Fprintln(os.Stderr, "警告：当前二进制未内置更新签名公钥，仅校验 SHA-256；无法防御同时篡改二进制与校验文件的攻击")
-		return nil
-	}
-	sig, err := u.fetchChecksumSignature(version)
-	if err != nil {
-		return fmt.Errorf("获取更新签名失败，已中止更新：%w", err)
-	}
-	if !ed25519.Verify(u.signingKey, body, sig) {
-		return errors.New("更新校验清单 Ed25519 签名验证失败（可能被篡改或发布密钥不匹配），已中止更新")
-	}
-	return nil
+	slog.Warn(msg, args...)
 }
 
 // parseChecksum 从校验文件内容中提取当前资产的 SHA-256。
@@ -623,9 +575,8 @@ func (u *Updater) DownloadAndReplace(version string) (string, error) {
 	if err != nil {
 		return "", fmt.Errorf("获取 SHA-256 校验值失败，已中止更新：%w", err)
 	}
-	// 内置签名公钥时，先验证校验清单本身的签名，再信任其中的 SHA-256。
-	if err := u.verifyChecksumSignature(version, checksumBody); err != nil {
-		return "", err
+	if !u.usesDirectChecksum() {
+		u.warn("仅校验 SHA-256；校验文件与二进制同源，无法防御来源同时篡改两者的攻击")
 	}
 	expectedHash, err := u.parseChecksum(checksumBody)
 	if err != nil {

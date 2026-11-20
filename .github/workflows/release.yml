@@ -106,21 +106,6 @@ jobs:
       - name: Install UPX
         if: matrix.upx
         run: sudo apt-get update && sudo apt-get install -y upx
-      - name: Derive signing public key
-        env:
-          MNAGENT_SIGNING_PRIVATE_KEY: ${{ secrets.MNAGENT_SIGNING_PRIVATE_KEY }}
-        run: |
-          if [ -z "$MNAGENT_SIGNING_PRIVATE_KEY" ]; then
-            echo "未配置 MNAGENT_SIGNING_PRIVATE_KEY：本次构建不内置更新签名公钥（发布时也无法生成 .sig）" >&2
-            exit 0
-          fi
-          key="$RUNNER_TEMP/signing-private.key"
-          printf '%s' "$MNAGENT_SIGNING_PRIVATE_KEY" > "$key"
-          chmod 600 "$key"
-          pub="$(go run ./scripts/gen-signing-key.go -mode public -key "$key")"
-          rm -f "$key"
-          test -n "$pub"
-          echo "SIGNING_PUBLIC_KEY=$pub" >> "$GITHUB_ENV"
       - name: Build
         env:
           VERSION: ${{ needs.prepare.outputs.version }}
@@ -135,9 +120,6 @@ jobs:
           fi
           output="mnagent_${GOOS}_${GOARCH}${ext}"
           ldflags="-s -w -X main.version=${VERSION}"
-          if [ -n "${SIGNING_PUBLIC_KEY:-}" ]; then
-            ldflags="$ldflags -X github.com/mengnanquq/mnagent/internal/updater.SigningPublicKeyBase64=${SIGNING_PUBLIC_KEY}"
-          fi
           go build -trimpath -ldflags "$ldflags" \
             -o "${output}" ./cmd/mnagent
           if [ "${{ matrix.upx }}" = "true" ]; then
@@ -174,95 +156,50 @@ jobs:
             && sha256sum install.sh install.ps1 > installers.sha256)
       # 线上 v0.3.102 的 ARM 节点会按旧资产名请求 mnagent_linux_armv7，没有这个别名
       # 它们会 404 而无法自动升级。别名与 mnagent_linux_arm 是完全相同的二进制，
-      # 并与其它资产一样生成同名 .sha256（后续加签与校验步骤会自动覆盖它）。
+      # 并与其它资产一样生成同名 .sha256。
       # TODO(v0.3.104): 等所有 ARM 节点都升级完成后，在 v0.3.104 或之后删除此步骤。
       - name: Add armv7 alias asset
         run: |
           cp dist/mnagent_linux_arm dist/mnagent_linux_armv7
           (cd dist && sha256sum mnagent_linux_armv7 > mnagent_linux_armv7.sha256)
 
-      - name: Sign checksum files
-        env:
-          MNAGENT_SIGNING_PRIVATE_KEY: ${{ secrets.MNAGENT_SIGNING_PRIVATE_KEY }}
-        run: |
-          if [ -z "$MNAGENT_SIGNING_PRIVATE_KEY" ]; then
-            echo "::warning title=未配置更新签名私钥::未设置 MNAGENT_SIGNING_PRIVATE_KEY，本次 Release 不会生成 .sig 附件"
-            exit 0
-          fi
-          key="$RUNNER_TEMP/signing-private.key"
-          printf '%s' "$MNAGENT_SIGNING_PRIVATE_KEY" > "$key"
-          chmod 600 "$key"
-          for sum in dist/*.sha256; do
-            [ -e "$sum" ] || continue
-            go run ./scripts/gen-signing-key.go -mode sign -key "$key" -in "$sum" -out "$sum.sig"
-          done
-          cat dist/*.sha256 | LC_ALL=C sort > dist/checksums.txt
-          go run ./scripts/gen-signing-key.go -mode sign -key "$key" -in dist/checksums.txt -out dist/checksums.txt.sig
-          rm -f "$key"
       - name: Verify release assets
-        env:
-          MNAGENT_SIGNING_PRIVATE_KEY: ${{ secrets.MNAGENT_SIGNING_PRIVATE_KEY }}
         run: |
           set -euo pipefail
-          shopt -s nullglob
-
-          # 构建 job 是否内置公钥完全取决于同一个 Secret：已配置则本次发布的所有
-          # .sha256 都必须有对应 .sig，且必须能用公钥验证通过，否则拒绝发布。
-          signer="$RUNNER_TEMP/gen-signing-key"
-          go build -o "$signer" ./scripts/gen-signing-key.go
 
           failed=0
+          checked=0
 
-          # 1) 每个非校验文件资产都必须有同名 .sha256。
+          # 每个非校验文件资产都必须有同名 .sha256，且哈希必须与资产内容一致。
+          # 发布前只依赖这道 SHA-256 校验兜底。
           for f in dist/*; do
             [ -f "$f" ] || continue
             base="$(basename "$f")"
             case "$base" in
-              *.sha256|*.sig|checksums.txt) continue ;;
+              *.sha256) continue ;;
             esac
+            checked=$((checked + 1))
             if [ ! -s "$f.sha256" ]; then
               echo "::error::资产 ${base} 缺少对应的 .sha256 校验文件"
+              failed=1
+              continue
+            fi
+            if ! (cd dist && sha256sum -c --strict "${base}.sha256" >/dev/null); then
+              echo "::error::资产 ${base} 的 .sha256 校验不一致"
               failed=1
             fi
           done
 
-          if [ -n "${MNAGENT_SIGNING_PRIVATE_KEY:-}" ]; then
-            key="$RUNNER_TEMP/signing-private.key"
-            printf '%s' "$MNAGENT_SIGNING_PRIVATE_KEY" > "$key"
-            chmod 600 "$key"
-            pub="$("$signer" -mode public -key "$key")"
-
-            # 2) 每个 .sha256 都必须有 .sig，并逐个用公钥验签。
-            for sum in dist/*.sha256; do
-              if [ ! -s "${sum}.sig" ]; then
-                echo "::error::校验文件 $(basename "$sum") 缺少对应的 .sig 签名"
-                failed=1
-                continue
-              fi
-              if ! "$signer" -mode verify -pub "$pub" -in "$sum" -sig "${sum}.sig"; then
-                echo "::error::$(basename "$sum") 的签名校验失败"
-                failed=1
-              fi
-            done
-
-            # 3) 汇总清单 checksums.txt 也必须带签名并可验证。
-            if [ ! -s dist/checksums.txt.sig ]; then
-              echo "::error::checksums.txt 缺少对应的 .sig 签名"
-              failed=1
-            elif ! "$signer" -mode verify -pub "$pub" -in dist/checksums.txt -sig dist/checksums.txt.sig; then
-              echo "::error::checksums.txt 的签名校验失败"
-              failed=1
-            fi
-            rm -f "$key"
-          else
-            echo "::warning title=未配置更新签名私钥::未生成 .sig 附件，仅校验了每个资产的 .sha256"
+          if [ "$checked" -eq 0 ]; then
+            echo "::error::dist/ 中没有可校验的发布资产，已中止发布"
+            exit 1
           fi
 
           if [ "$failed" -ne 0 ]; then
             echo "::error::发布资产校验未通过，已中止发布"
             exit 1
           fi
-          echo "所有发布资产均通过校验和/签名检查"
+          echo "所有发布资产均通过 SHA-256 校验"
 
       - name: Publish release
         env:

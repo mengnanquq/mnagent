@@ -34,6 +34,7 @@ param(
     [switch]$InstallMiaoSpeed,
     [switch]$NoInstallMiaoSpeed,
     [string]$MiaoSpeedVersion = "latest",
+    [switch]$InsecureProxyChecksum,
     [switch]$Uninstall,
     [switch]$Help
 )
@@ -84,6 +85,8 @@ mnagent Windows 一键安装脚本
   -LogFile <路径>            服务日志文件（默认: <安装目录>\mnagent.log，5MB × 3 轮转）
   -Version <版本>            mnagent 版本号（默认: latest）
   -GhProxy <URL>             GitHub 代理加速前缀（如 https://gh-proxy.com/）
+  -InsecureProxyChecksum     使用 -GhProxy 时允许经代理获取 .sha256 校验文件
+                              （默认必须直连 github.com；确认代理可信时才使用）
   -AutoUpdate                开启自动检查更新（默认开启）
   -NoAutoUpdate              关闭自动更新
   -UpdateInterval <间隔>     自动更新检查间隔（默认: 6h）
@@ -220,18 +223,39 @@ function Get-ProxiedUrl([string]$rawUrl) {
     return $p + $rawUrl
 }
 
-function Download-File([string]$url, [string]$destination) {
-    $proxied = Get-ProxiedUrl $url
+function Download-File([string]$url, [string]$destination, [switch]$NoProxy) {
+    $proxied = if ($NoProxy) { $url } else { Get-ProxiedUrl $url }
     Write-Host "正在下载: $proxied" -ForegroundColor Gray
     $wc = New-Object System.Net.WebClient
     $wc.Headers.Add("User-Agent", "mnagent-installer")
     $wc.DownloadFile($proxied, $destination)
 }
 
+# 获取校验文件：使用 -GhProxy 时必须优先直连 github.com，否则代理可同时替换
+# 二进制与同源 .sha256；只有显式 -InsecureProxyChecksum 才允许退回代理。
+function Download-ChecksumFile([string]$url, [string]$destination) {
+    if ([string]::IsNullOrWhiteSpace($GhProxy)) {
+        Download-File $url $destination
+        return
+    }
+    try {
+        Download-File $url $destination -NoProxy
+        Write-Host "已直连 GitHub 获取校验文件（未经 gh-proxy）" -ForegroundColor Gray
+        return
+    } catch {
+        if (Test-Path $destination) { Remove-Item -Path $destination -Force -ErrorAction SilentlyContinue }
+        if (-not $InsecureProxyChecksum) {
+            throw "无法直连 github.com 获取 SHA-256 校验文件。使用 -GhProxy 时默认禁止经代理获取校验文件（代理可同时替换二进制与校验文件）；请检查网络，或确认代理可信后加 -InsecureProxyChecksum 重试。原始错误: $_"
+        }
+        Write-Warning "无法直连 GitHub 获取校验文件，按 -InsecureProxyChecksum 改为经代理获取；代理仍可同时替换二进制与校验文件"
+        Download-File $url $destination
+    }
+}
+
 function Assert-Sha256([string]$filePath, [string]$checksumUrl, [string]$assetName) {
     $sumPath = "$filePath.sha256"
     try {
-        Download-File $checksumUrl $sumPath
+        Download-ChecksumFile $checksumUrl $sumPath
     } catch {
         if (Test-Path $sumPath) { Remove-Item -Path $sumPath -Force -ErrorAction SilentlyContinue }
         throw "下载 SHA-256 校验文件失败（已中止安装）: $_"
