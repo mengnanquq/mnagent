@@ -26,10 +26,10 @@ jobs:
     outputs:
       version: ${{ steps.version.outputs.version }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
         with:
           fetch-depth: 0
-      - uses: actions/setup-go@v5
+      - uses: actions/setup-go@v6
         with:
           # 固定到最新 1.26.x 补丁版本：go.mod 的 go 1.26.0 只是最低版本，直接用它会带上已修复的标准库漏洞
           go-version: '1.26.x'
@@ -101,8 +101,8 @@ jobs:
           - { goos: windows, goarch: amd64 }
           - { goos: windows, goarch: arm64 }
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-go@v5
+      - uses: actions/checkout@v5
+      - uses: actions/setup-go@v6
         with:
           # 固定到最新 1.26.x 补丁版本：go.mod 的 go 1.26.0 只是最低版本，直接用它会带上已修复的标准库漏洞
           go-version: '1.26.x'
@@ -131,7 +131,7 @@ jobs:
           fi
           sha256sum "${output}" > "${output}.sha256"
       - name: Upload artifacts
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: binaries-${{ matrix.goos }}-${{ matrix.goarch }}
           path: |
@@ -142,14 +142,14 @@ jobs:
     needs: [prepare, build]
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-go@v5
+      - uses: actions/checkout@v5
+      - uses: actions/setup-go@v6
         with:
           # 固定到最新 1.26.x 补丁版本：go.mod 的 go 1.26.0 只是最低版本，直接用它会带上已修复的标准库漏洞
           go-version: '1.26.x'
           check-latest: true
       - name: Download artifacts
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v7
         with:
           path: dist
           merge-multiple: true
@@ -160,15 +160,6 @@ jobs:
           (cd dist && sha256sum install.sh > install.sh.sha256 \
             && sha256sum install.ps1 > install.ps1.sha256 \
             && sha256sum install.sh install.ps1 > installers.sha256)
-      # 线上 v0.3.102 的 ARM 节点会按旧资产名请求 mnagent_linux_armv7，没有这个别名
-      # 它们会 404 而无法自动升级。别名与 mnagent_linux_arm 是完全相同的二进制，
-      # 并与其它资产一样生成同名 .sha256。
-      # TODO(v0.3.104): 等所有 ARM 节点都升级完成后，在 v0.3.104 或之后删除此步骤。
-      - name: Add armv7 alias asset
-        run: |
-          cp dist/mnagent_linux_arm dist/mnagent_linux_armv7
-          (cd dist && sha256sum mnagent_linux_armv7 > mnagent_linux_armv7.sha256)
-
       - name: Verify release assets
         run: |
           set -euo pipefail

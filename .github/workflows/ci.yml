@@ -11,8 +11,8 @@ jobs:
     name: Test and Vet
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-go@v5
+      - uses: actions/checkout@v5
+      - uses: actions/setup-go@v6
         with:
           # 固定到最新 1.26.x 补丁版本：go.mod 的 go 1.26.0 只是最低版本，直接用它会带上已修复的标准库漏洞
           go-version: '1.26.x'
@@ -43,13 +43,14 @@ jobs:
     name: Windows Vet and Test
     runs-on: windows-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-go@v5
+      - uses: actions/checkout@v5
+      - uses: actions/setup-go@v6
         with:
           go-version: '1.26.x'
           check-latest: true
-      # 只跑能在 Windows 上稳定执行的包；statedir 覆盖 owner/DACL 的 Windows 专用实现。
-      - name: Go Vet (statedir)
-        run: go vet ./internal/statedir
-      - name: Go Test (statedir, windows)
-        run: go test -race -count=1 ./internal/statedir
+      - name: Go Vet
+        run: go vet ./...
+      # 只跑能在 Windows 上稳定执行的包：statedir 覆盖 owner/DACL，
+      # instancelock 覆盖 Windows 文件锁；client/model/tracker 为纯 Go 网络与逻辑测试。
+      - name: Go Test (Windows-compatible packages)
+        run: go test -race -count=1 ./internal/statedir ./internal/instancelock ./internal/client ./internal/model ./internal/tracker

@@ -384,8 +384,7 @@ func TestReleaseArchMatchesAssets(t *testing.T) {
 }
 
 // TestReleaseWorkflowAssetsMatchUpdater 解析 release.yml 的 matrix，确认 updater 生成的
-// 资产名与发布产物完全一致（含 Windows .exe 后缀）。armv7 只作为兼容旧节点的别名
-// （见 TestReleaseWorkflowProvidesArmv7Alias），不参与本测试的资产名映射。
+// 资产名与发布产物完全一致（含 Windows .exe 后缀）。
 func TestReleaseWorkflowAssetsMatchUpdater(t *testing.T) {
 	root := filepath.Join("..", "..")
 	raw, err := os.ReadFile(filepath.Join(root, ".github", "workflows", "release.yml"))
@@ -435,40 +434,20 @@ func TestReleaseWorkflowAssetsMatchUpdater(t *testing.T) {
 	}
 }
 
-// TestReleaseWorkflowProvidesArmv7Alias 验证 release.yml 在发布校验之前为旧版 ARM 节点
-// 补了 mnagent_linux_armv7 别名：线上 v0.3.102 的 ARM 节点只会请求这个资产名，
-// 缺少它就无法自动升级。别名必须早于校验步骤，否则它的 .sha256 不会被校验。
-func TestReleaseWorkflowProvidesArmv7Alias(t *testing.T) {
+// TestReleaseWorkflowHasNoArmv7Alias 验证 release.yml 已移除临时的
+// mnagent_linux_armv7 别名：updater 只按 GOARCH 请求 mnagent_linux_arm，
+// 继续发布一个内容重复的别名只会让升级资产选择产生歧义。
+func TestReleaseWorkflowHasNoArmv7Alias(t *testing.T) {
 	raw, err := os.ReadFile(filepath.Join("..", "..", ".github", "workflows", "release.yml"))
 	if err != nil {
 		t.Fatalf("读取 release.yml 失败：%v", err)
 	}
 	workflow := string(raw)
-
-	cpCmd := "cp dist/mnagent_linux_arm dist/mnagent_linux_armv7"
-	cpIdx := strings.Index(workflow, cpCmd)
-	if cpIdx < 0 {
-		t.Fatalf("release.yml 缺少 ARM 别名产物命令 %q", cpCmd)
+	if strings.Contains(workflow, "mnagent_linux_armv7") {
+		t.Error("release.yml 不应再生成 mnagent_linux_armv7 别名")
 	}
-	if !strings.Contains(workflow, "mnagent_linux_armv7.sha256") {
-		t.Error("release.yml 未为 mnagent_linux_armv7 生成同名 .sha256")
-	}
-
-	verifyIdx := strings.Index(workflow, "Verify release assets")
-	if verifyIdx < 0 {
-		t.Fatal("release.yml 缺少 Verify release assets 校验步骤")
-	}
-	if cpIdx > verifyIdx {
-		t.Fatalf("别名产物必须在发布校验之前生成（alias=%d verify=%d）", cpIdx, verifyIdx)
-	}
-
 	if !strings.Contains(workflow, "sha256sum -c --strict") {
 		t.Error("release.yml 的发布校验应实际比对 .sha256 哈希")
-	}
-
-	// 别名是临时兼容措施，必须留下带版本号的删除提醒。
-	if !strings.Contains(workflow, "TODO") || !strings.Contains(workflow, "v0.3.104") {
-		t.Error("release.yml 的 ARM 别名缺少「v0.3.104 或之后删除」的 TODO 注释")
 	}
 }
 
