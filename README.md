@@ -51,8 +51,8 @@ Remove-Item Env:MNAGENT_TOKEN
 >
 > **⚠️ gh-proxy 信任说明**：
 > - 使用 `--gh-proxy` 安装时，二进制仍可经代理下载，但 `.sha256` 校验文件默认**不经 gh-proxy 镜像获取（仍遵循系统 `HTTPS_PROXY` 环境变量）**；获取失败会中止安装并提示。只有在确认代理可信时，才可用 `--insecure-proxy-checksum`（Windows 为 `-InsecureProxyChecksum`）允许经代理获取校验文件。
-> - Agent 自动更新在配置了 `-gh-proxy` 时，`.sha256` 校验文件会**不经 gh-proxy 镜像获取（仍遵循系统 `HTTPS_PROXY` 环境变量）**（二进制仍走代理）；获取校验文件失败即拒绝更新（fail-closed），因为代理可同时替换二进制与同源 `.sha256`。这是默认的完整性校验方式。
-> - 依赖（nexttrace/miaospeed）的 SHA-256 摘要来自直连的 `github.com`（`<资产>.sha256`）或直连的 `api.github.com`（asset digest），不经代理；两个来源互为兜底。Agent 自身更新同样会先试直连 `.sha256`，失败后回退直连 API digest；每个来源至少重试 3 次（指数退避 + 抖动），失败信息会列出尝试过的来源与次数。
+> - Agent 自动更新（v0.4.2 起）的校验值按「服务端代取 → 直连 `.sha256` → 直连 API digest」三级获取：服务端代取只尝试一次（10 秒超时），成功后还会用 5 秒窗口单次直连 `.sha256` 交叉校验，两者不一致立即中止更新（fail-closed）；直连失败时直接采用服务端返回的值。配置 `-gh-proxy` 时，直连 `.sha256` 仍**不经 gh-proxy 镜像获取（仍遵循系统 `HTTPS_PROXY` 环境变量）**（二进制仍走代理），获取校验文件失败即拒绝更新。
+> - 依赖（nexttrace/miaospeed）的 SHA-256 摘要同样优先由服务端代取（只尝试一次，不做交叉校验，因为上游未发布 `.sha256`）；失败后回退到直连 `github.com` 的 `<资产>.sha256` 或直连 `api.github.com` 的 asset digest，两个直连来源各自重试（指数退避 + 抖动），失败信息会列出尝试过的来源与次数。
 > - 为避免离线/被墙时长时间挂起，安装脚本中校验文件的直连尝试限时 30 秒（`curl --connect-timeout 5 --max-time 30` / `wget --timeout=30 --tries=2`），失败提示会区分 404 与网络不可达。
 >
 > **订阅拉取不使用环境代理**：miaospeed 订阅与进程内探针的 HTTP 客户端均显式设置 `Proxy: nil`，不会读取 `HTTP_PROXY` / `HTTPS_PROXY`。这是为了避免代理自行解析目标地址、绕过按解析 IP 做的 SSRF 校验；如需经代理拉取订阅，请改用服务端中转或本地自定义方案，而不是设置环境代理。
@@ -63,7 +63,33 @@ Remove-Item Env:MNAGENT_TOKEN
 
 ## 🔐 更新校验
 
-所有更新与安装仅做 SHA-256 校验；配置 `gh-proxy` 时，`.sha256` 校验文件直连 `github.com` 获取（仍遵循系统 `HTTPS_PROXY` 环境变量），获取失败即拒绝更新或安装。
+所有更新与安装仅做 SHA-256 校验。Agent 自身更新（v0.4.2 起）的校验值按以下顺序获取：
+
+1. **服务端代取（首选）**：请求 `-bot` 服务端的 `/agent/release-digest`，由部署在海外、可稳定访问 GitHub 的服务端代为获取；令牌走 `Authorization` 头，只尝试一次，超时 10 秒。成功后还会用 5 秒窗口单次直连 `<资产>.sha256` 做交叉校验：两侧都拿到合法值且不一致时立即中止更新（fail-closed，疑似篡改或上游重新上传了资产），**不会**再回退到其他来源；直连失败、超时或格式非法时放行，直接使用服务端返回的值。
+2. **直连 `.sha256`**：直连 `github.com` 下载 `<资产>.sha256`，失败按指数退避重试 3 次。
+3. **直连 API digest**：直连 `api.github.com` 读取 Release 附件的 `digest` 字段，同样重试 3 次。
+
+服务端代取失败（任何非 200 响应、网络错误、缺少令牌等）只记录 Debug 日志并静默回退到直连来源，同时计入最终错误摘要；三个来源共用 75 秒的整体预算（含交叉校验），不会把各来源的超时与重试层层叠加，三个来源都失败时中止更新，并在错误中明确写出「整体校验值获取预算（75s）已用尽」。配置 `gh-proxy` 时，直连 `.sha256` 与 API 仍不经 gh-proxy 镜像（遵循系统 `HTTPS_PROXY` 环境变量），获取失败即拒绝更新或安装。
+
+`-bot` 为公网 `http://` 地址时（即使加了 `-allow-insecure-http`），服务端代取会被禁用（启动时输出 WARN），只使用直连来源；`-no-bot-checksum` 可显式禁用服务端代取。依赖（nexttrace/miaospeed）同样优先走服务端代取，但**不做**交叉校验（上游未发布 `.sha256`），失败后回退原有的两个直连来源。
+
+**CLI 路径同样启用服务端代取**：`-check-update` / `-apply-update` / `-probe-target` / `-diag-job` 带上 `-bot` 时，会按与常驻模式一致的顺序（`-token` > `MNAGENT_TOKEN` > `-token-file`/默认令牌文件）读取令牌并启用代取；读取不到令牌时**静默忽略**（退出码不受影响），只走直连来源。`-diag` 也会展示令牌来源与状态。
+
+### ⏱️ 升级与下载时间预算
+
+| 路径 / 阶段 | 超时预算 | 超时后的行为 |
+| :--- | :--- | :--- |
+| 服务端代取校验值（单次） | 10s | 静默回退直连来源 |
+| 代取成功后的交叉校验（单次） | 5s | 放行并使用服务端返回的值 |
+| 校验值获取（代取 + 直连 `.sha256` + API 兜底） | 整体 75s | 中止更新，错误中说明整体预算已用尽 |
+| 摘要 / API 等小请求（单个 HTTP 客户端） | 20s | 按来源重试或回退 |
+| 依赖归档 / 二进制下载 | 无整体超时；连接/TLS 10s、响应头 20s、连续 30s 无数据中止，另受调用方 ctx 约束 | 下载失败；由所在路径决定是否写冷却 |
+| 启动补齐 / 定期检查 / 运行时安装 | 单个依赖宽松整体 5m | 自身预算耗尽会写 5 分钟失败冷却，避免每轮重试重复下载；调用方主动取消不写冷却 |
+| CLI 依赖更新（`-apply-update`） | 单个依赖宽松整体 5m | 直接报错退出（进程结束，不涉及冷却） |
+| 远程升级任务的依赖阶段 | 紧凑 40s（只作用于升级路径） | 跳过剩余依赖，继续更新 Agent 自身 |
+| 远程升级任务自身下载/替换 | `job.TimeoutMS − 5s`，默认 115s，夹取到 [1s, 115s]；从任务进入处理函数开始计时（包含等待更新锁） | 预算耗尽则中止；等锁已耗尽预算时直接回报「节点正忙于其他更新，请稍后重试」 |
+| 升级结果回传 | 独立的 `-result-timeout` / 整体回传预算 | 不受升级 workCtx 约束；上述预留 5s 仅作为时间余量 |
+
 
 ---
 
@@ -112,15 +138,20 @@ mnagent -apply-update latest         # 立即升级到最新版本并平滑重�
 | **`-gh-proxy <url>`** | — | GitHub 代理加速前缀（支持环境变量 `GH_PROXY`） |
 | **`-result-timeout`** | `5m` | 单次结果回传（含大体积 `/results` 上传）的客户端超时 |
 | **`-allow-insecure-http`** | `false` | 允许 `-bot` 用明文 HTTP 连接公网地址（默认仅允许回环/内网；明文会暴露令牌） |
+| **`-no-bot-checksum`** | `false` | 禁用服务端代取 SHA-256 校验值（只使用直连 `github.com` / `api.github.com`；服务端疑被入侵或排障时使用） |
 | **`-allow-private-probes`** | `false` | 放行对内网私有网段与云元数据地址的探测（默认严格拦截）。只跳过“地址是否落在私网/保留段”这一步：节点测速的协议白名单、payload 结构与禁止字段、server 钉死等安全闸门照常执行 |
 | **`-allow-remote-downgrade`** | `false` | 允许服务端远程指令把 Agent 降级到旧版本（默认只接受高于当前版本的目标；本地 `-apply-update` 不受限） |
 | **`-log-level`** | `info` | 日志级别：`debug` / `info` / `warn` / `error` |
 
 ---
 
-## 📝 行为变更（v0.4.1）
+## 📝 行为变更（v0.4.2）
 
 与升级相关、会影响已有部署的实际行为调整：
+
+- **服务端代取 SHA-256（v0.4.2）**：Agent 自身更新与依赖安装的校验值改为优先由 `-bot` 服务端代取（`GET /agent/release-digest`），服务端不可用或返回非 200 时静默回退到直连来源。Agent 自身更新在代取成功后会额外用一次直连 `.sha256` 交叉校验，不一致立即中止（fail-closed）且不再走 API 兜底；依赖路径不做交叉校验。旧服务端（不认识该接口，返回 404）不会影响新探针，只会回退到直连。`-check-update` / `-apply-update` / `-probe-target` / `-diag-job` 等 CLI 路径带 `-bot` 与令牌时同样启用代取；缺少令牌时静默忽略，不会导致 CLI 报错退出。
+- **新增 `-no-bot-checksum`（v0.4.2）**：显式禁用服务端代取校验值。`-bot` 为公网明文 HTTP 地址时默认就禁用（启动日志输出 WARN），即使同时加了 `-allow-insecure-http`；回环/内网 HTTP 与 HTTPS 端点默认启用。
+- **旧节点升级说明（v0.4.2）**：v0.4.0 运行的旧探针没有代取逻辑，无法使用服务端提供的哈希；升级途径与以前一致：设置 `HTTPS_PROXY` 让直连 `github.com`/`api.github.com` 走可达代理、在 `-check-update`/`-apply-update` 失败时多次重试，或执行 `install.sh --binary <gh-proxy 地址> --sha256 <核对过的哈希>` 直接安装（Windows 为 `install.ps1 -Binary ... -Sha256 ...`）。升级到 v0.4.2 后即可享受服务端代取。
 
 - **依赖缺失时一律自动下载（v0.4.1）**：不再需要任何开关。`miaospeed` 或 `nexttrace` 缺失时，启动检查、定期检查、测速任务与路由追踪都会自动下载安装；同一依赖并发触发时只下载一次，安装失败后有 5 分钟冷却并返回明确错误。**`-allow-auto-install-deps` 已删除**：服务命令里仍带着它的节点启动时会报“未知参数”，请重新执行一次安装命令（`install.sh` / `install.ps1`）以生成新的服务参数。
 - **内联代理配置上限按内存收紧（v0.4.1）**：默认上限 12MB（与服务端 ≤12MB 内联下发契约一致），Linux 上按 `min(12MB, MemTotal/8)` 收紧、最低 2MB；解析时按候选节点上限截断，超出部分不保留 payload，避免低内存设备被超大配置撑爆。
@@ -146,6 +177,8 @@ mnagent -apply-update latest         # 立即升级到最新版本并平滑重�
 - **服务端显示 ⚪️ 离线**：先运行 `mnagent -diag` 检查主机到服务端的 HTTPS 连通性，再确认系统服务运行状态（如 `systemctl status mnagent`）。
 - **日志提示 `鉴权失败`**：令牌与服务端不一致；可通过 Telegram `/host rotate` 重新生成，或直接修改令牌文件（Linux: `/etc/mnagent/token`）。
 - **报错 `无法启动 nexttrace/miaospeed`**：运行 `mnagent -apply-update latest` 触发依赖自动补全下载；网络受限环境请配置 `-gh-proxy`。
+- **报错 `服务端代取校验值与直连 .sha256 不一致`**：更新已按 fail-closed 中止，二进制未被替换，也不会改用 API 兜底。先确认上游是否重新上传了同一版本的资产（重新执行一次通常即可）；若确认直连来源的值才正确（例如与上游 Release 页面一致），可临时加 `-no-bot-checksum` 只用直连来源重试，或用 `install.sh --binary <gh-proxy 地址> --sha256 <核对过的哈希>` 直接安装。**不要**在未确认来源可信时盲目重试或跳过校验。
+- **旧版本（v0.4.0 及更早）无法使用服务端代取的哈希**：这些版本没有 `/agent/release-digest` 客户端逻辑，只能按原来的直连方式升级（设置 `HTTPS_PROXY`、多次重试，或 `install.sh --binary <gh-proxy 地址> --sha256 <核对过的哈希>`）；升级到 v0.4.2 后自动启用。
 - **Ping 探针报套接字权限不足**：systemd 需配置 `AmbientCapabilities=CAP_NET_RAW CAP_NET_ADMIN`（重新执行安装脚本会自动修复）；OpenWrt 需以 root 运行。
 - **提示 `目标地址属于受限私有/元数据地址`**：默认防御 SSRF 拦截了局域网或云元数据地址；自建内网探测需添加 `-allow-private-probes`。
 - **日志提示 `状态目录属主校验失败`**：状态目录（Linux 默认为 `/var/lib/mnagent`）被改成其他用户所有，Agent 会拒绝使用它并退回当前用户的缓存目录（此时跳过版本记录等状态会丢失）。执行 `sudo chown root:root /var/lib/mnagent` 后重启服务即可修复；该目录还要求权限不含组/其他用户的写位（`chmod 755` 或 `700` 均可）。
