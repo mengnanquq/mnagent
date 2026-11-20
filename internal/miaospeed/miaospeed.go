@@ -229,9 +229,6 @@ func CalcMiaospeedTimeout(nodeCount int) time.Duration {
 type RunOptions struct {
 	// AllowPrivate 允许连接私有/保留地址（对应 -allow-private-probes）。
 	AllowPrivate bool
-	// AllowAutoInstallDeps 允许在 miaospeed 缺失时自动下载安装（对应 -allow-auto-install-deps）。
-	// 默认关闭：机器人下发的测速任务不应单方面触发探针以 root 身份下载并执行新二进制。
-	AllowAutoInstallDeps bool
 }
 
 // RunJob 执行一次 MiaoSpeed 测速任务（兼容旧调用：仅允许控制 AllowPrivate）。
@@ -253,23 +250,19 @@ func RunJobWithOptions(ctx context.Context, binary, ghProxy string, job model.Jo
 	if p, ok := dep.ResolveBinaryPath(binary); ok {
 		binPath = p
 	} else if _, err := os.Stat(binary); err != nil {
-		// 未找到可执行文件，若配置为 miaospeed 标准文件名则尝试从 AirportR/miaospeed 自动下载安装。
-		// 该下载安装由远程任务触发，必须以 -allow-auto-install-deps 显式开启。
+		// 未找到可执行文件：依赖必须自动补齐。若配置为标准文件名，从
+		// AirportR/miaospeed 下载安装；EnsureMiaospeed 负责并发去重与失败冷却。
 		baseName := strings.ToLower(filepath.Base(binary))
 		if baseName == "miaospeed" || baseName == "miaospeed.exe" {
-			if !opts.AllowAutoInstallDeps {
-				return "", nil, fmt.Errorf("未找到 miaospeed 可执行文件（%s），且未开启 -allow-auto-install-deps：远程测速任务不会自动下载安装依赖。请在主机上安装 miaospeed（例如重新执行 install.sh，或手动安装到 PATH）后重试", binary)
-			}
 			if log != nil {
-				log.Warn("未找到 miaospeed，按 -allow-auto-install-deps 触发自动下载安装", "binary", binary)
+				log.Warn("未找到 miaospeed，正在自动下载安装", "binary", binary)
 			}
 			installed, installErr := autoInstallMiaospeed(ctx, binary, ghProxy, log)
 			if installErr == nil && installed == "" {
 				installErr = errors.New("安装过程未返回可执行文件路径")
 			}
 			if installErr != nil {
-				// 原来这里静默忽略安装失败，用户只能看到后续“启动失败”的模糊错误。
-				return "", nil, fmt.Errorf("自动安装 miaospeed 失败（%w）：请手动安装 miaospeed 到 PATH 后重试，或检查 GitHub 连通性", installErr)
+				return "", nil, fmt.Errorf("自动安装 miaospeed 失败（%w）：请检查 GitHub 连通性，或手动安装 miaospeed 到 PATH", installErr)
 			}
 			binPath = installed
 		}

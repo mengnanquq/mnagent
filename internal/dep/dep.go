@@ -225,6 +225,126 @@ func (dm *DependencyManager) lockDependency(name string) func() {
 	return mu.Unlock
 }
 
+// 运行时自动补装依赖的并发与失败冷却。
+//
+// 同一个依赖可能同时被 miaospeed 任务、trace 任务、启动检查与定期检查触发安装：
+// 只允许一个调用方真正下载，其余调用方等待同一结果；失败后在冷却期内直接返回
+// 上次错误，避免每个任务都重新下载一遍（弱网下会持续占用带宽与 CPU）。
+var (
+	depEnsureMu               sync.Mutex
+	depEnsureCalls            = make(map[string]*depEnsureCall)
+	depEnsureFailures         = make(map[string]depEnsureFailure)
+	depInstallFailureCooldown = 5 * time.Minute
+)
+
+type depEnsureCall struct {
+	done chan struct{}
+	path string
+	err  error
+}
+
+type depEnsureFailure struct {
+	err   error
+	until time.Time
+}
+
+// resetDependencyInstallState 仅供测试清理包级安装状态。
+func resetDependencyInstallState() {
+	depEnsureMu.Lock()
+	defer depEnsureMu.Unlock()
+	depEnsureCalls = make(map[string]*depEnsureCall)
+	depEnsureFailures = make(map[string]depEnsureFailure)
+}
+
+// isContextError 判断依赖安装是否因调用方 ctx 取消/超时失败。
+// 这类失败不代表依赖本身不可用，不能写入全局失败冷却。
+func isContextError(err error) bool {
+	return errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded)
+}
+
+// EnsureDependency 确保依赖可用：同一依赖的并发安装只执行一次，失败后短时间内
+// 不再重复下载。返回值与 UpdateDependency 一致。
+func (dm *DependencyManager) EnsureDependency(ctx context.Context, name, targetPath, version string, log Logger) (string, error) {
+	normalized := strings.ToLower(strings.TrimSpace(name))
+	var defaultName string
+	switch normalized {
+	case "nexttrace":
+		defaultName = "nexttrace"
+	case "miaospeed":
+		defaultName = "miaospeed"
+	default:
+		return "", fmt.Errorf("未知的依赖：%q", name)
+	}
+	dest := ResolveInstallTarget(targetPath, defaultName)
+	key := normalized + "|" + dest
+	retriedAfterLeaderCancel := false
+
+	for {
+		depEnsureMu.Lock()
+		if failure, ok := depEnsureFailures[key]; ok {
+			remaining := time.Until(failure.until)
+			if remaining > 0 {
+				depEnsureMu.Unlock()
+				return "", fmt.Errorf("依赖 %s 安装刚刚失败，%s 内不会重复下载：%w", normalized, remaining.Round(time.Second), failure.err)
+			}
+			delete(depEnsureFailures, key)
+		}
+		if call, ok := depEnsureCalls[key]; ok {
+			depEnsureMu.Unlock()
+			select {
+			case <-call.done:
+				// leader 因自身 ctx 取消/超时失败时，等待者若仍有效应自己重试一次，
+				// 不能把“另一个调用方放弃了”当成依赖永久不可用。
+				if !retriedAfterLeaderCancel && call.err != nil && isContextError(call.err) && ctx.Err() == nil {
+					retriedAfterLeaderCancel = true
+					continue
+				}
+				return call.path, call.err
+			case <-ctx.Done():
+				return "", ctx.Err()
+			}
+		}
+		call := &depEnsureCall{done: make(chan struct{})}
+		depEnsureCalls[key] = call
+		depEnsureMu.Unlock()
+
+		path, err := dm.UpdateDependency(ctx, normalized, targetPath, version, log)
+		if err != nil && ctx.Err() != nil && !isContextError(err) {
+			// 底层可能把取消错误包成了普通文本（重试摘要会压缩错误），
+			// 这里补回 ctx 错误链，供等待者判断“leader 因 ctx 失败”并自行重试。
+			err = fmt.Errorf("%w：%v", ctx.Err(), err)
+		}
+
+		depEnsureMu.Lock()
+		call.path, call.err = path, err
+		if err != nil {
+			if isContextError(err) {
+				// ctx 取消/超时只影响本次调用，不能冷却 5 分钟：
+				// 否则一次短超时会让后续任务都拿不到依赖。
+				delete(depEnsureFailures, key)
+			} else {
+				depEnsureFailures[key] = depEnsureFailure{err: err, until: time.Now().Add(depInstallFailureCooldown)}
+			}
+		} else {
+			delete(depEnsureFailures, key)
+		}
+		delete(depEnsureCalls, key)
+		close(call.done)
+		depEnsureMu.Unlock()
+		return path, err
+	}
+}
+
+// EnsureNextTrace 是 EnsureDependency("nexttrace") 的便捷封装。
+func (dm *DependencyManager) EnsureNextTrace(ctx context.Context, targetPath, version string, log Logger) (string, error) {
+	return dm.EnsureDependency(ctx, "nexttrace", targetPath, version, log)
+}
+
+// EnsureMiaospeed 是 EnsureDependency("miaospeed") 的便捷封装。
+func (dm *DependencyManager) EnsureMiaospeed(ctx context.Context, targetPath, version string, log Logger) (string, error) {
+	return dm.EnsureDependency(ctx, "miaospeed", targetPath, version, log)
+}
+
 // detectLocalNextTrace 探测本地已安装的 nexttrace 版本。
 // 内部再套一层独立超时：调用方（主循环 / heavyWorker）可能没有 deadline，
 // 绝不能因为依赖的 -V 卡死而永久阻塞。

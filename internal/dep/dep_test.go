@@ -16,6 +16,7 @@ import (
 	"path/filepath"
 	"runtime"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -1202,6 +1203,221 @@ func TestFetchAssetDigestFallsBackToAPIWithRetry(t *testing.T) {
 	}
 	if apiHits.Load() != digestFetchAttempts {
 		t.Fatalf("API 应尝试 %d 次，实际 %d 次", digestFetchAttempts, apiHits.Load())
+	}
+}
+
+// TestEnsureDependencySingleFlight 验证多个任务并发补装同一依赖时只下载一次。
+func TestEnsureDependencySingleFlight(t *testing.T) {
+	resetDependencyInstallState()
+	t.Cleanup(resetDependencyInstallState)
+
+	content := bytes.Repeat([]byte("F"), 150*1024)
+	sum := sha256.Sum256(content)
+	digest := hex.EncodeToString(sum[:])
+	var downloads atomic.Int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case strings.HasSuffix(r.URL.Path, ".sha256"):
+			http.NotFound(w, r)
+		case strings.Contains(r.URL.Path, "/releases/tags/"):
+			fmt.Fprintf(w, `{"assets":[{"name":"nexttrace_linux_amd64","digest":"sha256:%s"}]}`, digest)
+		case strings.Contains(r.URL.Path, "releases/download"):
+			downloads.Add(1)
+			time.Sleep(50 * time.Millisecond)
+			_, _ = w.Write(content)
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer srv.Close()
+
+	// 配置 gh-proxy 让二进制下载指向本地测试服务；摘要走本地 API。
+	dm := newDependencyManager(srv.URL)
+	dm.apiBaseURL = srv.URL
+	dm.githubBaseURL = srv.URL
+	dm.goos = "linux"
+	dm.goarch = "amd64"
+	mockDependencyVersion(dm, "v1.7.4", "4.7.7")
+
+	target := filepath.Join(t.TempDir(), "bin", "nexttrace")
+	const workers = 6
+	start := make(chan struct{})
+	errs := make(chan error, workers)
+	var wg sync.WaitGroup
+	for i := 0; i < workers; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			<-start
+			path, err := dm.EnsureDependency(context.Background(), "nexttrace", target, "v1.7.4", nil)
+			if err == nil && path != target {
+				err = fmt.Errorf("安装路径 = %q，期望 %q", path, target)
+			}
+			errs <- err
+		}()
+	}
+	close(start)
+	wg.Wait()
+	close(errs)
+	for err := range errs {
+		if err != nil {
+			t.Fatalf("并发补装失败: %v", err)
+		}
+	}
+	if got := downloads.Load(); got != 1 {
+		t.Fatalf("并发补装应只下载 1 次，实际 %d 次", got)
+	}
+}
+
+// TestEnsureDependencyFailureCooldown 验证安装失败后冷却期内不再重复下载，
+// 并返回带冷却时间的中文错误。
+func TestEnsureDependencyFailureCooldown(t *testing.T) {
+	resetDependencyInstallState()
+	t.Cleanup(resetDependencyInstallState)
+	origDelay := digestRetryBaseDelay
+	digestRetryBaseDelay = 5 * time.Millisecond
+	defer func() { digestRetryBaseDelay = origDelay }()
+
+	var hits atomic.Int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		hits.Add(1)
+		http.Error(w, "down", http.StatusBadGateway)
+	}))
+	defer srv.Close()
+
+	dm := newDependencyManager("")
+	dm.apiBaseURL = srv.URL
+	dm.githubBaseURL = srv.URL
+	dm.goos = "linux"
+	dm.goarch = "amd64"
+	target := filepath.Join(t.TempDir(), "bin", "nexttrace")
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	if _, err := dm.EnsureDependency(ctx, "nexttrace", target, "v1.7.4", nil); err == nil {
+		t.Fatal("上游持续失败时安装应报错")
+	}
+	firstHits := hits.Load()
+	if firstHits != digestFetchAttempts*2 {
+		t.Fatalf("首次安装应分别尝试 .sha256 与 API 各 %d 次，实际总请求 %d 次", digestFetchAttempts, firstHits)
+	}
+	_, err := dm.EnsureDependency(ctx, "nexttrace", target, "v1.7.4", nil)
+	if err == nil || !strings.Contains(err.Error(), "不会重复下载") {
+		t.Fatalf("冷却期内应返回不重复下载的清晰错误，实际: %v", err)
+	}
+	if got := hits.Load(); got != firstHits {
+		t.Fatalf("冷却期内不应再次请求上游，首次 %d 次、现在 %d 次", firstHits, got)
+	}
+}
+
+// TestEnsureDependencyContextFailureNoCooldown 验证 leader 因 ctx 取消/超时失败时
+// 不写 5 分钟冷却，下一次有效调用仍会真正尝试安装。
+func TestEnsureDependencyContextFailureNoCooldown(t *testing.T) {
+	resetDependencyInstallState()
+	t.Cleanup(resetDependencyInstallState)
+
+	var hits atomic.Int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		hits.Add(1)
+		http.NotFound(w, r)
+	}))
+	defer srv.Close()
+	dm := newDependencyManager("")
+	dm.apiBaseURL = srv.URL
+	dm.githubBaseURL = srv.URL
+	dm.goos = "linux"
+	dm.goarch = "amd64"
+	target := filepath.Join(t.TempDir(), "bin", "nexttrace")
+
+	canceled, cancel := context.WithCancel(context.Background())
+	cancel()
+	if _, err := dm.EnsureDependency(canceled, "nexttrace", target, "v1.7.4", nil); err == nil {
+		t.Fatal("ctx 已取消时安装应报错")
+	}
+	firstHits := hits.Load()
+
+	ctx, cancel2 := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel2()
+	_, err := dm.EnsureDependency(ctx, "nexttrace", target, "v1.7.4", nil)
+	if err == nil {
+		t.Fatal("上游返回 404 时应报错")
+	}
+	if strings.Contains(err.Error(), "不会重复下载") {
+		t.Fatalf("ctx 类失败不应写入冷却：%v", err)
+	}
+	if hits.Load() <= firstHits {
+		t.Fatalf("ctx 失败后再次调用应重新请求上游，首次 %d 次、现在 %d 次", firstHits, hits.Load())
+	}
+}
+
+// TestEnsureDependencyWaiterRetriesLeaderContextFailure 验证等待者拿到 leader 的
+// ctx 类错误、但自身 ctx 仍有效时会自己重试一次，而不是把放弃当成依赖不可用。
+func TestEnsureDependencyWaiterRetriesLeaderContextFailure(t *testing.T) {
+	resetDependencyInstallState()
+	t.Cleanup(resetDependencyInstallState)
+
+	started := make(chan struct{})
+	release := make(chan struct{})
+	var hits atomic.Int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if hits.Add(1) == 1 {
+			close(started)
+			<-release
+		}
+		http.NotFound(w, r)
+	}))
+	defer srv.Close()
+	dm := newDependencyManager("")
+	dm.apiBaseURL = srv.URL
+	dm.githubBaseURL = srv.URL
+	dm.goos = "linux"
+	dm.goarch = "amd64"
+	target := filepath.Join(t.TempDir(), "bin", "nexttrace")
+
+	leaderCtx, cancelLeader := context.WithCancel(context.Background())
+	leaderDone := make(chan error, 1)
+	go func() {
+		_, err := dm.EnsureDependency(leaderCtx, "nexttrace", target, "v1.7.4", nil)
+		leaderDone <- err
+	}()
+	select {
+	case <-started:
+	case <-time.After(2 * time.Second):
+		t.Fatal("leader 未发出请求")
+	}
+
+	waiterCtx, cancelWaiter := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancelWaiter()
+	waiterDone := make(chan error, 1)
+	go func() {
+		_, err := dm.EnsureDependency(waiterCtx, "nexttrace", target, "v1.7.4", nil)
+		waiterDone <- err
+	}()
+	time.Sleep(100 * time.Millisecond) // 确保等待者已挂到 leader 上
+
+	cancelLeader()
+	close(release)
+	select {
+	case err := <-leaderDone:
+		if err == nil || !errors.Is(err, context.Canceled) {
+			t.Fatalf("leader 应返回 ctx 取消错误，实际: %v", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("leader 未退出")
+	}
+	select {
+	case err := <-waiterDone:
+		if err == nil {
+			t.Fatal("上游返回 404 时等待者最终应报错")
+		}
+		if errors.Is(err, context.Canceled) || strings.Contains(err.Error(), "不会重复下载") {
+			t.Fatalf("等待者应自行重试一次，而不是直接返回 leader 的 ctx 错误/冷却：%v", err)
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("等待者未完成重试")
+	}
+	if got := hits.Load(); got < 3 {
+		t.Fatalf("等待者重试后应重新请求两个摘要来源，实际总请求 %d 次", got)
 	}
 }
 

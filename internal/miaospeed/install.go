@@ -73,7 +73,8 @@ func getMiaospeedVersion(ctx context.Context, binPath string, serverOutput strin
 }
 
 // autoInstallMiaospeed 在运行时自动下载并解压 AirportR/miaospeed Release，严格继承使用 ghProxy。
+// EnsureMiaospeed 会在多个任务并发触发时只下载一次，并在失败后短暂冷却。
 func autoInstallMiaospeed(ctx context.Context, targetPath, ghProxy string, log Logger) (string, error) {
 	dm := newDependencyManager(ghProxy)
-	return dm.UpdateMiaospeed(ctx, targetPath, "latest", log)
+	return dm.EnsureMiaospeed(ctx, targetPath, "latest", log)
 }

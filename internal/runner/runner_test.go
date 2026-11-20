@@ -12,6 +12,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -454,16 +455,26 @@ func TestSleepRespectsContext(t *testing.T) {
 // TestRunnerReportsStartFailure 验证“进程根本没起来”时会带出真实原因，
 // 而不是只报一个无从排查的“退出码 -1”。
 func TestRunnerReportsStartFailure(t *testing.T) {
-	r := newRunner(filepath.Join(t.TempDir(), "missing-nexttrace"), nil)
+	missing := filepath.Join(t.TempDir(), "missing-nexttrace")
+	r := newRunner(missing, nil)
+	// 直接验证 exec 层：可执行文件不存在时必须带出真实原因，而不是只报退出码 -1。
+	_, code, err := r.execWithBinary(context.Background(), missing, []string{"1.1.1.1"})
+	if code != -1 || err == nil {
+		t.Fatalf("缺失可执行文件时 code=%d err=%v，期望 -1 与错误", code, err)
+	}
+	msg := describeRunError(err, code)
+	if !strings.Contains(msg, "无法启动 nexttrace") || !strings.Contains(msg, "no such file") {
+		t.Fatalf("错误提示应包含真实原因: %q", msg)
+	}
+	if strings.Contains(msg, "退出码 -1）") {
+		t.Fatalf("不应只报退出码 -1: %q", msg)
+	}
+	// 通过 Runner 执行时，缺失 nexttrace 会先走自动安装；这里注入 nil 工厂避免联网，
+	// 并确认返回清晰错误。
+	r.depManagerFactory = func(string) *dep.DependencyManager { return nil }
 	res := r.run(context.Background(), model.Job{Target: "1.1.1.1"})
-	if res.ExitCode != -1 {
-		t.Fatalf("退出码 = %d，期望 -1", res.ExitCode)
-	}
-	if !strings.Contains(res.ErrText, "无法启动 nexttrace") || !strings.Contains(res.ErrText, "no such file") {
-		t.Fatalf("错误提示应包含真实原因: %q", res.ErrText)
-	}
-	if strings.Contains(res.ErrText, "退出码 -1）") {
-		t.Fatalf("不应只报退出码 -1: %q", res.ErrText)
+	if res.ExitCode != -1 || !strings.Contains(res.ErrText, "无法启动 nexttrace") {
+		t.Fatalf("缺失 nexttrace 时应返回明确错误: %+v", res)
 	}
 }
 
@@ -1012,6 +1023,8 @@ func TestAgentLoopConcurrentLightTasks(t *testing.T) {
 // TestRunTraceMissingBinary 验证未安装 nexttrace 时 runTrace 会优雅返回错误，退出码为 -1。
 func TestRunTraceMissingBinary(t *testing.T) {
 	r := newRunner("nonexistent-nexttrace-xyz", nil)
+	// 注入返回 nil 的工厂：本用例只验证缺失时的错误文案，不访问真实 GitHub。
+	r.depManagerFactory = func(string) *dep.DependencyManager { return nil }
 	job := model.Job{
 		ID:     "trace-missing",
 		Kind:   "trace",
@@ -1020,6 +1033,51 @@ func TestRunTraceMissingBinary(t *testing.T) {
 	res := r.run(context.Background(), job)
 	if res.ExitCode != -1 || !strings.Contains(res.ErrText, "无法启动 nexttrace") {
 		t.Fatalf("缺失 nexttrace 时未返回预期错误: exitCode=%d errText=%q", res.ExitCode, res.ErrText)
+	}
+}
+
+// TestRunnerAutoInstallsMissingNexttrace 验证 nexttrace 缺失时 trace 任务会先自动
+// 下载安装，再执行本次追踪（不再直接 exec 失败）。
+func TestRunnerAutoInstallsMissingNexttrace(t *testing.T) {
+	body := "#!/bin/sh\ncase \"$1\" in\n  -V|--version) echo \"NextTrace  v1.7.4\" ;;\n  *) echo \"trace ok\" ;;\nesac\n"
+	for len(body) < 150*1024 {
+		body += "# padding\n"
+	}
+	content := []byte(body)
+	digest := fmt.Sprintf("%x", sha256.Sum256(content))
+	asset, err := dep.NexttraceAsset(runtime.GOOS, runtime.GOARCH)
+	if err != nil {
+		t.Fatal(err)
+	}
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case strings.Contains(r.URL.Path, "/releases/latest"):
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(`{"tag_name":"v1.7.4"}`))
+		case strings.Contains(r.URL.Path, "/releases/tags/v1.7.4"):
+			w.Header().Set("Content-Type", "application/json")
+			fmt.Fprintf(w, `{"assets":[{"name":%q,"digest":"sha256:%s"}]}`, asset, digest)
+		case strings.Contains(r.URL.Path, "/releases/download/"):
+			_, _ = w.Write(content)
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer srv.Close()
+
+	target := filepath.Join(t.TempDir(), "bin", "nexttrace")
+	r := NewRunnerFull(target, "miaospeed", srv.URL, true, nil)
+	r.depManagerFactory = func(proxy string) *dep.DependencyManager {
+		dm := dep.NewDependencyManager(proxy)
+		dm.SetGitHubEndpoints(srv.URL, srv.URL)
+		return dm
+	}
+	res := r.Run(context.Background(), model.Job{ID: "auto-trace", Kind: "trace", Target: "1.1.1.1", Hops: 3, TimeoutMS: 10000})
+	if res.ExitCode != 0 || !strings.Contains(res.Output, "trace ok") {
+		t.Fatalf("缺失 nexttrace 时应自动安装并执行成功：%+v", res)
+	}
+	if _, err := os.Stat(target); err != nil {
+		t.Fatalf("nexttrace 应安装到配置路径 %s: %v", target, err)
 	}
 }
 
@@ -1092,6 +1150,60 @@ func TestBuildMiaospeedResultDropsDuplicateOutput(t *testing.T) {
 	}
 	if len(bare.Data) != 0 {
 		t.Fatalf("无结构化数据时 Data 应为空，实际: %s", bare.Data)
+	}
+}
+
+// TestAgentCheckAndUpdateDependenciesInstallsMissing 验证即使未开启 -auto-update，
+// 依赖检查也会自动安装缺失的 nexttrace。
+func TestAgentCheckAndUpdateDependenciesInstallsMissing(t *testing.T) {
+	body := "#!/bin/sh\ncase \"$1\" in\n  -V|--version) echo \"NextTrace  v1.7.4\" ;;\n  *) echo ok ;;\nesac\n"
+	for len(body) < 150*1024 {
+		body += "# padding\n"
+	}
+	content := []byte(body)
+	digest := fmt.Sprintf("%x", sha256.Sum256(content))
+	asset, err := dep.NexttraceAsset(runtime.GOOS, runtime.GOARCH)
+	if err != nil {
+		t.Fatal(err)
+	}
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case strings.Contains(r.URL.Path, "/nxtrace/NTrace-core/releases/latest"):
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(`{"tag_name":"v1.7.4"}`))
+		case strings.Contains(r.URL.Path, "/AirportR/miaospeed/releases/latest"):
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(`{"tag_name":"4.7.7"}`))
+		case strings.Contains(r.URL.Path, "/nxtrace/NTrace-core/releases/tags/v1.7.4"):
+			w.Header().Set("Content-Type", "application/json")
+			fmt.Fprintf(w, `{"assets":[{"name":%q,"digest":"sha256:%s"}]}`, asset, digest)
+		case strings.Contains(r.URL.Path, "/releases/download/"):
+			_, _ = w.Write(content)
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer srv.Close()
+
+	dir := t.TempDir()
+	nexttracePath := filepath.Join(dir, "nexttrace")
+	miaoPath := filepath.Join(dir, "miaospeed")
+	if err := os.WriteFile(miaoPath, []byte("#!/bin/sh\necho \"version: 4.7.7\"\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	cfg := &config.Config{Binary: nexttracePath, MiaospeedBinary: miaoPath, AutoUpdate: false}
+	a := &Agent{cfg: cfg, logger: testLogger{t}}
+	a.depManagerFactory = func(proxy string) *dep.DependencyManager {
+		dm := dep.NewDependencyManager(proxy)
+		dm.SetGitHubEndpoints(srv.URL, srv.URL)
+		return dm
+	}
+	// 用 gh-proxy 指向本地测试服务，避免访问真实 GitHub。
+	a.cfg.GHProxy = srv.URL
+
+	a.checkAndUpdateDependencies(context.Background())
+	if _, err := os.Stat(nexttracePath); err != nil {
+		t.Fatalf("缺失 nexttrace 应在启动/定期检查中自动安装: %v", err)
 	}
 }
 
@@ -1659,27 +1771,5 @@ func TestLoggableTargetRedactsHTTPAndUnvalidated(t *testing.T) {
 	// 合法目标保持原样，便于排障。
 	if got := loggableTarget(model.Job{Kind: "trace", Target: "example.com:443"}); got != "example.com:443" {
 		t.Fatalf("合法 trace 目标应保持原样，got=%q", got)
-	}
-}
-
-// TestRunnerMiaospeedRequiresExplicitAutoInstall 验证 Runner 默认不允许远程测速任务
-// 触发 miaospeed 的自动下载安装（必须显式 -allow-auto-install-deps）。
-func TestRunnerMiaospeedRequiresExplicitAutoInstall(t *testing.T) {
-	r := newRunnerWithMiaospeed("nexttrace", filepath.Join(t.TempDir(), "miaospeed"), nil)
-	if r.allowAutoInstallDeps {
-		t.Fatal("Runner 默认不应允许依赖自动安装")
-	}
-	res := r.Run(context.Background(), model.Job{
-		ID:        "m1",
-		Kind:      "miaospeed",
-		Target:    "trojan://pass@example.com:443#n",
-		TimeoutMS: 5000,
-	})
-	if res.ExitCode != -1 || !strings.Contains(res.ErrText, "allow-auto-install-deps") {
-		t.Fatalf("默认应拒绝自动安装并提示开关：%+v", res)
-	}
-	r.SetAllowAutoInstallDeps(true)
-	if !r.allowAutoInstallDeps {
-		t.Fatal("SetAllowAutoInstallDeps 未生效")
 	}
 }

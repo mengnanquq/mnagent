@@ -126,7 +126,27 @@ func (a *Agent) newDependencyManager() *dep.DependencyManager {
 	return dep.NewDependencyManager(ghProxy)
 }
 
-// checkAndUpdateDependencies 检查各依赖项（如 nexttrace、miaospeed）版本，若启用 autoUpdate 则自动更新。
+// dependencyTargetPath 返回依赖的配置路径（用于缺失时自动安装）。
+func dependencyTargetPath(cfg *config.Config, name string) string {
+	if cfg == nil {
+		return name
+	}
+	switch strings.ToLower(strings.TrimSpace(name)) {
+	case "nexttrace":
+		if cfg.Binary != "" {
+			return cfg.Binary
+		}
+	case "miaospeed":
+		if cfg.MiaospeedBinary != "" {
+			return cfg.MiaospeedBinary
+		}
+	}
+	return name
+}
+
+// checkAndUpdateDependencies 检查各依赖项（如 nexttrace、miaospeed）版本：
+// 缺失的依赖一律安装；已安装的依赖仅在启用 autoUpdate 时更新。
+// 并发触发（启动检查、定期检查、测试任务）由 dep.EnsureDependency 去重并冷却失败。
 func (a *Agent) checkAndUpdateDependencies(ctx context.Context) {
 	if a.cfg == nil {
 		return
@@ -137,18 +157,28 @@ func (a *Agent) checkAndUpdateDependencies(ctx context.Context) {
 	}
 	statuses := dm.CheckAll(ctx, a.cfg.Binary, a.cfg.MiaospeedBinary)
 	for _, st := range statuses {
-		if st.Error != nil {
-			a.logger.Warn("检查依赖更新失败", "dependency", st.Name, "error", st.Error)
+		if !st.Installed {
+			version := st.LatestVersion
+			if version == "" {
+				version = "latest"
+			}
+			a.logger.Info("依赖未安装，开始自动下载安装", "dependency", st.Name, "version", version)
+			path, err := dm.EnsureDependency(ctx, st.Name, dependencyTargetPath(a.cfg, st.Name), version, a.logger)
+			if err != nil {
+				a.logger.Warn("自动安装依赖失败", "dependency", st.Name, "error", err)
+			} else {
+				a.logger.Info("依赖已自动安装", "dependency", st.Name, "path", path)
+			}
 			continue
 		}
-		if !st.Installed {
-			a.logger.Debug("依赖未安装", "dependency", st.Name, "latest", st.LatestVersion)
+		if st.Error != nil {
+			a.logger.Warn("检查依赖更新失败", "dependency", st.Name, "error", st.Error)
 			continue
 		}
 		if st.HasUpdate {
 			a.logger.Info("发现依赖新版本", "dependency", st.Name, "current", st.CurrentVersion, "latest", st.LatestVersion)
 			if a.cfg.AutoUpdate {
-				if _, err := dm.UpdateDependency(ctx, st.Name, st.BinaryPath, st.LatestVersion, a.logger); err != nil {
+				if _, err := dm.EnsureDependency(ctx, st.Name, st.BinaryPath, st.LatestVersion, a.logger); err != nil {
 					a.logger.Warn("自动更新依赖失败", "dependency", st.Name, "Version", st.LatestVersion, "error", err)
 				} else {
 					a.logger.Info("依赖已自动更新", "dependency", st.Name, "Version", st.LatestVersion)
@@ -158,6 +188,19 @@ func (a *Agent) checkAndUpdateDependencies(ctx context.Context) {
 			a.logger.Debug("依赖已是最新版本", "dependency", st.Name, "Version", st.CurrentVersion)
 		}
 	}
+}
+
+// StartInitialDependencyCheck 在后台检查并补齐缺失依赖（不依赖 -auto-update 是否开启）。
+// 该协程注册到 tasksWG 并受 ctx 控制，主循环退出时会等待其结束。
+func (a *Agent) StartInitialDependencyCheck(ctx context.Context) {
+	if a.cfg == nil {
+		return
+	}
+	a.tasksWG.Add(1)
+	go func() {
+		defer a.tasksWG.Done()
+		a.checkAndUpdateDependencies(ctx)
+	}()
 }
 
 // startAutoUpdate 在独立协程中执行一次自动更新检查。
@@ -244,15 +287,24 @@ func (a *Agent) handleUpgradeJob(ctx context.Context, job model.Job) {
 		if dm := a.newDependencyManager(); dm != nil {
 			statuses := dm.CheckAll(ctx, a.cfg.Binary, a.cfg.MiaospeedBinary)
 			for _, st := range statuses {
+				if !st.Installed {
+					version := st.LatestVersion
+					if version == "" {
+						version = "latest"
+					}
+					if _, err := dm.EnsureDependency(ctx, st.Name, dependencyTargetPath(a.cfg, st.Name), version, a.logger); err != nil {
+						depNotes = append(depNotes, fmt.Sprintf("• 依赖 %s 自动安装失败：%v", st.Name, err))
+					} else {
+						depNotes = append(depNotes, fmt.Sprintf("• 依赖 %s 已自动安装", st.Name))
+					}
+					continue
+				}
 				if st.Error != nil {
 					depNotes = append(depNotes, fmt.Sprintf("• 依赖 %s 检查失败：%v", st.Name, st.Error))
 					continue
 				}
-				if !st.Installed {
-					continue
-				}
 				if st.HasUpdate {
-					if _, err := dm.UpdateDependency(ctx, st.Name, st.BinaryPath, st.LatestVersion, a.logger); err != nil {
+					if _, err := dm.EnsureDependency(ctx, st.Name, st.BinaryPath, st.LatestVersion, a.logger); err != nil {
 						depNotes = append(depNotes, fmt.Sprintf("• 依赖 %s 更新至 %s 失败：%v", st.Name, st.LatestVersion, err))
 					} else {
 						depNotes = append(depNotes, fmt.Sprintf("• 依赖 %s 已成功更新至 %s", st.Name, st.LatestVersion))

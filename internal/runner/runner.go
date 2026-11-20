@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"math/rand/v2"
 	"net"
+	"os"
 	"os/exec"
 	"regexp"
 	"strconv"
@@ -17,6 +18,7 @@ import (
 
 	"github.com/mengnanquq/mnagent/internal/client"
 	"github.com/mengnanquq/mnagent/internal/config"
+	"github.com/mengnanquq/mnagent/internal/dep"
 	"github.com/mengnanquq/mnagent/internal/miaospeed"
 	"github.com/mengnanquq/mnagent/internal/model"
 	"github.com/mengnanquq/mnagent/internal/probe"
@@ -34,6 +36,10 @@ var targetPattern = regexp.MustCompile(`^[A-Za-z0-9_.:\[\]-]+$`)
 // maxOutputBytes 限制单次追踪读入内存的输出（机器人侧同样有上限）。
 const maxOutputBytes = 1 << 20
 
+// dependencyInstallMaxTimeout 限制 trace 任务触发依赖下载/安装的时长：
+// 安装与任务本身共用一个串行 heavyWorker，不能因为弱网下载把它长期占住。
+const dependencyInstallMaxTimeout = 90 * time.Second
+
 // runner 负责校验任务参数并执行 nexttrace 或外部工具。
 type Runner struct {
 	binary          string
@@ -44,15 +50,13 @@ type Runner struct {
 	// 避免超时任务因为派生的孙进程而把 agent 卡死。
 	waitDelay          time.Duration
 	allowPrivateProbes bool
-	// allowAutoInstallDeps 是否允许远程测速任务在 miaospeed 缺失时自动下载安装（默认否）。
-	allowAutoInstallDeps bool
-	logger               Logger // 可选：记录实际执行的 argv，便于与主机上手跑结果对照。
-	onProgress           func(model.Progress)
-}
+	logger             Logger // 可选：记录实际执行的 argv，便于与主机上手跑结果对照。
+	onProgress         func(model.Progress)
 
-// SetAllowAutoInstallDeps 设置是否允许远程任务触发依赖的自动下载安装（-allow-auto-install-deps）。
-func (r *Runner) SetAllowAutoInstallDeps(allow bool) {
-	r.allowAutoInstallDeps = allow
+	nexttraceMu        sync.Mutex
+	installedNexttrace string
+	// depManagerFactory 可选：测试注入依赖管理器，避免访问真实 GitHub。
+	depManagerFactory func(ghProxy string) *dep.DependencyManager
 }
 
 // setProgressReporter 注入实时进度回调。
@@ -123,8 +127,7 @@ func (r *Runner) runMiaospeed(ctx context.Context, job model.Job) runResult {
 	defer cancel()
 
 	output, data, err := miaospeed.RunJobWithOptions(runCtx, r.miaospeedBinary, r.ghProxy, job, r.logger, r.onProgress, miaospeed.RunOptions{
-		AllowPrivate:         r.allowPrivateProbes,
-		AllowAutoInstallDeps: r.allowAutoInstallDeps,
+		AllowPrivate: r.allowPrivateProbes,
 	})
 	if err != nil {
 		return buildMiaospeedResult(output, data, err.Error(), -1)
@@ -201,6 +204,45 @@ func (r *Runner) runTrace(ctx context.Context, job model.Job) runResult {
 	return runResult{Output: out, ErrText: errText, ExitCode: exitCode}
 }
 
+// nexttraceBinary 返回可执行的 nexttrace 路径；缺失时自动下载安装一次并缓存结果。
+func (r *Runner) nexttraceBinary(ctx context.Context) (string, error) {
+	if p, ok := dep.ResolveBinaryPath(r.binary); ok {
+		return p, nil
+	}
+	r.nexttraceMu.Lock()
+	cached := r.installedNexttrace
+	r.nexttraceMu.Unlock()
+	if cached != "" {
+		if p, ok := dep.ResolveBinaryPath(cached); ok {
+			return p, nil
+		}
+	}
+
+	dm := r.newDependencyManager()
+	if dm == nil {
+		return "", fmt.Errorf("未找到 nexttrace 可执行文件（%s）", r.binary)
+	}
+	if r.logger != nil {
+		r.logger.Warn("未找到 nexttrace，正在自动下载安装", "binary", r.binary)
+	}
+	installed, err := dm.EnsureNextTrace(ctx, r.binary, "latest", r.logger)
+	if err != nil {
+		return "", err
+	}
+	r.nexttraceMu.Lock()
+	r.installedNexttrace = installed
+	r.nexttraceMu.Unlock()
+	return installed, nil
+}
+
+// newDependencyManager 创建依赖管理器；测试可注入工厂返回 nil 跳过真实下载。
+func (r *Runner) newDependencyManager() *dep.DependencyManager {
+	if r.depManagerFactory != nil {
+		return r.depManagerFactory(r.ghProxy)
+	}
+	return dep.NewDependencyManager(r.ghProxy)
+}
+
 // runNexttrace 组装 argv、执行并处理 -j 兼容回退。
 func (r *Runner) runNexttrace(ctx context.Context, job model.Job) (output string, errText string, exitCode int) {
 	args, err := r.argv(job)
@@ -208,15 +250,32 @@ func (r *Runner) runNexttrace(ctx context.Context, job model.Job) (output string
 		return "", err.Error(), -1
 	}
 
+	// 依赖安装有独立上限：heavyWorker 是串行的，弱网下载不能无限占住队列。
+	// 同时不超过任务自身超时，避免安装比任务预算还长。
+	installCtx, cancelInstall := context.WithTimeout(ctx, min(dependencyInstallMaxTimeout, job.Timeout()))
+	defer cancelInstall()
+
+	binaryPath, err := r.nexttraceBinary(installCtx)
+	if err != nil {
+		return "", "执行失败：无法启动 nexttrace（" + clampText(err.Error(), 300) + "）", -1
+	}
+
 	runCtx, cancel := context.WithTimeout(ctx, job.Timeout())
 	defer cancel()
 
-	out, code, runErr := r.exec(runCtx, args)
+	out, code, runErr := r.execWithBinary(runCtx, binaryPath, args)
+	// 执行前检查通过、执行时却找不到文件（被删除/替换中）：重新安装后重试一次。
+	if runErr != nil && isExecNotFound(runErr) {
+		if installed, installErr := r.nexttraceBinary(installCtx); installErr == nil {
+			binaryPath = installed
+			out, code, runErr = r.execWithBinary(runCtx, binaryPath, args)
+		}
+	}
 	// 旧版 nexttrace（< v1.7）不认识 -j：去掉该参数重试一次，并记住结论。
 	if runErr != nil && r.jsonOutput.Load() && looksLikeUnknownFlag(out) {
 		r.jsonOutput.Store(false)
 		if plain, err := r.argv(job); err == nil {
-			out, code, runErr = r.exec(runCtx, plain)
+			out, code, runErr = r.execWithBinary(runCtx, binaryPath, plain)
 		}
 	}
 
@@ -256,13 +315,18 @@ func clampText(s string, max int) string {
 	return s[:max] + "…"
 }
 
-// exec 以 argv 方式调用 nexttrace（不经 shell），并捕获受限输出。
-func (r *Runner) exec(ctx context.Context, args []string) (string, int, error) {
-	cmd := exec.CommandContext(ctx, r.binary, args...)
+// isExecNotFound 判断执行失败是否因为可执行文件不存在（含 LookPath 失败）。
+func isExecNotFound(err error) bool {
+	return errors.Is(err, exec.ErrNotFound) || errors.Is(err, os.ErrNotExist)
+}
+
+// execWithBinary 以 argv 方式调用指定 nexttrace 二进制（不经 shell），并捕获受限输出。
+func (r *Runner) execWithBinary(ctx context.Context, binary string, args []string) (string, int, error) {
+	cmd := exec.CommandContext(ctx, binary, args...)
 	process.SetupCmdProcessGroup(cmd)
 	cmd.WaitDelay = r.waitDelay
 	if r.logger != nil {
-		r.logger.Debug("执行 nexttrace", "argv", strings.Join(append([]string{r.binary}, args...), " "))
+		r.logger.Debug("执行 nexttrace", "argv", strings.Join(append([]string{binary}, args...), " "))
 	}
 	out := process.NewCappedBuffer(maxOutputBytes)
 	cmd.Stdout, cmd.Stderr = out, out

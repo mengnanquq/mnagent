@@ -2400,30 +2400,33 @@ func TestSubscriptionClientIgnoresEnvProxy(t *testing.T) {
 	}
 }
 
-// TestRunJobWithOptionsAutoInstallGated 验证未开启 -allow-auto-install-deps 时，
-// 缺失 miaospeed 直接给出清晰错误，绝不触发远程下载安装（远程任务不得单方面安装依赖）。
+// TestRunJobWithOptionsAutoInstallGated 验证依赖必须自动下载：不再需要任何开关，
+// miaospeed 缺失时直接尝试安装；安装失败返回明确错误而不是继续用不存在的二进制启动。
 func TestRunJobWithOptionsAutoInstallGated(t *testing.T) {
 	orig := newDependencyManager
 	defer func() { newDependencyManager = orig }()
 	created := false
 	newDependencyManager = func(ghProxy string) *dep.DependencyManager {
 		created = true
-		return dep.NewDependencyManager(ghProxy)
+		dm := dep.NewDependencyManager(ghProxy)
+		// 指向不可达地址，确保不会真的访问 GitHub。
+		dm.SetGitHubEndpoints("http://127.0.0.1:1", "http://127.0.0.1:1")
+		return dm
 	}
 
 	job := model.Job{ID: "job-auto-install", Kind: "miaospeed", Target: "trojan://pass@example.com:443#n"}
 	binary := filepath.Join(t.TempDir(), "miaospeed")
 	_, _, err := RunJobWithOptions(context.Background(), binary, "", job, testLogger{t}, nil, RunOptions{})
-	if err == nil || !strings.Contains(err.Error(), "allow-auto-install-deps") {
-		t.Fatalf("未开启自动安装时应给出带开关名的清晰错误，实际: %v", err)
+	if err == nil || !strings.Contains(err.Error(), "自动安装 miaospeed 失败") {
+		t.Fatalf("缺失 miaospeed 时应自动安装并返回明确错误，实际: %v", err)
 	}
-	if created {
-		t.Fatal("未开启自动安装时不应创建依赖管理器（即不得发起下载）")
+	if !created {
+		t.Fatal("缺失 miaospeed 时应尝试自动安装（不再受开关控制）")
 	}
 }
 
-// TestRunJobWithOptionsAutoInstallEnabled 验证开启开关后才会走自动安装分支，
-// 安装失败时返回明确错误而不是继续用不存在的二进制启动。
+// TestRunJobWithOptionsAutoInstallEnabled 验证自动安装失败时返回明确错误，
+// 而不是继续用不存在的二进制启动。
 func TestRunJobWithOptionsAutoInstallEnabled(t *testing.T) {
 	orig := newDependencyManager
 	defer func() { newDependencyManager = orig }()
@@ -2438,12 +2441,12 @@ func TestRunJobWithOptionsAutoInstallEnabled(t *testing.T) {
 
 	job := model.Job{ID: "job-auto-install-2", Kind: "miaospeed", Target: "trojan://pass@example.com:443#n"}
 	binary := filepath.Join(t.TempDir(), "miaospeed")
-	_, _, err := RunJobWithOptions(context.Background(), binary, "", job, testLogger{t}, nil, RunOptions{AllowAutoInstallDeps: true})
+	_, _, err := RunJobWithOptions(context.Background(), binary, "", job, testLogger{t}, nil, RunOptions{})
 	if err == nil || !strings.Contains(err.Error(), "自动安装 miaospeed 失败") {
-		t.Fatalf("开启后安装失败应返回明确错误，实际: %v", err)
+		t.Fatalf("自动安装失败应返回明确错误，实际: %v", err)
 	}
 	if !created {
-		t.Fatal("开启后应尝试自动安装")
+		t.Fatal("缺失时应尝试自动安装")
 	}
 }
 

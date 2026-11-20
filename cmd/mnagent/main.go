@@ -104,7 +104,6 @@ func runWithContext(ctx context.Context, args []string) error {
 
 	if cfg.DiagJob != "" {
 		rnr := runner.NewRunnerFull(cfg.Binary, cfg.MiaospeedBinary, cfg.GHProxy, cfg.AllowPrivateProbes, log)
-		rnr.SetAllowAutoInstallDeps(cfg.AllowAutoInstallDeps)
 		res := rnr.Run(ctx, model.Job{
 			ID:        "diag",
 			Kind:      "miaospeed",
@@ -150,7 +149,6 @@ func runWithContext(ctx context.Context, args []string) error {
 	cli := client.New(cfg)
 	trk := tracker.New()
 	rnr := runner.NewRunnerFull(cfg.Binary, cfg.MiaospeedBinary, cfg.GHProxy, cfg.AllowPrivateProbes, log)
-	rnr.SetAllowAutoInstallDeps(cfg.AllowAutoInstallDeps)
 	rnr.SetProgressReporter(func(p model.Progress) {
 		pCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
 		defer cancel()
@@ -161,12 +159,14 @@ func runWithContext(ctx context.Context, args []string) error {
 
 	upd := runner.NewUpdater(cfg, log)
 	agent := runner.NewAgent(cfg, log, cli, rnr, upd, trk)
+	// 启动后在后台补齐缺失依赖；无论 -auto-update 是否开启都会执行。
+	agent.StartInitialDependencyCheck(ctx)
 
 	if _, ok := dep.ResolveBinaryPath(cfg.Binary); !ok {
-		log.Warn("未检测到 nexttrace 可执行文件，路由追踪任务将暂不可用（其它探针与测速正常）", "nexttrace", cfg.Binary)
+		log.Warn("未检测到 nexttrace 可执行文件，后台将尝试自动下载安装", "nexttrace", cfg.Binary)
 	}
 	if _, ok := dep.ResolveBinaryPath(cfg.MiaospeedBinary); !ok {
-		log.Debug("未检测到 miaospeed 可执行文件（仅测速任务需要）", "miaospeed", cfg.MiaospeedBinary)
+		log.Info("未检测到 miaospeed 可执行文件，后台将尝试自动下载安装（仅测速任务需要）", "miaospeed", cfg.MiaospeedBinary)
 	}
 	tokenFrom := ""
 	if cfg.Tokens != nil {
