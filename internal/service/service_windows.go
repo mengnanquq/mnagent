@@ -90,6 +90,10 @@ func RestartWindowsService() error {
 		return errors.New("Windows 环境下未检测到运行中的 mnagent 服务，请手动重启程序")
 	}
 
+	// 这里保留 cmd.exe 组合命令：重启必须在“本服务被 net stop 杀掉”之后继续执行，
+	// 因此只能交给一个独立的 shell 进程按序完成（先延迟等 SCM 完成停止，再启动）。
+	// 直接连续调用 sc.exe/net.exe 做不到：第一条 net stop 生效后本进程即被终止，
+	// 后续命令不会再执行；而 SCM 的失败恢复动作只对“异常退出”生效，覆盖不了主动重启。
 	cmd := exec.Command("cmd.exe", "/c", "ping 127.0.0.1 -n 2 >nul & net stop mnagent & net start mnagent")
 	cmd.SysProcAttr = &syscall.SysProcAttr{
 		CreationFlags: syscall.CREATE_NEW_PROCESS_GROUP | 0x00000008, // DETACHED_PROCESS

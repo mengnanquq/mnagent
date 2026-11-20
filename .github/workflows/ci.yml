@@ -38,3 +38,18 @@ jobs:
         run: |
           GOOS=windows GOARCH=amd64 go build -v ./...
           GOOS=windows GOARCH=arm64 go build -v ./...
+
+  windows:
+    name: Windows Vet and Test
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.26.x'
+          check-latest: true
+      # 只跑能在 Windows 上稳定执行的包；statedir 覆盖 owner/DACL 的 Windows 专用实现。
+      - name: Go Vet (statedir)
+        run: go vet ./internal/statedir
+      - name: Go Test (statedir, windows)
+        run: go test -race -count=1 ./internal/statedir
