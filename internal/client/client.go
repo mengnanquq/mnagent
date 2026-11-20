@@ -10,10 +10,12 @@ import (
 	"math/rand/v2"
 	"net"
 	"net/http"
+	"regexp"
 	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
+	"unicode/utf8"
 
 	"github.com/coder/websocket"
 
@@ -80,7 +82,8 @@ type Client struct {
 	wsCancelNotify   chan struct{}
 
 	ackMu sync.Mutex
-	acks  map[string]chan struct{} // 等待机器人确认的结果 ID
+	// acks 记录每个结果 ID 的 ack 等待者（同一 ID 可能因重试/重发出现多个并发等待者）。
+	acks map[string][]chan struct{}
 }
 
 // New 构建通信客户端；轮询超时略大于机器人侧的长轮询保持时间。
@@ -354,7 +357,29 @@ func (c *Client) doWith(cli *http.Client, ctx context.Context, method, path stri
 }
 
 // readSnippet 读取响应片段用于错误提示（不打印可能很长的正文）。
+// 机器人的错误响应可能回显请求头或令牌，因此统一脱敏后再拼进错误/日志，
+// 避免凭据被写进 journalctl / 上报给上游。
 func readSnippet(body io.Reader) string {
 	data, _ := io.ReadAll(io.LimitReader(body, 512))
-	return strings.TrimSpace(string(data))
+	return redactSnippet(strings.TrimSpace(string(data)))
+}
+
+// snippetTokenPattern 匹配响应里常见的凭据形态：
+// "Bearer <token>"，以及 token/secret/password/authorization 的 key=value / "key":"value" 写法。
+var snippetTokenPattern = regexp.MustCompile(`(?i)(bearer\s+)[A-Za-z0-9._\-+/=]{4,}|("?(?:token|secret|password|authorization)"?\s*[:=]\s*"?)[^\s",;}]{4,}`)
+
+// redactSnippet 把响应片段中的凭据替换为 ***，只保留可诊断的结构信息。
+func redactSnippet(s string) string {
+	if s == "" {
+		return ""
+	}
+	if len(s) > 512 {
+		// 按 UTF-8 rune 边界截断，避免把多字节字符切成半个导致日志出现乱码。
+		cut := 512
+		for cut > 0 && !utf8.RuneStart(s[cut]) {
+			cut--
+		}
+		s = s[:cut]
+	}
+	return snippetTokenPattern.ReplaceAllString(s, "${1}${2}***")
 }

@@ -263,6 +263,9 @@ func (c *Client) stopWSRejectLoop() {
 }
 
 // waitWSRejectLoops 等待在途回传结束；ctx 到期时返回 false。
+// 注意：ctx 到期后这个等待协程会一直留到 WaitGroup 归零才退出（协程里无法中断
+// WaitGroup.Wait）。这是有意接受的：回传协程本身受 ctx 约束，会很快结束，
+// 因此这里只可能短暂滞留一个协程，不值得为此引入额外的完成信号通道。
 func (c *Client) waitWSRejectLoops(ctx context.Context) bool {
 	done := make(chan struct{})
 	go func() {
@@ -441,17 +444,13 @@ func (c *Client) sendResultWS(ctx context.Context, res model.Result) bool {
 	ch := make(chan struct{})
 	c.ackMu.Lock()
 	if c.acks == nil {
-		c.acks = make(map[string]chan struct{})
+		c.acks = make(map[string][]chan struct{})
 	}
-	c.acks[res.ID] = ch
+	// 同一 jobID 可能因重试/重发出现多个并发等待者：追加而不是覆盖，
+	// 覆盖会让先登记的协程永远等不到 ack（白等到超时）。
+	c.acks[res.ID] = append(c.acks[res.ID], ch)
 	c.ackMu.Unlock()
-	defer func() {
-		c.ackMu.Lock()
-		if c.acks[res.ID] == ch {
-			delete(c.acks, res.ID)
-		}
-		c.ackMu.Unlock()
-	}()
+	defer c.removeAckWaiter(res.ID, ch)
 	if c.wsSend(ctx, wsMessage{Type: "result", Result: &res}) != nil {
 		return false
 	}
@@ -467,14 +466,31 @@ func (c *Client) sendResultWS(ctx context.Context, res model.Result) bool {
 	}
 }
 
+// removeAckWaiter 注销一个 ack 等待者；没有等待者时删除键，避免 map 无限增长。
+func (c *Client) removeAckWaiter(id string, ch chan struct{}) {
+	c.ackMu.Lock()
+	defer c.ackMu.Unlock()
+	waiters := c.acks[id]
+	for i, w := range waiters {
+		if w == ch {
+			waiters = append(waiters[:i], waiters[i+1:]...)
+			break
+		}
+	}
+	if len(waiters) == 0 {
+		delete(c.acks, id)
+		return
+	}
+	c.acks[id] = waiters
+}
+
 func (c *Client) resolveAck(id string) {
 	c.ackMu.Lock()
-	ch, ok := c.acks[id]
-	if ok {
-		delete(c.acks, id)
-	}
+	waiters := c.acks[id]
+	delete(c.acks, id)
 	c.ackMu.Unlock()
-	if ok {
+	// 唤醒全部等待者：ack 是针对结果 ID 的，不是针对某一次发送。
+	for _, ch := range waiters {
 		close(ch)
 	}
 }

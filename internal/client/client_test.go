@@ -13,6 +13,7 @@ import (
 	"sync/atomic"
 	"testing"
 	"time"
+	"unicode/utf8"
 )
 
 // testConfig 用给定端点构建最小配置。
@@ -364,5 +365,48 @@ func TestClientWSJobsCapacityLowMemory(t *testing.T) {
 	cli := New(testConfig("http://127.0.0.1:1", nil))
 	if got := cap(cli.wsJobs); got != 16 {
 		t.Fatalf("wsJobs 容量 = %d，期望 16", got)
+	}
+}
+
+// TestReadSnippetRedactsCredentials 验证非 2xx 响应体片段里的凭据不会被写进错误/日志。
+func TestReadSnippetRedactsCredentials(t *testing.T) {
+	cases := []struct {
+		name string
+		body string
+		leak []string
+		want string
+	}{
+		{"bearer", "unauthorized: Bearer s3cr3t-token-abc", []string{"s3cr3t-token-abc"}, "Bearer ***"},
+		{"token kv", `{"error":"bad","token":"s3cr3t-value"}`, []string{"s3cr3t-value"}, `"token":"***"`},
+		{"password eq", "password=s3cr3t-pass&x=1", []string{"s3cr3t-pass"}, "password=***"},
+		{"普通错误保留", "invalid target: foo", nil, "invalid target: foo"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got := readSnippet(strings.NewReader(tc.body))
+			for _, leak := range tc.leak {
+				if leak != "" && strings.Contains(got, leak) {
+					t.Fatalf("响应片段未脱敏凭据 %q: %s", leak, got)
+				}
+			}
+			if tc.want != "" && !strings.Contains(got, tc.want) {
+				t.Fatalf("脱敏后应保留结构信息 %q，实际: %s", tc.want, got)
+			}
+		})
+	}
+}
+
+// TestRedactSnippetTruncatesAtRuneBoundary 验证 512 字节截断不会把多字节字符切成半个。
+func TestRedactSnippetTruncatesAtRuneBoundary(t *testing.T) {
+	body := strings.Repeat("中", 300) // 900 字节，截断点落在 rune 中间
+	got := redactSnippet(body)
+	if !utf8.ValidString(got) {
+		t.Fatalf("截断后不是合法 UTF-8: %q", got)
+	}
+	if len(got) > 512 {
+		t.Fatalf("截断后长度超过 512 字节: %d", len(got))
+	}
+	if want := strings.Repeat("中", 170); got != want {
+		t.Fatalf("应截断到 510 字节（170 个 rune），实际 %d 字节", len(got))
 	}
 }

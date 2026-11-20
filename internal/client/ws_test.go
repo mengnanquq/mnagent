@@ -829,3 +829,54 @@ func TestWSFallbackLogsWarn(t *testing.T) {
 		t.Fatalf("WS 降级日志应包含 WebSocket，实际日志：%s", out)
 	}
 }
+
+// TestResolveAckWakesAllWaiters 验证同一结果 ID 的多个 ack 等待者都会被唤醒，
+// 不会因覆盖 map 而让先登记的等待者白等到超时。
+func TestResolveAckWakesAllWaiters(t *testing.T) {
+	c := New(testConfig("http://127.0.0.1:1", nil))
+	ch1 := make(chan struct{})
+	ch2 := make(chan struct{})
+	c.ackMu.Lock()
+	c.acks = map[string][]chan struct{}{"job-1": {ch1, ch2}}
+	c.ackMu.Unlock()
+
+	c.resolveAck("job-1")
+	for i, ch := range []chan struct{}{ch1, ch2} {
+		select {
+		case <-ch:
+		default:
+			t.Fatalf("第 %d 个等待者未被唤醒", i+1)
+		}
+	}
+	c.ackMu.Lock()
+	n := len(c.acks)
+	c.ackMu.Unlock()
+	if n != 0 {
+		t.Fatalf("resolveAck 后应清空等待者，实际剩 %d", n)
+	}
+}
+
+// TestRemoveAckWaiterKeepsOthers 验证注销单个等待者时不会误删同一 ID 的其它等待者。
+func TestRemoveAckWaiterKeepsOthers(t *testing.T) {
+	c := New(testConfig("http://127.0.0.1:1", nil))
+	ch1 := make(chan struct{})
+	ch2 := make(chan struct{})
+	c.ackMu.Lock()
+	c.acks = map[string][]chan struct{}{"job-2": {ch1, ch2}}
+	c.ackMu.Unlock()
+
+	c.removeAckWaiter("job-2", ch1)
+	c.ackMu.Lock()
+	waiters := append([]chan struct{}(nil), c.acks["job-2"]...)
+	c.ackMu.Unlock()
+	if len(waiters) != 1 || waiters[0] != ch2 {
+		t.Fatalf("应只移除 ch1，实际剩余 %d 个", len(waiters))
+	}
+	c.removeAckWaiter("job-2", ch2)
+	c.ackMu.Lock()
+	_, ok := c.acks["job-2"]
+	c.ackMu.Unlock()
+	if ok {
+		t.Fatal("最后一个等待者注销后应删除键")
+	}
+}
