@@ -93,7 +93,7 @@ func TestParseProxyURIs(t *testing.T) {
 			"ps":   "JP-VMess",
 			"add":  "jp.node.example",
 			"port": 443,
-			"id":   "b831381d-6324-4d53-ad4f-8cda48b30811",
+			"id":   "00000000-0000-0000-0000-000000000000",
 			"aid":  0,
 			"scy":  "auto",
 			"net":  "ws",
@@ -177,12 +177,12 @@ func TestParseProxyURIs(t *testing.T) {
 		}
 
 		// 测试 IPv6 与缺省配置
-		uri6 := "anytls://pwd@[2409:8a71:6a00:1953::615]:8964/?insecure=1#IPv6-Node"
+		uri6 := "anytls://pwd@[2001:db8::615]:8964/?insecure=1#IPv6-Node"
 		node6, err := parseProxyURI(uri6)
 		if err != nil {
 			t.Fatalf("IPv6 解析失败: %v", err)
 		}
-		if node6.Server != "[2409:8a71:6a00:1953::615]:8964" || node6.Name != "IPv6-Node" {
+		if node6.Server != "[2001:db8::615]:8964" || node6.Name != "IPv6-Node" {
 			t.Fatalf("IPv6 节点信息不符合预期: %+v", node6)
 		}
 
@@ -646,9 +646,9 @@ func TestExtractFieldRobustness(t *testing.T) {
 	}{
 		{
 			name: "单引号包裹且内含逗号与冒号",
-			raw:  `{ name: '剩余流量：975.52 GB, 有效期：长期', server: 1.2.3.4, port: 443 }`,
+			raw:  `{ name: '示例节点, 有效期：长期', server: 1.2.3.4, port: 443 }`,
 			key:  "name",
-			want: "剩余流量：975.52 GB, 有效期：长期",
+			want: "示例节点, 有效期：长期",
 		},
 		{
 			name: "双引号包裹且内含逗号",
@@ -703,11 +703,11 @@ func TestParseClashYAMLProxiesRobustness(t *testing.T) {
 	yamlContent := `
 mixed-port: 7890
 proxies:
-  - { name: '剩余流量：975.52 GB', server: 203.10.98.189, port: 443, udp: true, type: hysteria2, password: pass1, fingerprint: fp1 }
+  - { name: '示例节点', server: 203.0.113.10, port: 443, udp: true, type: hysteria2, password: pass1, fingerprint: fp1 }
   - { name: 🇯🇵AWS日本1号, type: vless, server: aws.jp.node, port: 443, uuid: u-123, reality-opts: { public-key: pbk1, short-id: sid1 } }
   - name: "多行节点-HY2"
     type: hysteria2
-    server: 203.10.99.51
+    server: 203.0.113.51
     port: 50000
     ports: 50000-55000
     password: pass2
@@ -718,7 +718,7 @@ proxy-groups:
 		t.Fatalf("期望解析出 3 个节点，实际解析出: %d", len(nodes))
 	}
 
-	if nodes[0].Name != "剩余流量：975.52 GB" || nodes[0].Protocol != "hysteria2" || nodes[0].Server != "203.10.98.189:443" {
+	if nodes[0].Name != "示例节点" || nodes[0].Protocol != "hysteria2" || nodes[0].Server != "203.0.113.10:443" {
 		t.Fatalf("节点 1 解析不符合预期: %+v", nodes[0])
 	}
 
@@ -729,20 +729,20 @@ proxy-groups:
 		t.Fatalf("节点 2 Payload 应保留 reality-opts，实际: %s", nodes[1].Payload)
 	}
 
-	if nodes[2].Name != "多行节点-HY2" || nodes[2].Protocol != "hysteria2" || nodes[2].Server != "203.10.99.51:50000" {
+	if nodes[2].Name != "多行节点-HY2" || nodes[2].Protocol != "hysteria2" || nodes[2].Server != "203.0.113.51:50000" {
 		t.Fatalf("节点 3 解析不符合预期: %+v", nodes[2])
 	}
 }
 
 // TestParseHysteria2URIComprehensive 验证 parseHysteria2URI 提取指纹、多端口、混淆等参数。
 func TestParseHysteria2URIComprehensive(t *testing.T) {
-	rawURI := "hysteria2://my-password@203.10.99.51:50000/?sni=www.bing.com&pinSHA256=1d7995901a93bada6d17f10289441793e8ec54ee314d9f04f3a9d05daa622331&mport=50000-55000&obfs=salamander&obfs-password=obfspass123&alpn=h3#%F0%9F%87%AF%F0%9F%87%B5%E6%97%A5%E6%9C%AC%E4%B8%93%E7%BA%BF"
+	rawURI := "hysteria2://my-password@203.0.113.51:50000/?sni=www.bing.com&pinSHA256=1d7995901a93bada6d17f10289441793e8ec54ee314d9f04f3a9d05daa622331&mport=50000-55000&obfs=salamander&obfs-password=obfspass123&alpn=h3#%F0%9F%87%AF%F0%9F%87%B5%E6%97%A5%E6%9C%AC%E4%B8%93%E7%BA%BF"
 	node, err := parseProxyURI(rawURI)
 	if err != nil {
 		t.Fatalf("解析 Hysteria2 URI 失败: %v", err)
 	}
 
-	if node.Protocol != "hysteria2" || node.Server != "203.10.99.51:50000" || node.Name != "🇯🇵日本专线" {
+	if node.Protocol != "hysteria2" || node.Server != "203.0.113.51:50000" || node.Name != "🇯🇵日本专线" {
 		t.Fatalf("基础信息不符合预期: %+v", node)
 	}
 
@@ -776,16 +776,16 @@ func TestParseHysteria2URIComprehensive(t *testing.T) {
 // TestParseVlessURIComprehensive 验证 parseVlessURI 提取 Reality、WS、gRPC 等参数。
 func TestParseVlessURIComprehensive(t *testing.T) {
 	t.Run("Reality 节点", func(t *testing.T) {
-		rawURI := "vless://3725dcb7-5767-472d-93be-872cdd4a7e0f@aws.jp:443?type=tcp&security=reality&flow=xtls-rprx-vision&fp=chrome&sni=osxapps.itunes.apple.com&pbk=egq3FRi4oqkJ-iJ40r-pk10g7tawGg6o9c4UDGOPDU4&sid=9824e11ad3a632f8&spx=%2Ftest#AWS-Reality"
+		rawURI := "vless://00000000-0000-0000-0000-000000000000@reality.example:443?type=tcp&security=reality&flow=xtls-rprx-vision&fp=chrome&sni=www.example.com&pbk=AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA&sid=0000000000000000&spx=%2Ftest#AWS-Reality"
 		node, err := parseProxyURI(rawURI)
 		if err != nil {
 			t.Fatalf("解析 VLESS Reality 失败: %v", err)
 		}
-		if node.Protocol != "vless" || node.Server != "aws.jp:443" || node.Name != "AWS-Reality" {
+		if node.Protocol != "vless" || node.Server != "reality.example:443" || node.Name != "AWS-Reality" {
 			t.Fatalf("基础信息不符合预期: %+v", node)
 		}
 		p := node.Payload
-		if !strings.Contains(p, `uuid: "3725dcb7-5767-472d-93be-872cdd4a7e0f"`) {
+		if !strings.Contains(p, `uuid: "00000000-0000-0000-0000-000000000000"`) {
 			t.Fatalf("缺少 uuid: %s", p)
 		}
 		if !strings.Contains(p, `flow: "xtls-rprx-vision"`) {
@@ -794,10 +794,10 @@ func TestParseVlessURIComprehensive(t *testing.T) {
 		if !strings.Contains(p, `client-fingerprint: "chrome"`) {
 			t.Fatalf("缺少 client-fingerprint: %s", p)
 		}
-		if !strings.Contains(p, `servername: "osxapps.itunes.apple.com"`) {
+		if !strings.Contains(p, `servername: "www.example.com"`) {
 			t.Fatalf("缺少 servername: %s", p)
 		}
-		if !strings.Contains(p, "reality-opts:") || !strings.Contains(p, `public-key: "egq3FRi4oqkJ-iJ40r-pk10g7tawGg6o9c4UDGOPDU4"`) || !strings.Contains(p, `short-id: "9824e11ad3a632f8"`) {
+		if !strings.Contains(p, "reality-opts:") || !strings.Contains(p, `public-key: "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"`) || !strings.Contains(p, `short-id: "0000000000000000"`) {
 			t.Fatalf("缺少 reality-opts: %s", p)
 		}
 		if !strings.Contains(p, `spider-x: "/test"`) {
@@ -948,12 +948,30 @@ proxy-groups:
 }
 
 // TestRunMiaospeedTuicLive 实测真实 TUIC 节点的 MiaoSpeed 连通性。
+// 默认跳过：必须显式设置 MNAGENT_LIVE_TUIC_TEST=1，并通过
+// MNAGENT_LIVE_TUIC_SERVER / MNAGENT_LIVE_TUIC_UUID / MNAGENT_LIVE_TUIC_PASSWORD
+// 提供一次性测试节点；仓库内不保存任何真实机场凭据。
 func TestRunMiaospeedTuicLive(t *testing.T) {
-	if _, err := os.Stat("/tmp/miaospeed"); err != nil {
-		t.Skip("本地未找到 /tmp/miaospeed，跳过实机测速")
+	if os.Getenv("MNAGENT_LIVE_TUIC_TEST") != "1" {
+		t.Skip("真实联网用例默认跳过；设置 MNAGENT_LIVE_TUIC_TEST=1 与 MNAGENT_LIVE_TUIC_* 后手动执行")
+	}
+	server := strings.TrimSpace(os.Getenv("MNAGENT_LIVE_TUIC_SERVER"))
+	uuid := strings.TrimSpace(os.Getenv("MNAGENT_LIVE_TUIC_UUID"))
+	password := strings.TrimSpace(os.Getenv("MNAGENT_LIVE_TUIC_PASSWORD"))
+	if server == "" || uuid == "" || password == "" {
+		t.Skip("未设置 MNAGENT_LIVE_TUIC_SERVER/UUID/PASSWORD，跳过实机测速")
+	}
+	miaoBin := strings.TrimSpace(os.Getenv("MNAGENT_LIVE_MIAOSPEED_BIN"))
+	if miaoBin == "" {
+		miaoBin = "/tmp/miaospeed"
+	}
+	if _, err := os.Stat(miaoBin); err != nil {
+		t.Skipf("未找到 miaospeed（%s），跳过实机测速", miaoBin)
 	}
 
-	rawPayload := "name: \"TUIC-Test\"\ntype: tuic\nserver: jp4.mtf.llc\nport: 8444\nuuid: 74503f56-4b80-4017-a062-04c6d8a25527\npassword: 74503f56-4b80-4017-a062-04c6d8a25527\nskip-cert-verify: false\nalpn:\n  - h3\ncongestion-controller: bbr\nudp-relay-mode: native\n"
+	rawPayload := "name: \"TUIC-Test\"\ntype: tuic\nserver: " + server +
+		"\nport: 8444\nuuid: " + uuid + "\npassword: " + password +
+		"\nskip-cert-verify: false\nalpn:\n  - h3\ncongestion-controller: bbr\nudp-relay-mode: native\n"
 	job := model.Job{
 		ID:     "live-tuic-01",
 		Kind:   "miaospeed",
@@ -962,7 +980,7 @@ func TestRunMiaospeedTuicLive(t *testing.T) {
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
 	defer cancel()
-	res, raw, err := runMiaospeedJob(ctx, "/tmp/miaospeed", "", job, testLogger{t}, func(p model.Progress) {
+	res, raw, err := runMiaospeedJob(ctx, miaoBin, "", job, testLogger{t}, func(p model.Progress) {
 		t.Logf("Progress: %d/%d (%s)", p.Current, p.Total, p.NodeName)
 	})
 	if err != nil {
@@ -974,17 +992,20 @@ func TestRunMiaospeedTuicLive(t *testing.T) {
 	}
 }
 
-// TestFetchMtfSubscriptionAllNodes 验证从真实的 mtf.llc 订阅中完整拉取全部节点（含 VLESS, HY2, TUIC）。
+// TestFetchLiveSubscriptionAllNodes 验证从真实订阅中完整拉取全部节点（含 VLESS, HY2, TUIC）。
 //
 // 该用例依赖第三方机场订阅的可用性与配额（限流、地区封锁、节点数量随时可能变化），
-// 属于明确的环境相关测试：默认跳过，只有在显式设置 MNAGENT_LIVE_SUB_TEST=1 时才执行，
-// 避免外部服务抖动导致 CI / 发布流水线误报失败。
-func TestFetchMtfSubscriptionAllNodes(t *testing.T) {
+// 属于明确的环境相关测试：默认跳过，只有在显式设置 MNAGENT_LIVE_SUB_TEST=1 且提供
+// MNAGENT_LIVE_SUB_URL 时才执行，避免真实订阅链接进入仓库。
+func TestFetchLiveSubscriptionAllNodes(t *testing.T) {
 	if os.Getenv("MNAGENT_LIVE_SUB_TEST") != "1" {
 		t.Skip("依赖外部机场订阅（网络与配额不可控），默认跳过；设置 MNAGENT_LIVE_SUB_TEST=1 手动执行")
 	}
 
-	subURL := "https://mtf.llc/s/87d9ad4e06304a12638ccfc9552274b5"
+	subURL := strings.TrimSpace(os.Getenv("MNAGENT_LIVE_SUB_URL"))
+	if subURL == "" {
+		t.Skip("未设置 MNAGENT_LIVE_SUB_URL，跳过在线订阅测试")
+	}
 	// 独立超时：外部服务不可达时尽快跳过，避免拖满 go test 的 10 分钟总超时。
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
@@ -1175,7 +1196,7 @@ func TestParseVMessEnhanced(t *testing.T) {
 		"ps":   "JP-VMess-gRPC",
 		"add":  "grpc.jp.example",
 		"port": 443,
-		"id":   "b831381d-6324-4d53-ad4f-8cda48b30811",
+		"id":   "00000000-0000-0000-0000-000000000000",
 		"aid":  0,
 		"scy":  "auto",
 		"net":  "grpc",
@@ -1787,15 +1808,15 @@ func TestExecuteMiaospeedTaskPreservesPartialProgressOnTimeout(t *testing.T) {
 // TestIPv6NodeSupportAndDualStackScript 验证全协议对 IPv6 字面量节点地址的解析、安全引用格式化及双栈落地探测脚本。
 func TestIPv6NodeSupportAndDualStackScript(t *testing.T) {
 	t.Run("VLESS IPv6 节点", func(t *testing.T) {
-		uri := "vless://80a6c919-fcc8-49da-ace8-84bf0b75e81a@[2409:8a71:6a00:1953::615]:443?security=tls&sni=example.com#IPv6-VLESS"
+		uri := "vless://00000000-0000-0000-0000-000000000000@[2001:db8::615]:443?security=tls&sni=example.com#IPv6-VLESS"
 		node, err := parseProxyURI(uri)
 		if err != nil {
 			t.Fatalf("解析 VLESS IPv6 失败: %v", err)
 		}
-		if node.Server != "[2409:8a71:6a00:1953::615]:443" {
+		if node.Server != "[2001:db8::615]:443" {
 			t.Fatalf("Server 期望标准中括号 IPv6 host:port，实际: %q", node.Server)
 		}
-		if !strings.Contains(node.Payload, `server: "2409:8a71:6a00:1953::615"`) {
+		if !strings.Contains(node.Payload, `server: "2001:db8::615"`) {
 			t.Fatalf("Payload 期望包含转义后的 IPv6 地址，实际:\n%s", node.Payload)
 		}
 	})
@@ -1834,7 +1855,7 @@ func TestIPv6NodeSupportAndDualStackScript(t *testing.T) {
     {
       "type": "vless",
       "tag": "SB-IPv6-Node",
-      "server": "2409:8a71:6a00:1953::1",
+      "server": "2001:db8::1",
       "server_port": 443,
       "uuid": "00000000-0000-0000-0000-000000000000"
     }
@@ -1847,10 +1868,10 @@ func TestIPv6NodeSupportAndDualStackScript(t *testing.T) {
 		if len(nodes) != 1 {
 			t.Fatalf("期望提取 1 个节点，实际: %d", len(nodes))
 		}
-		if nodes[0].Server != "[2409:8a71:6a00:1953::1]:443" {
+		if nodes[0].Server != "[2001:db8::1]:443" {
 			t.Fatalf("Sing-box 提取的 IPv6 节点 Server 期望带中括号，实际: %q", nodes[0].Server)
 		}
-		if !strings.Contains(nodes[0].Payload, `server: "2409:8a71:6a00:1953::1"`) {
+		if !strings.Contains(nodes[0].Payload, `server: "2001:db8::1"`) {
 			t.Fatalf("Payload 期望引用 IPv6 纯地址，实际:\n%s", nodes[0].Payload)
 		}
 	})
@@ -1992,8 +2013,8 @@ func TestFetchSubscriptionSSRFBlocked(t *testing.T) {
 
 // TestRedactProxyError 验证 mnagent 中对 URL 与代理凭据的脱敏保护。
 func TestRedactProxyError(t *testing.T) {
-	subURL := "https://dy.vistart.art/sbciiol/db00ce5f01c4929eab88541fe3393657"
-	token := "db00ce5f01c4929eab88541fe3393657"
+	subURL := "https://sub.example.com/sbciiol/0123456789abcdef0123456789abcdef"
+	token := "0123456789abcdef0123456789abcdef"
 
 	// 1. url.Error 格式
 	rawErr := fmt.Sprintf(`Get "%s": context deadline exceeded`, subURL)
@@ -2001,8 +2022,8 @@ func TestRedactProxyError(t *testing.T) {
 	if strings.Contains(redacted, token) {
 		t.Fatalf("严重安全漏洞：暴露了敏感 Token: %s", redacted)
 	}
-	if !strings.Contains(redacted, "https://dy.vistart.art/***") {
-		t.Fatalf("期望脱敏为 https://dy.vistart.art/***，实际: %s", redacted)
+	if !strings.Contains(redacted, "https://sub.example.com/***") {
+		t.Fatalf("期望脱敏为 https://sub.example.com/***，实际: %s", redacted)
 	}
 
 	// 2. 单节点 URI
@@ -2019,8 +2040,8 @@ func TestRedactProxyError(t *testing.T) {
 
 // TestFetchSubscriptionRedactsURLOnError 验证拉取不存在或超时的订阅时，返回的错误中不含敏感路径与 Token。
 func TestFetchSubscriptionRedactsURLOnError(t *testing.T) {
-	subURL := "https://nonexistent-airport-sub-domain.xyz/sbciiol/db00ce5f01c4929eab88541fe3393657"
-	token := "db00ce5f01c4929eab88541fe3393657"
+	subURL := "https://nonexistent-airport-sub-domain.example/sbciiol/0123456789abcdef0123456789abcdef"
+	token := "0123456789abcdef0123456789abcdef"
 
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 	defer cancel()
